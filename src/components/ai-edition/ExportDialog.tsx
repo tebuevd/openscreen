@@ -123,7 +123,8 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 	const [progress, setProgress] = useState<ExportProgress | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [savedPath, setSavedPath] = useState<string | null>(null);
-	const cancelRef = useRef<{ cancel: () => void } | null>(null);
+	// Invalidates stale async continuations; it does not cancel an in-flight native export.
+	const submissionGenerationRef = useRef(0);
 
 	// (Old behavior: the native compositor overlay used to be a top-level OS window outside the
 	//  Chromium surface, so we'd hide it here to put this modal in front. The compositor now
@@ -223,16 +224,23 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 
 	useEffect(() => {
 		if (!open) {
+			submissionGenerationRef.current += 1;
 			setPhase("idle");
 			setProgress(null);
 			setError(null);
 			setSavedPath(null);
-			cancelRef.current = null;
 		}
 	}, [open]);
+	useEffect(
+		() => () => {
+			submissionGenerationRef.current += 1;
+		},
+		[],
+	);
 
 	const handleClose = () => {
 		if (phase === "rendering" || phase === "writing") return;
+		submissionGenerationRef.current += 1;
 		onClose();
 	};
 
@@ -244,6 +252,8 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 			setPhase("error");
 			return;
 		}
+		const submissionGeneration = ++submissionGenerationRef.current;
+		const isCurrentSubmission = () => submissionGenerationRef.current === submissionGeneration;
 		const dimensionsUnavailable = t("exportDialog.dimensionsUnavailable");
 		setPhase("configuring");
 		setError(null);
@@ -252,6 +262,7 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 
 		const visibleAssetIds = resolveVisibleClips(document).map((clip) => clip.assetId);
 		const hydrated = await hydrateExportDocumentDimensions(document, visibleAssetIds);
+		if (!isCurrentSubmission()) return;
 		if (!hydrated.ok) {
 			setError(dimensionsUnavailable);
 			setPhase("error");
@@ -288,8 +299,10 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 		let pickedPath: string | undefined;
 		try {
 			const picker = await window.electronAPI?.pickExportSavePath?.(suggested);
+			if (!isCurrentSubmission()) return;
 			pickedPath = picker && "path" in picker ? picker.path : undefined;
 		} catch (err) {
+			if (!isCurrentSubmission()) return;
 			setError(err instanceof Error ? err.message : String(err));
 			setPhase("error");
 			return;
@@ -323,6 +336,7 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 			const totalFrames = Math.max(1, Math.round(totalDurationSec * outFps));
 			const startedAt = Date.now();
 			const unsubscribeProgress = window.electronAPI?.onNativeExportProgress?.((frames) => {
+				if (!isCurrentSubmission()) return;
 				const elapsedS = (Date.now() - startedAt) / 1000;
 				const fractionDone = Math.min(1, frames / totalFrames);
 				const estimatedTimeRemaining = fractionDone > 0 ? elapsedS / fractionDone - elapsedS : 0;
@@ -367,6 +381,7 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 						codec,
 					});
 				}
+				if (!isCurrentSubmission()) return;
 				setSavedPath(pickedPath);
 				setPhase("done");
 				toast.success(t("exportDialog.exportedVideo"), {
@@ -384,6 +399,7 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 					},
 				});
 			} catch (err) {
+				if (!isCurrentSubmission()) return;
 				setError(err instanceof Error ? err.message : String(err));
 				setPhase("error");
 				toast.error(t("exportDialog.exportFailed"), {

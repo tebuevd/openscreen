@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "@/contexts/I18nContext";
 import { type AxcutAsset, type AxcutDocument, axcutSchemaVersion } from "@/lib/ai-edition/schema";
@@ -33,6 +34,16 @@ const bridgeMocks = {
 	pickExportSavePath: vi.fn(),
 };
 const noop = () => undefined;
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((next, fail) => {
+		resolve = next;
+		reject = fail;
+	});
+	return { promise, resolve, reject };
+}
 
 function video(width: number, height: number): NonNullable<AxcutAsset["video"]> {
 	return { codec: "h264", width, height, fps: 60 };
@@ -97,6 +108,22 @@ function renderDialog(document: AxcutDocument) {
 	);
 }
 
+function LifecycleDialog({ document }: { document: AxcutDocument }) {
+	const [open, setOpen] = useState(true);
+	return (
+		<I18nProvider>
+			<button type="button" onClick={() => setOpen(true)}>
+				Reopen export
+			</button>
+			<ExportDialog open={open} onClose={() => setOpen(false)} document={document} />
+		</I18nProvider>
+	);
+}
+
+function renderLifecycleDialog(document: AxcutDocument) {
+	return render(<LifecycleDialog document={document} />);
+}
+
 async function submitMp4() {
 	fireEvent.click(screen.getByRole("button", { name: "Export MP4" }));
 	await Promise.resolve();
@@ -113,7 +140,7 @@ function submittedScene(call: unknown[] | undefined) {
 	};
 }
 
-describe("ExportDialog MP4 submission dimensions", () => {
+describe("ExportDialog submission", () => {
 	beforeEach(() => {
 		localStorage.clear();
 		bridgeMocks.pickExportSavePath.mockResolvedValue({
@@ -240,5 +267,88 @@ describe("ExportDialog MP4 submission dimensions", () => {
 		expect(call?.[3]).toEqual({ width: 404, height: 720, fps: 15, loopCount: 0 });
 		expect(submittedScene(call).output).toEqual({ width: 1080, height: 1920, fps: null });
 		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
+	});
+
+	it("does not continue when a source probe resolves after close", async () => {
+		const probe = deferred<{ width: number; height: number } | null>();
+		probeVideoDimensionsMock.mockReturnValueOnce(probe.promise);
+		renderLifecycleDialog(makeDocument(undefined));
+
+		await submitMp4();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledOnce());
+		fireEvent.click(screen.getByRole("button", { name: "Close" }));
+		expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+		await act(async () => {
+			probe.resolve({ width: 1920, height: 1080 });
+			await probe.promise;
+			await Promise.resolve();
+		});
+
+		expect(bridgeMocks.pickExportSavePath).not.toHaveBeenCalled();
+		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
+	});
+
+	it("does not restore a stale probe error after close and reopen", async () => {
+		const probe = deferred<{ width: number; height: number } | null>();
+		probeVideoDimensionsMock.mockReturnValueOnce(probe.promise);
+		renderLifecycleDialog(makeDocument(undefined));
+
+		await submitMp4();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledOnce());
+		fireEvent.click(screen.getByRole("button", { name: "Close" }));
+		fireEvent.click(screen.getByRole("button", { name: "Reopen export" }));
+		expect(screen.getByRole("dialog")).toBeInTheDocument();
+
+		await act(async () => {
+			probe.reject(new Error("probe failed"));
+			await probe.promise.catch(noop);
+			await Promise.resolve();
+		});
+
+		expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Export MP4" })).toBeEnabled();
+		expect(bridgeMocks.pickExportSavePath).not.toHaveBeenCalled();
+		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
+	});
+
+	it("does not start native export when the save picker resolves after close", async () => {
+		const picker = deferred<{ success: true; path: string }>();
+		bridgeMocks.pickExportSavePath.mockReturnValueOnce(picker.promise);
+		renderLifecycleDialog(makeDocument(video(1920, 1080)));
+
+		await submitMp4();
+		await waitFor(() => expect(bridgeMocks.pickExportSavePath).toHaveBeenCalledOnce());
+		fireEvent.click(screen.getByRole("button", { name: "Close" }));
+
+		await act(async () => {
+			picker.resolve({ success: true, path: "/tmp/stale.mp4" });
+			await picker.promise;
+			await Promise.resolve();
+		});
+
+		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
+		fireEvent.click(screen.getByRole("button", { name: "Reopen export" }));
+		expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Export MP4" })).toBeEnabled();
+	});
+
+	it("completes the current deferred submission attempt", async () => {
+		const probe = deferred<{ width: number; height: number } | null>();
+		const picker = deferred<{ success: true; path: string }>();
+		probeVideoDimensionsMock.mockReturnValueOnce(probe.promise);
+		bridgeMocks.pickExportSavePath.mockReturnValueOnce(picker.promise);
+		renderLifecycleDialog(makeDocument(undefined));
+
+		await submitMp4();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledOnce());
+		probe.resolve({ width: 1920, height: 1080 });
+		await waitFor(() => expect(bridgeMocks.pickExportSavePath).toHaveBeenCalledOnce());
+		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
+
+		picker.resolve({ success: true, path: "/tmp/current.mp4" });
+		await waitFor(() => expect(nativeMocks.exportMultiNative).toHaveBeenCalledOnce());
+		expect(await screen.findByText("/tmp/current.mp4")).toBeInTheDocument();
+		expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 	});
 });
