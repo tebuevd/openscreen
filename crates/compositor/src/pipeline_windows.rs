@@ -1298,20 +1298,13 @@ unsafe fn nv12_to_yuv420p(src: *mut AVFrame, dst: *mut AVFrame) {
 }
 
 /// Résolution/cadence/codec de sortie. `fps: None` = dérivé du 1er clip (comportement
-/// historique) ; `width`/`height` doivent être pairs (NV12 4:2:0) — l'appelant napi arrondit.
+/// historique) ; `width`/`height` doivent être pairs (NV12 4:2:0) — l'appelant napi valide.
 pub struct ExportParams {
     pub width: u32,
     pub height: u32,
     pub fps: Option<u32>,
     pub codec: ExportCodec,
 }
-
-impl Default for ExportParams {
-    fn default() -> Self {
-        Self { width: OUT_W, height: OUT_H, fps: None, codec: ExportCodec::H264 }
-    }
-}
-
 
 unsafe fn run_multi_inner(
     clips: &[ClipSource],

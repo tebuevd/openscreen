@@ -68,17 +68,6 @@ pub struct ExportParams {
     pub codec: ExportCodec,
 }
 
-impl Default for ExportParams {
-    fn default() -> Self {
-        Self {
-            width: 1920,
-            height: 1080,
-            fps: None,
-            codec: ExportCodec::H264,
-        }
-    }
-}
-
 /// Decodeur Linux : software decode (`SwDecoder`) + upload NV12-split
 /// (`CpuFrames`). Meme surface que `pipeline_macos::Decoder`
 /// (`open`/`seek_to`/`next`/`cur_frame`/`cur_time_sec`/`fps`) pour que `live.rs`

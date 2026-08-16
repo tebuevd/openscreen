@@ -7,6 +7,10 @@
  * `readCompositorFrame` and paints them into a `<canvas>`.
  */
 
+import {
+	MP4_EXPORT_DIMENSIONS_ERROR,
+	validateMp4ExportDimensions,
+} from "@/lib/exporter/mp4ExportSettings";
 import { requireNativeBridgeData } from "./client";
 import type {
 	CompositorBackend,
@@ -136,10 +140,13 @@ export function destroyCompositorView(id: number): Promise<{ ok: true }> {
 
 export function exportMultiNative(
 	clips: CompositorClipInput[],
-	outPath?: string,
-	sceneJson?: string,
-	params?: CompositorExportParams,
+	outPath: string | undefined,
+	sceneJson: string | undefined,
+	params: CompositorExportParams,
 ): Promise<CompositorExportResult> {
+	if (!validateMp4ExportDimensions(params).ok) {
+		return Promise.reject(new Error(MP4_EXPORT_DIMENSIONS_ERROR));
+	}
 	return requireNativeBridgeData<CompositorExportResult>({
 		domain: "compositor",
 		action: "exportMulti",

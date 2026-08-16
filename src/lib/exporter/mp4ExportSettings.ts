@@ -17,6 +17,17 @@ export interface ExportDimensions {
 	height: number;
 }
 
+// Bound allocations to ordinary DCI 8K in either orientation. 8192 is a conservative cross-GPU
+// texture axis; the pixel cap admits 8192x4320 and 4320x8192 while rejecting pathological squares
+// and extreme aspect-ratio metadata before any native/GPU allocation.
+export const MAX_MP4_EXPORT_DIMENSION = 8192;
+export const MAX_MP4_EXPORT_PIXEL_AREA = 8192 * 4320;
+export const MP4_EXPORT_DIMENSIONS_ERROR = `MP4 export width and height must both be positive even integers, no greater than ${MAX_MP4_EXPORT_DIMENSION} per axis or ${MAX_MP4_EXPORT_PIXEL_AREA} total pixels.`;
+
+export type Mp4ExportDimensionValidation =
+	| { ok: true; dimensions: ExportDimensions }
+	| { ok: false; reason: "missing" | "invalid" | "too-large" };
+
 export type Mp4ExportSettingsResolution =
 	| { ok: true; settings: Mp4ExportSettings }
 	| {
@@ -50,6 +61,46 @@ export function hasValidExportSourceDimensions(
 		(dimensions?.width ?? 0) > 0 &&
 		(dimensions?.height ?? 0) > 0
 	);
+}
+
+export function hasPracticalExportSourceDimensions(
+	dimensions: ExportDimensions | null | undefined,
+): dimensions is ExportDimensions {
+	return (
+		hasValidExportSourceDimensions(dimensions) &&
+		dimensions.width <= MAX_MP4_EXPORT_DIMENSION &&
+		dimensions.height <= MAX_MP4_EXPORT_DIMENSION &&
+		dimensions.width <= Math.floor(MAX_MP4_EXPORT_PIXEL_AREA / dimensions.height)
+	);
+}
+
+export function validateMp4ExportDimensions(
+	dimensions: { width?: unknown; height?: unknown } | null | undefined,
+): Mp4ExportDimensionValidation {
+	if (dimensions?.width === undefined || dimensions.height === undefined) {
+		return { ok: false, reason: "missing" };
+	}
+	const { width, height } = dimensions;
+	if (
+		typeof width !== "number" ||
+		typeof height !== "number" ||
+		!Number.isSafeInteger(width) ||
+		!Number.isSafeInteger(height) ||
+		width <= 0 ||
+		height <= 0 ||
+		width % 2 !== 0 ||
+		height % 2 !== 0
+	) {
+		return { ok: false, reason: "invalid" };
+	}
+	if (
+		width > MAX_MP4_EXPORT_DIMENSION ||
+		height > MAX_MP4_EXPORT_DIMENSION ||
+		width > Math.floor(MAX_MP4_EXPORT_PIXEL_AREA / height)
+	) {
+		return { ok: false, reason: "too-large" };
+	}
+	return { ok: true, dimensions: { width, height } };
 }
 
 const MEDIUM_SHORT_SIDE = 720;
@@ -213,8 +264,17 @@ export function resolveMp4ExportSettings({
 		aspectRatioValue = parsed.width / parsed.height;
 	}
 
-	if (quality === "source" && !hasValidExportSourceDimensions(sourceDimensions)) {
-		return { ok: false, reason: "source-dimensions-unavailable" };
+	if (quality === "source") {
+		if (!hasValidExportSourceDimensions(sourceDimensions)) {
+			return { ok: false, reason: "source-dimensions-unavailable" };
+		}
+		if (
+			sourceDimensions.width > MAX_MP4_EXPORT_DIMENSION ||
+			sourceDimensions.height > MAX_MP4_EXPORT_DIMENSION ||
+			sourceDimensions.width > Math.floor(MAX_MP4_EXPORT_PIXEL_AREA / sourceDimensions.height)
+		) {
+			return { ok: false, reason: "invalid-output-dimensions" };
+		}
 	}
 
 	// The fixed tiers do not read source dimensions. Supplying a valid sentinel keeps the legacy
@@ -228,14 +288,7 @@ export function resolveMp4ExportSettings({
 		sourceHeight: source.height,
 		aspectRatioValue,
 	});
-	if (
-		!Number.isSafeInteger(settings.width) ||
-		!Number.isSafeInteger(settings.height) ||
-		settings.width <= 0 ||
-		settings.height <= 0 ||
-		settings.width % 2 !== 0 ||
-		settings.height % 2 !== 0
-	) {
+	if (!validateMp4ExportDimensions(settings).ok) {
 		return { ok: false, reason: "invalid-output-dimensions" };
 	}
 

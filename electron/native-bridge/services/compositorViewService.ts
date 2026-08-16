@@ -4,6 +4,10 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { app } from "electron";
 import { resolveCursorSprites } from "../../../src/lib/cursor/cursorThemes";
+import {
+	MP4_EXPORT_DIMENSIONS_ERROR,
+	validateMp4ExportDimensions,
+} from "../../../src/lib/exporter/mp4ExportSettings";
 import type {
 	ClipInput,
 	CompositorBackend,
@@ -141,6 +145,15 @@ export function resolveSceneAssetPaths(sceneJson: string): string {
 	} catch {
 		return sceneJson;
 	}
+}
+
+export function validateExportParamsInput(params: unknown): ExportParamsInput {
+	if (typeof params !== "object" || params === null) {
+		throw new TypeError(MP4_EXPORT_DIMENSIONS_ERROR);
+	}
+	const validation = validateMp4ExportDimensions(params as { width?: unknown; height?: unknown });
+	if (!validation.ok) throw new TypeError(MP4_EXPORT_DIMENSIONS_ERROR);
+	return { ...(params as ExportParamsInput), ...validation.dimensions };
 }
 
 export interface CompositorViewServiceOptions {
@@ -530,11 +543,12 @@ export class CompositorViewService {
 	 *  Returns null when the addon is absent. */
 	async exportMulti(
 		clips: ClipInput[],
-		outPath?: string,
-		sceneJson?: string,
-		params?: ExportParamsInput,
+		outPath: string | undefined,
+		sceneJson: string | undefined,
+		params: ExportParamsInput,
 		onProgress?: (frames: number) => void,
 	): Promise<ExportStats | null> {
+		const validatedParams = validateExportParamsInput(params);
 		const addon = this.ensureAddon();
 		if (!addon) {
 			return null;
@@ -544,7 +558,7 @@ export class CompositorViewService {
 			clips,
 			target,
 			sceneJson ? resolveSceneAssetPaths(sceneJson) : undefined,
-			params,
+			validatedParams,
 			onProgress,
 		);
 	}

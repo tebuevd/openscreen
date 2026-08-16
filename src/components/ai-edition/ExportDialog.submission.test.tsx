@@ -10,6 +10,7 @@ const nativeMocks = vi.hoisted(() => ({
 	exportGifNative: vi.fn(),
 	exportMultiNative: vi.fn(),
 }));
+const probeVideoDimensionsMock = vi.hoisted(() => vi.fn());
 
 vi.mock("@/native", () => ({
 	exportGifNative: nativeMocks.exportGifNative,
@@ -19,6 +20,11 @@ vi.mock("@/native", () => ({
 
 vi.mock("sonner", () => ({
 	toast: { error: vi.fn(), success: vi.fn() },
+}));
+
+vi.mock("@/lib/ai-edition/timeline/duration", async (importOriginal) => ({
+	...(await importOriginal<typeof import("@/lib/ai-edition/timeline/duration")>()),
+	probeVideoDimensions: probeVideoDimensionsMock,
 }));
 
 import { ExportDialog } from "./ExportDialog";
@@ -96,6 +102,17 @@ async function submitMp4() {
 	await Promise.resolve();
 }
 
+function submittedScene(call: unknown[] | undefined) {
+	const sceneJson = call?.[2];
+	if (typeof sceneJson !== "string") throw new Error("Expected submitted scene JSON");
+	return JSON.parse(sceneJson) as {
+		output: { width: number; height: number; fps: number | null };
+		layout: {
+			screenRect: { width: number; height: number } | null;
+		};
+	};
+}
+
 describe("ExportDialog MP4 submission dimensions", () => {
 	beforeEach(() => {
 		localStorage.clear();
@@ -109,6 +126,14 @@ describe("ExportDialog MP4 submission dimensions", () => {
 			fps: 60,
 			videoDurationS: 1,
 		});
+		nativeMocks.exportGifNative.mockResolvedValue({
+			frames: 15,
+			wallS: 1,
+			fps: 15,
+			videoDurationS: 1,
+			fileBytes: 1024,
+		});
+		probeVideoDimensionsMock.mockResolvedValue({ width: 1920, height: 1080 });
 		window.electronAPI = {
 			pickExportSavePath: bridgeMocks.pickExportSavePath,
 		} as unknown as Window["electronAPI"];
@@ -122,43 +147,51 @@ describe("ExportDialog MP4 submission dimensions", () => {
 	it.each([
 		["missing", undefined],
 		["invalid", video(0, 1864)],
-	])("blocks Source with %s metadata before invoking native export", async (_label, metadata) => {
-		renderDialog(makeDocument(metadata));
+	])("probes %s persisted metadata before a Source export", async (_label, metadata) => {
+		probeVideoDimensionsMock.mockResolvedValue({ width: 2880, height: 1864 });
+		renderDialog(makeDocument(metadata, "native"));
 		fireEvent.click(screen.getByRole("button", { name: /^Source/ }));
 
 		await submitMp4();
 
-		expect(
-			screen.getByText(
-				"Export dimensions could not be determined. Reopen the project to retry media analysis, then export again.",
-			),
-		).toBeInTheDocument();
-		expect(bridgeMocks.pickExportSavePath).not.toHaveBeenCalled();
-		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
+		await waitFor(() => expect(nativeMocks.exportMultiNative).toHaveBeenCalledOnce());
+		expect(probeVideoDimensionsMock).toHaveBeenCalledOnce();
+		const call = nativeMocks.exportMultiNative.mock.calls[0];
+		expect(call?.[3]).toEqual({ width: 2880, height: 1864, fps: 60, codec: "h264" });
+		expect(submittedScene(call).output).toEqual({ width: 2880, height: 1864, fps: null });
 	});
 
-	it("blocks Original without metadata instead of substituting 16:9", async () => {
-		renderDialog(makeDocument(undefined, "native"));
+	it("blocks before save/native export when the on-demand probe fails", async () => {
+		probeVideoDimensionsMock.mockResolvedValue(null);
+		renderDialog(makeDocument(undefined));
 
 		await submitMp4();
 
-		expect(screen.getByText(/Export dimensions could not be determined/)).toBeInTheDocument();
+		expect(await screen.findByRole("alert")).toHaveTextContent(
+			/Export dimensions could not be determined/,
+		);
 		expect(bridgeMocks.pickExportSavePath).not.toHaveBeenCalled();
 		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
 	});
 
-	it("passes 1920x1080 for default 16:9 + 1080p without source metadata", async () => {
+	it("passes 1920x1080 but builds the 16:9 scene from probed source geometry", async () => {
+		probeVideoDimensionsMock.mockResolvedValue({ width: 2880, height: 1864 });
 		renderDialog(makeDocument(undefined));
 
 		await submitMp4();
 
 		await waitFor(() => expect(nativeMocks.exportMultiNative).toHaveBeenCalledOnce());
-		expect(nativeMocks.exportMultiNative).toHaveBeenCalledWith(
-			expect.any(Array),
-			"/tmp/export.mp4",
-			expect.any(String),
-			{ width: 1920, height: 1080, fps: 60, codec: "h264" },
-		);
+		const call = nativeMocks.exportMultiNative.mock.calls[0];
+		expect(call?.[1]).toBe("/tmp/export.mp4");
+		expect(call?.[3]).toEqual({ width: 1920, height: 1080, fps: 60, codec: "h264" });
+		const scene = submittedScene(call);
+		expect(scene.output).toEqual({ width: 2880, height: 1620, fps: null });
+		expect(scene.layout.screenRect).not.toBeNull();
+		if (!scene.layout.screenRect) throw new Error("Expected a screen rect");
+		const renderedAspect =
+			(scene.layout.screenRect.width * scene.output.width) /
+			(scene.layout.screenRect.height * scene.output.height);
+		expect(renderedAspect).toBeCloseTo(2880 / 1864, 3);
 	});
 
 	it("passes exact source pixels for valid Original + Source", async () => {
@@ -168,11 +201,44 @@ describe("ExportDialog MP4 submission dimensions", () => {
 		await submitMp4();
 
 		await waitFor(() => expect(nativeMocks.exportMultiNative).toHaveBeenCalledOnce());
-		expect(nativeMocks.exportMultiNative).toHaveBeenCalledWith(
-			expect.any(Array),
-			"/tmp/export.mp4",
-			expect.any(String),
-			{ width: 2880, height: 1864, fps: 60, codec: "h264" },
-		);
+		const call = nativeMocks.exportMultiNative.mock.calls[0];
+		expect(probeVideoDimensionsMock).not.toHaveBeenCalled();
+		expect(call?.[3]).toEqual({ width: 2880, height: 1864, fps: 60, codec: "h264" });
+		expect(submittedScene(call).output).toEqual({ width: 2880, height: 1864, fps: null });
+	});
+
+	it.each([
+		["portrait", "9:16" as const, { width: 1080, height: 1920 }, { width: 1080, height: 1920 }],
+		["square", "1:1" as const, { width: 1200, height: 1200 }, { width: 1080, height: 1080 }],
+	])("builds a hydrated %s scene while keeping fixed-tier output concrete", async (_label, aspectRatio, probed, expectedParams) => {
+		probeVideoDimensionsMock.mockResolvedValue(probed);
+		renderDialog(makeDocument(undefined, aspectRatio));
+
+		await submitMp4();
+
+		await waitFor(() => expect(nativeMocks.exportMultiNative).toHaveBeenCalledOnce());
+		const call = nativeMocks.exportMultiNative.mock.calls[0];
+		expect(call?.[3]).toEqual({ ...expectedParams, fps: 60, codec: "h264" });
+		const scene = submittedScene(call);
+		expect(scene.output).toEqual({ ...probed, fps: null });
+		expect(scene.layout.screenRect).not.toBeNull();
+		if (!scene.layout.screenRect) throw new Error("Expected a screen rect");
+		const renderedAspect =
+			(scene.layout.screenRect.width * scene.output.width) /
+			(scene.layout.screenRect.height * scene.output.height);
+		expect(renderedAspect).toBeCloseTo(probed.width / probed.height, 3);
+	});
+
+	it("hydrates shared scene geometry without changing GIF sizing", async () => {
+		probeVideoDimensionsMock.mockResolvedValue({ width: 1080, height: 1920 });
+		renderDialog(makeDocument(undefined, "9:16"));
+		fireEvent.click(screen.getByRole("button", { name: "GIF" }));
+		fireEvent.click(screen.getByRole("button", { name: "Export GIF" }));
+
+		await waitFor(() => expect(nativeMocks.exportGifNative).toHaveBeenCalledOnce());
+		const call = nativeMocks.exportGifNative.mock.calls[0];
+		expect(call?.[3]).toEqual({ width: 404, height: 720, fps: 15, loopCount: 0 });
+		expect(submittedScene(call).output).toEqual({ width: 1080, height: 1920, fps: null });
+		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
 	});
 });

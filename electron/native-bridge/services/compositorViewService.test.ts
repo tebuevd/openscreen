@@ -8,6 +8,7 @@ import {
 	CompositorViewService,
 	ffmpegSharedBinCandidates,
 	resolveSceneAssetPaths,
+	validateExportParamsInput,
 } from "./compositorViewService";
 
 /** A source checkout's `crates/.cargo/config.toml`, with `FFMPEG_DIR` written as `body`. */
@@ -20,6 +21,40 @@ function writeCargoConfig(root: string, body: string): void {
 		"utf8",
 	);
 }
+
+describe("validateExportParamsInput", () => {
+	it.each([
+		["missing params", undefined],
+		["empty params", {}],
+		["missing height", { width: 1920 }],
+		["missing width", { height: 1080 }],
+		["string width", { width: "1920", height: 1080 }],
+		["non-finite width", { width: Number.POSITIVE_INFINITY, height: 1080 }],
+		["zero width", { width: 0, height: 1080 }],
+		["odd height", { width: 1920, height: 1079 }],
+		["oversized axis", { width: 8194, height: 4320 }],
+		["oversized area", { width: 8192, height: 4322 }],
+		["overflow-scale values", { width: Number.MAX_SAFE_INTEGER - 1, height: 8192 }],
+	])("rejects %s before the native addon boundary", (_label, params) => {
+		expect(() => validateExportParamsInput(params)).toThrow(/width and height must both/);
+	});
+
+	it.each([
+		{ width: 1920, height: 1080, fps: 60, codec: "h264" },
+		{ width: 2880, height: 1864, fps: 60, codec: "h264" },
+		{ width: 8192, height: 4320 },
+		{ width: 4320, height: 8192 },
+	])("accepts a bounded coherent pair: $width x $height", (params) => {
+		expect(validateExportParamsInput(params)).toEqual(params);
+	});
+
+	it("rejects a raw missing params object before attempting to load the addon", async () => {
+		const service = new CompositorViewService();
+		await expect(service.exportMulti([], undefined, undefined, undefined as never)).rejects.toThrow(
+			/width and height must both/,
+		);
+	});
+});
 
 describe("ffmpegSharedBinCandidates", () => {
 	let tmpRoot: string;

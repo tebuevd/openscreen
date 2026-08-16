@@ -32,9 +32,10 @@ import {
 	type GifFrameRate,
 	type GifSizePreset,
 } from "@/lib/exporter";
+import { hydrateExportDocumentDimensions } from "@/lib/exporter/exportDocumentDimensions";
 import {
 	calculateMp4ExportSettings,
-	hasValidExportSourceDimensions,
+	hasPracticalExportSourceDimensions,
 	type Mp4ExportSettings,
 	resolveMp4ExportSettings,
 	wouldUpscale,
@@ -129,10 +130,8 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 	//  streams into a normal `<canvas>` inside the DOM — CSS z-index handles stacking naturally
 	//  and there's no OS window to hide. The hide/show dance is now dead code; removed.)
 
-	// Source dimensions come straight off `asset.video`. This dialog used to probe missing ones
-	// into local state as a fallback for recordings that were never probed; `useTimeline` now
-	// backfills them on editor load (before this dialog can open) and persists them, so every
-	// consumer reads the one populated source instead of each re-probing on its own.
+	// Persisted `asset.video` metadata drives the configuration preview. Submission hydrates an
+	// export-only clone on demand so older projects with missing metadata can still export safely.
 	const primaryAsset = useMemo(
 		() =>
 			document
@@ -173,7 +172,7 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 			visibleClips.length > 0 &&
 			visibleClips.every((clip) => {
 				const video = assetById.get(clip.assetId)?.video;
-				return hasValidExportSourceDimensions(video ?? null);
+				return hasPracticalExportSourceDimensions(video ?? null);
 			})
 		);
 	}, [document]);
@@ -183,13 +182,9 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 	// Aspect the export normalizes to: the timeline's selected ratio (mirrors documentExporter),
 	// so the sizes shown match what the export produces. Read through `getEditorSettings` — the
 	// same typed façade the ratio dropdown writes through and `buildSceneDescription` reads — so
-	// this dialog can't drift from the compositor if the storage ever moves. GIF still consumes the
-	// numeric value; MP4 receives the token so legacy Original cannot silently resolve to 16:9.
+	// this dialog can't drift from the compositor if the storage ever moves. MP4 receives the token
+	// so legacy Original cannot silently resolve to 16:9.
 	const exportAspectRatio = useMemo(() => getEditorSettings(document).aspectRatio, [document]);
-	const EXPORT_ASPECT = useMemo(
-		() => resolveAspectRatioValue(document, exportAspectRatio),
-		[document, exportAspectRatio],
-	);
 	// Output dimensions the export will produce for a given tier, from the (crop-aware)
 	// SMALLEST clip on the timeline — see `smallestSource` above for why. Only "Source"
 	// quality actually uses these as its target size; 720p/1080p target a fixed short side
@@ -250,9 +245,32 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 			return;
 		}
 		const dimensionsUnavailable = t("exportDialog.dimensionsUnavailable");
+		setPhase("configuring");
+		setError(null);
+		setProgress(null);
+		setSavedPath(null);
+
+		const visibleAssetIds = resolveVisibleClips(document).map((clip) => clip.assetId);
+		const hydrated = await hydrateExportDocumentDimensions(document, visibleAssetIds);
+		if (!hydrated.ok) {
+			setError(dimensionsUnavailable);
+			setPhase("error");
+			return;
+		}
+		const exportDocument = hydrated.document;
+		const exportEffectiveDims = collectEffectiveClipDims(exportDocument);
+		const exportSmallestSource = pickExtremeDims(exportEffectiveDims, "smallest");
+		const exportLargestSource = pickExtremeDims(exportEffectiveDims, "largest");
+		const exportAspectRatio = getEditorSettings(exportDocument).aspectRatio;
+		const exportAspectValue = resolveAspectRatioValue(exportDocument, exportAspectRatio);
 		let mp4Output: Mp4ExportSettings | null = null;
 		if (format === "mp4") {
-			const resolution = resolveMp4Tier(quality);
+			const resolution = resolveMp4ExportSettings({
+				quality,
+				aspectRatio: exportAspectRatio,
+				sourceDimensions: exportSmallestSource,
+				originalDimensions: exportLargestSource,
+			});
 			if (!resolution.ok) {
 				setError(dimensionsUnavailable);
 				setPhase("error");
@@ -261,16 +279,11 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 			mp4Output = resolution.settings;
 		}
 
-		const safeName = (document.project.title || "OpenScreen")
+		const safeName = (exportDocument.project.title || "OpenScreen")
 			.replace(/[^a-z0-9-_]+/gi, "_")
 			.replace(/^_+|_+$/g, "")
 			.slice(0, 60);
 		const suggested = `${safeName || "export"}${format === "gif" ? ".gif" : ".mp4"}`;
-
-		setPhase("configuring");
-		setError(null);
-		setProgress(null);
-		setSavedPath(null);
 
 		let pickedPath: string | undefined;
 		try {
@@ -296,7 +309,7 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 		{
 			setPhase("rendering");
 			// Render the real timeline when there are clips; else fall back to the fixture.
-			const clips = buildNativeClipList(document);
+			const clips = buildNativeClipList(exportDocument);
 			// GIF runs at its own frame rate, so the progress total has to use it.
 			const outFps = format === "gif" ? gifFrameRate : fps;
 			// Total frames the encoder will produce, known upfront from the timeline (sum of
@@ -321,15 +334,13 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 				});
 			});
 			try {
-				const sceneJson = JSON.stringify(buildSceneDescription(document));
-				// Preserve GIF's existing metadata fallback. The MP4 resolver above is intentionally
-				// stricter and must not change another format's sizing behavior.
-				const gifTierDims = smallestSource
+				const sceneJson = JSON.stringify(buildSceneDescription(exportDocument));
+				const gifTierDims = exportSmallestSource
 					? calculateMp4ExportSettings({
 							quality,
-							sourceWidth: smallestSource.width,
-							sourceHeight: smallestSource.height,
-							aspectRatioValue: EXPORT_ASPECT,
+							sourceWidth: exportSmallestSource.width,
+							sourceHeight: exportSmallestSource.height,
+							aspectRatioValue: exportAspectValue,
 						})
 					: null;
 				if (clips.length === 0) {
@@ -805,6 +816,7 @@ function ProgressBlock({
 	if (phase === "error") {
 		return (
 			<div
+				role="alert"
 				style={{
 					padding: "16px",
 					border: "1px solid var(--danger)",

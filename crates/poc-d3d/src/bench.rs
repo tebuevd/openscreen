@@ -139,7 +139,12 @@ fn run_bench(args: &[String]) -> Result<()> {
     }
 
     if exporting {
-        let params = pipeline::ExportParams::default();
+        let params = pipeline::ExportParams {
+            width: 1920,
+            height: 1080,
+            fps: None,
+            codec: pipeline::ExportCodec::H264,
+        };
         for cfg in &cfgs {
             // `ClipSource` n'est pas `Clone` et l'appel le prend par tranche : reconstruit
             // par cfg plutôt que d'ajouter un derive pour le seul harnais de mesure.

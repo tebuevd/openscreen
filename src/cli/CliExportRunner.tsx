@@ -16,7 +16,6 @@ import type { CursorTelemetryPoint } from "@/components/video-editor/types";
 import { migrateProjectDataToAxcutDocument } from "@/lib/ai-edition/document/migrate";
 import {
 	collectEffectiveClipDims,
-	type Dims,
 	pickExtremeDims,
 	resolveAspectRatioValue,
 } from "@/lib/ai-edition/document/outputFormat";
@@ -31,18 +30,18 @@ import type { CliDoneResult, CliExportRequest } from "@/lib/cliContracts";
 import { GIF_SIZE_PRESETS, type GifSizePreset } from "@/lib/exporter";
 import {
 	calculateMp4ExportSettings,
-	hasValidExportSourceDimensions,
 	resolveMp4ExportSettings,
 } from "@/lib/exporter/mp4ExportSettings";
 import { mixVoiceoverIntoVideo } from "@/lib/exporter/voiceoverMix";
 import { exportGifNative, exportMultiNative, nativeBridgeClient } from "@/native";
 import type { CompositorClipInput } from "@/native/contracts";
 import { buildSceneDescription, resolveVisibleClips } from "@/native/sceneDescription";
+import { CLI_EXPORT_DIMENSIONS_ERROR, prepareCliExportDocument } from "./prepareExportDocument";
 import { clampZoomFocus } from "./vendor/zoomHelpers";
 
 const MP4_EXPORT_FPS = 60;
 
-function probeVideoDimensions(
+function probeVideoMetadata(
 	url: string,
 ): Promise<{ width: number; height: number; durationMs: number }> {
 	return new Promise((resolve, reject) => {
@@ -196,7 +195,7 @@ async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
 		}
 	}
 
-	const probed = await probeVideoDimensions(toFileUrl(media.screenVideoPath));
+	const probed = await probeVideoMetadata(toFileUrl(media.screenVideoPath));
 
 	// Migrate the .openscreen project onto the AxcutDocument the native
 	// compositor consumes. The migration is pure and carries zooms, annotations,
@@ -219,19 +218,25 @@ async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
 		const added = appendAutoZoomRanges(axcutDocument, cursorTelemetry, probed.durationMs);
 		window.electronAPI.cliLog("info", `Auto-zoom: added ${added} region(s) from cursor telemetry`);
 	}
+	const visibleAssetIds = resolveVisibleClips(axcutDocument).map((clip) => clip.assetId);
+	axcutDocument = await prepareCliExportDocument(
+		axcutDocument,
+		visibleAssetIds,
+		primaryAssetId,
+		probed,
+	);
 
 	// Output sizing mirrors the ExportDialog: crop-aware smallest clip on the
 	// timeline, normalized to the document's aspect ratio.
-	const probedAssetDims: Record<string, Dims> = {
-		[primaryAssetId]: { width: probed.width, height: probed.height },
+	const effectiveClipDims = collectEffectiveClipDims(axcutDocument);
+	const smallestSource = pickExtremeDims(effectiveClipDims, "smallest") ?? {
+		width: probed.width,
+		height: probed.height,
 	};
-	const effectiveClipDims = collectEffectiveClipDims(axcutDocument, probedAssetDims);
-	const smallestSource =
-		pickExtremeDims(effectiveClipDims, "smallest") ??
-		({ width: probed.width, height: probed.height } as Dims);
-	const largestSource =
-		pickExtremeDims(effectiveClipDims, "largest") ??
-		({ width: probed.width, height: probed.height } as Dims);
+	const largestSource = pickExtremeDims(effectiveClipDims, "largest") ?? {
+		width: probed.width,
+		height: probed.height,
+	};
 	const aspectRatio = getEditorSettings(axcutDocument).aspectRatio;
 	const aspectRatioValue = resolveAspectRatioValue(axcutDocument, aspectRatio);
 	const outDims = calculateMp4ExportSettings({
@@ -240,20 +245,17 @@ async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
 		sourceHeight: smallestSource.height,
 		aspectRatioValue,
 	});
-	const sourceMetadataValid = hasValidExportSourceDimensions(probed);
-	const dimensionsError =
-		"Export dimensions could not be determined from the source video. Verify the media file and retry.";
 	const mp4Resolution =
 		format === "mp4"
 			? resolveMp4ExportSettings({
 					quality,
 					aspectRatio,
-					sourceDimensions: sourceMetadataValid ? smallestSource : null,
-					originalDimensions: sourceMetadataValid ? largestSource : null,
+					sourceDimensions: smallestSource,
+					originalDimensions: largestSource,
 				})
 			: null;
 	if (mp4Resolution && !mp4Resolution.ok) {
-		throw new Error(dimensionsError);
+		throw new Error(CLI_EXPORT_DIMENSIONS_ERROR);
 	}
 
 	const clips = buildNativeClipList(axcutDocument);
@@ -305,7 +307,7 @@ async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
 		// it afterwards (the native pipeline has no extra-audio-track concept) and
 		// overwrite the same file.
 		if (!mp4Resolution?.ok) {
-			throw new Error(dimensionsError);
+			throw new Error(CLI_EXPORT_DIMENSIONS_ERROR);
 		}
 		await exportMultiNative(clips, outPath, sceneJson, {
 			width: mp4Resolution.settings.width,

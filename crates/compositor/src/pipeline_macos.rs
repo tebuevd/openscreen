@@ -612,17 +612,6 @@ pub struct ExportParams {
     pub codec: ExportCodec,
 }
 
-impl Default for ExportParams {
-    fn default() -> Self {
-        Self {
-            width: 1920,
-            height: 1080,
-            fps: None,
-            codec: ExportCodec::H264,
-        }
-    }
-}
-
 /// Encodeur ffmpeg — câblage `h264_videotoolbox` / `hevc_videotoolbox` (zero-copy
 /// sur `AV_PIX_FMT_VIDEOTOOLBOX`) + repli `libopenh264` / `libkvazaar` (software).
 /// Symétrique de `pipeline_windows::VideoEncoder` côté surface publique, à la

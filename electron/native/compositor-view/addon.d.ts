@@ -77,11 +77,10 @@ export interface GifParamsInput {
 	dither?: boolean;
 }
 
-/** Output size/framerate/codec the app wants. All optional — omitted → 1920x1080 / first
- *  clip's fps / h264. `width`/`height` are rounded to the nearest even number (NV12 4:2:0). */
+/** Output size/framerate/codec the app wants. Width and height are a required, validated pair. */
 export interface ExportParamsInput {
-	width?: number;
-	height?: number;
+	width: number;
+	height: number;
 	fps?: number;
 	/** "h264" | "h265". Anything else (e.g. "vp9", no AMF hardware equivalent) fails the export
 	 *  with a clear error instead of silently falling back to h264. */
@@ -158,13 +157,13 @@ export interface CompositorViewAddon {
 	/** Renders the real timeline (ordered clips + trims) to `outPath`, auto-pausing previews.
 	 *  `sceneJson` — same `SceneDescription` as the live preview (background/layout/webcam/cursor/
 	 *  effects); omitted or invalid → nothing configured is applied (not a masking fallback).
-	 *  `params` — output size/fps/codec; omitted → 1920x1080/first clip's fps/h264.
+	 *  `params` — required output size plus optional fps/codec.
 	 *  `onProgress` (frames encoded so far) is optional, throttled to ~10/s. */
 	exportMulti(
 		clips: ClipInput[],
 		outPath: string,
-		sceneJson?: string,
-		params?: ExportParamsInput,
+		sceneJson: string | undefined,
+		params: ExportParamsInput,
 		onProgress?: (frames: number) => void,
 	): Promise<ExportStats>;
 	/** Native GIF export. Identical inputs to `exportMulti` — same clips, same

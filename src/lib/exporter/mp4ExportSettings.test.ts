@@ -3,7 +3,10 @@ import { ASPECT_RATIO_PRESETS, type AspectRatio } from "@/utils/aspectRatioUtils
 import {
 	calculateEffectiveSourceDimensions,
 	calculateMp4ExportSettings,
+	MAX_MP4_EXPORT_DIMENSION,
+	MAX_MP4_EXPORT_PIXEL_AREA,
 	resolveMp4ExportSettings,
+	validateMp4ExportDimensions,
 	wouldUpscale,
 } from "./mp4ExportSettings";
 
@@ -271,5 +274,39 @@ describe("resolveMp4ExportSettings", () => {
 			width: 2560,
 			height: 1440,
 		});
+	});
+
+	it("allows DCI 8K landscape and portrait at the allocation boundary", () => {
+		expect(validateMp4ExportDimensions({ width: 8192, height: 4320 }).ok).toBe(true);
+		expect(validateMp4ExportDimensions({ width: 4320, height: 8192 }).ok).toBe(true);
+		expect(MAX_MP4_EXPORT_DIMENSION).toBe(8192);
+		expect(MAX_MP4_EXPORT_PIXEL_AREA).toBe(35_389_440);
+	});
+
+	it.each([
+		["one-sided", { width: 1920 }],
+		["odd", { width: 1920, height: 1079 }],
+		["axis limit", { width: 8194, height: 4320 }],
+		["pixel-area limit", { width: 8192, height: 4322 }],
+		["pathological square", { width: 8192, height: 8192 }],
+	])("rejects %s output dimensions", (_label, dimensions) => {
+		expect(validateMp4ExportDimensions(dimensions).ok).toBe(false);
+	});
+
+	it("rejects pathological fixed-tier aspect ratios and oversized Source before calculation", () => {
+		expect(
+			resolveMp4ExportSettings({
+				quality: "good",
+				aspectRatio: "10000:1",
+				sourceDimensions: null,
+			}),
+		).toEqual({ ok: false, reason: "invalid-output-dimensions" });
+		expect(
+			resolveMp4ExportSettings({
+				quality: "source",
+				aspectRatio: "16:9",
+				sourceDimensions: { width: Number.MAX_SAFE_INTEGER, height: 1080 },
+			}),
+		).toEqual({ ok: false, reason: "invalid-output-dimensions" });
 	});
 });

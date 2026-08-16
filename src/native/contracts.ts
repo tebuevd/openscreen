@@ -164,10 +164,10 @@ export interface CompositorExportResult {
 	videoDurationS: number;
 }
 
-/** Taille/cadence/codec de sortie voulus. Tout omis → 1920x1080 / fps du 1er clip / h264. */
+/** Taille/cadence/codec de sortie voulus. La taille est toujours une paire explicite. */
 export interface CompositorExportParams {
-	width?: number;
-	height?: number;
+	width: number;
+	height: number;
 	fps?: number;
 	/** "h264" | "h265" — pas de vp9 (aucun équivalent matériel AMF côté natif). */
 	codec?: string;
@@ -719,7 +719,7 @@ export type NativeBridgeRequest =
 				clips: CompositorClipInput[];
 				outPath?: string;
 				sceneJson?: string;
-				params?: CompositorExportParams;
+				params: CompositorExportParams;
 			};
 			requestId?: string;
 	  }

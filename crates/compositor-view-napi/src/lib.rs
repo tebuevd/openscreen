@@ -350,17 +350,69 @@ pub struct ClipInput {
     pub has_audio: bool,
 }
 
-/// Taille/cadence/codec de sortie voulus par l'app (modale d'export). Tous optionnels :
-/// absent → comportement historique (1920x1080, fps du 1er clip, h264). `width`/`height`
-/// sont arrondis au pair le plus proche (exigence NV12 4:2:0) côté `export_multi`.
+/// Taille/cadence/codec de sortie voulus par l'app (modale d'export). La taille est une paire
+/// explicite validée avant toute allocation ; fps et codec gardent leurs défauts historiques.
 #[napi(object)]
 pub struct ExportParamsInput {
-    pub width: Option<u32>,
-    pub height: Option<u32>,
+    // Keep raw JS numbers until validation: napi's direct number→u32 conversion truncates
+    // fractions, which would let a caller bypass the integer contract before Rust sees it.
+    pub width: f64,
+    pub height: f64,
     pub fps: Option<u32>,
     /// "h264" | "h265". Toute autre valeur (ex. "vp9", pas d'équivalent matériel AMF) fait
     /// échouer l'export avec un message clair plutôt que de silencieusement retomber sur h264.
     pub codec: Option<String>,
+}
+
+// Same policy as src/lib/exporter/mp4ExportSettings.ts: ordinary DCI 8K in either orientation,
+// without admitting pathological square/extreme-aspect allocations.
+const MAX_EXPORT_DIMENSION: u32 = 8192;
+const MAX_EXPORT_PIXEL_AREA: u64 = 8192 * 4320;
+
+fn validate_export_dimensions(width: f64, height: f64) -> Result<(u32, u32)> {
+    if !width.is_finite()
+        || !height.is_finite()
+        || width.fract() != 0.0
+        || height.fract() != 0.0
+        || width <= 0.0
+        || height <= 0.0
+        || width > f64::from(MAX_EXPORT_DIMENSION)
+        || height > f64::from(MAX_EXPORT_DIMENSION)
+    {
+        return Err(Error::from_reason(format!(
+            "MP4 export width and height must both be positive even integers, no greater than {MAX_EXPORT_DIMENSION} per axis or {MAX_EXPORT_PIXEL_AREA} total pixels"
+        )));
+    }
+    let width = width as u32;
+    let height = height as u32;
+    let pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| Error::from_reason("MP4 export pixel-area overflow"))?;
+    if width % 2 != 0 || height % 2 != 0 || pixels > MAX_EXPORT_PIXEL_AREA {
+        return Err(Error::from_reason(format!(
+            "MP4 export width and height must both be positive even integers, no greater than {MAX_EXPORT_DIMENSION} per axis or {MAX_EXPORT_PIXEL_AREA} total pixels"
+        )));
+    }
+    Ok((width, height))
+}
+
+fn resolve_export_params(params: ExportParamsInput) -> Result<pipeline::ExportParams> {
+    let (width, height) = validate_export_dimensions(params.width, params.height)?;
+    let codec = match params.codec.as_deref() {
+        None | Some("h264") => pipeline::ExportCodec::H264,
+        Some("h265") => pipeline::ExportCodec::H265,
+        Some(other) => {
+            return Err(Error::from_reason(format!(
+                "codec d'export \"{other}\" non supporté par le pipeline natif (h264/h265 seulement — pas d'équivalent matériel AMF pour VP9, et le chemin logiciel testé était trop lent pour être utile)"
+            )));
+        }
+    };
+    Ok(pipeline::ExportParams {
+        width,
+        height,
+        fps: params.fps,
+        codec,
+    })
 }
 
 /// Export multiclip mesuré (worker libuv). Rend la vraie timeline (clips + trims) en un MP4.
@@ -373,7 +425,7 @@ pub struct ExportMultiTask {
     out_path: String,
     clips: Vec<pipeline::ClipSource>,
     scene_json: Option<String>,
-    params: Option<ExportParamsInput>,
+    params: pipeline::ExportParams,
     on_progress: Option<ThreadsafeFunction<u32, ErrorStrategy::Fatal>>,
 }
 
@@ -404,30 +456,8 @@ impl Task for ExportMultiTask {
             cfg.cursor = false;
         }
 
-        let mut export_params = pipeline::ExportParams::default();
-        if let Some(p) = &self.params {
-            if let Some(w) = p.width {
-                export_params.width = w.max(2) & !1; // pair le plus proche (>=2, NV12)
-            }
-            if let Some(h) = p.height {
-                export_params.height = h.max(2) & !1;
-            }
-            export_params.fps = p.fps;
-            if let Some(codec) = &p.codec {
-                export_params.codec = match codec.as_str() {
-                    "h264" => pipeline::ExportCodec::H264,
-                    "h265" => pipeline::ExportCodec::H265,
-                    other => {
-                        return Err(Error::from_reason(format!(
-                            "codec d'export \"{other}\" non supporté par le pipeline natif (h264/h265 seulement — pas d'équivalent matériel AMF pour VP9, et le chemin logiciel testé était trop lent pour être utile)"
-                        )));
-                    }
-                };
-            }
-        }
-
         // Le compositeur rastérise à la taille RÉELLEMENT encodée — d'où sa
-        // construction ici, une fois `export_params` résolu.
+        // construction ici, une fois `self.params` validé.
         //
         // Avant : il composait toujours en 1920×1080 puis `blit_resized` étirait
         // vers la taille d'export. Deux défauts, une seule cause — tout export
@@ -436,7 +466,7 @@ impl Task for ExportMultiTask {
         // compensation géométrique. En construisant le compositeur à la
         // géométrie de sortie, `blit_resized` devient une identité et les pixels
         // sont rastérisés exactement là où ils seront encodés.
-        let comp = Compositor::new_sized(&gpu, export_params.width, export_params.height)
+        let comp = Compositor::new_sized(&gpu, self.params.width, self.params.height)
             .map_err(|e| Error::from_reason(format!("{e:#}")))?;
         if let Some(scene) = &scene {
             comp.set_live_params(live_params_from_scene(scene));
@@ -450,7 +480,7 @@ impl Task for ExportMultiTask {
             &gpu,
             &comp,
             &cfg,
-            &export_params,
+            &self.params,
             &mut progress,
         )
         .map_err(|e| Error::from_reason(format!("{e:#}")))?;
@@ -464,7 +494,7 @@ impl Task for ExportMultiTask {
 
 /// Lance un export multiclip natif (vraie timeline → MP4) et résout `Promise<ExportStats>`.
 /// `scene_json` : même `SceneDescription` que la preview (fond/layout/webcam/effets/curseur).
-/// `params` : taille/cadence/codec de sortie voulus (absent → 1920x1080/fps du 1er clip/h264).
+/// `params` : taille explicite validée, cadence/codec de sortie voulus.
 /// `on_progress(framesEncodées)` optionnel — rappelé côté JS à ~10 Hz max pendant le rendu ;
 /// le JS calcule lui-même le pourcentage (il connaît déjà le total attendu, durée×fps des clips).
 #[napi]
@@ -472,9 +502,10 @@ pub fn export_multi(
     clips: Vec<ClipInput>,
     out_path: String,
     scene_json: Option<String>,
-    params: Option<ExportParamsInput>,
+    params: ExportParamsInput,
     on_progress: Option<JsFunction>,
 ) -> Result<AsyncTask<ExportMultiTask>> {
+    let params = resolve_export_params(params)?;
     let clips = clips
         .into_iter()
         .map(|c| pipeline::ClipSource {
@@ -493,6 +524,63 @@ pub fn export_multi(
         params,
         on_progress: make_progress_tsfn(on_progress)?,
     }))
+}
+
+#[cfg(test)]
+mod export_dimension_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_common_and_dci_8k_dimensions_in_both_orientations() {
+        for (width, height) in [
+            (1920.0, 1080.0),
+            (2880.0, 1864.0),
+            (8192.0, 4320.0),
+            (4320.0, 8192.0),
+        ] {
+            assert!(
+                validate_export_dimensions(width, height).is_ok(),
+                "{width}x{height}"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_exact_valid_app_dimensions() {
+        for (width, height) in [(1920.0, 1080.0), (2880.0, 1864.0)] {
+            let params = resolve_export_params(ExportParamsInput {
+                width,
+                height,
+                fps: Some(60),
+                codec: Some("h264".to_string()),
+            })
+            .expect("valid export params");
+            assert_eq!((params.width, params.height), (width as u32, height as u32));
+        }
+    }
+
+    #[test]
+    fn rejects_zero_odd_axis_and_oversized_allocations() {
+        for (width, height) in [
+            (0.0, 1080.0),
+            (1920.0, 0.0),
+            (1919.0, 1080.0),
+            (1920.0, 1079.0),
+            (1920.5, 1080.0),
+            (f64::NAN, 1080.0),
+            (f64::INFINITY, 1080.0),
+            (8194.0, 4320.0),
+            (4320.0, 8194.0),
+            (8192.0, 4322.0),
+            (8192.0, 8192.0),
+            (f64::from(u32::MAX - 1), f64::from(u32::MAX - 1)),
+        ] {
+            assert!(
+                validate_export_dimensions(width, height).is_err(),
+                "{width}x{height}"
+            );
+        }
+    }
 }
 
 /// Sortie GIF native (slice 1) — taille, cadence, compteur de loop, dithering.
