@@ -1,5 +1,17 @@
 import CoreGraphics
 
+enum SourceGeometryMethod: String, Equatable {
+	case screenCaptureKitContentRect = "screen-capture-kit-content-rect"
+	case displayModeFallback = "display-mode-fallback"
+	case sanitizedFallback = "sanitized-fallback"
+}
+
+struct SourcePointGeometry: Equatable {
+	let contentRectPoints: CGRect
+	let pixelsPerPoint: CGFloat
+	let method: SourceGeometryMethod
+}
+
 struct CaptureDimensions: Equatable {
 	let width: Int
 	let height: Int
@@ -10,6 +22,8 @@ enum CaptureGeometry {
 	static let maximumWidth = 3840
 	static let maximumHeight = 2160
 	static let maximumSafeJSONNumber = 9_007_199_254_740_991.0
+	static let maximumSensiblePixelsPerPoint = 16.0
+	static let sourcePixelRoundingTolerance = 0.5
 
 	static func pixelSize(for pointSize: CGSize, pointPixelScale: CGFloat) -> CGSize {
 		let scale = pointPixelScale.isFinite && pointPixelScale > 0 ? pointPixelScale : 1
@@ -31,6 +45,59 @@ enum CaptureGeometry {
 	static func jsonSafeNumber(_ value: CGFloat) -> Double {
 		let number = Double(value)
 		return number.isFinite && abs(number) <= maximumSafeJSONNumber ? number : 0
+	}
+
+	static func derivedPixelsPerPoint(pointSize: CGSize, pixelSize: CGSize) -> CGFloat {
+		let pointWidth = Double(pointSize.width)
+		let pixelWidth = Double(pixelSize.width)
+		guard pointWidth.isFinite, pixelWidth.isFinite, pointWidth > 0, pixelWidth > 0 else {
+			return 1
+		}
+		let scale = pixelWidth / pointWidth
+		return scale.isFinite && scale > 0 && scale <= maximumSensiblePixelsPerPoint
+			? CGFloat(scale)
+			: 1
+	}
+
+	static func sourcePointGeometry(
+		contentRectPoints: CGRect,
+		pixelsPerPoint: CGFloat,
+		sourcePixelSize: CGSize,
+		method: SourceGeometryMethod
+	) -> SourcePointGeometry {
+		let x = Double(contentRectPoints.origin.x)
+		let y = Double(contentRectPoints.origin.y)
+		let pointWidth = Double(contentRectPoints.width)
+		let pointHeight = Double(contentRectPoints.height)
+		let scale = Double(pixelsPerPoint)
+		let sourceWidth = Double(sourcePixelSize.width)
+		let sourceHeight = Double(sourcePixelSize.height)
+		let hasSafeRect = [x, y, pointWidth, pointHeight].allSatisfy {
+			$0.isFinite && abs($0) <= maximumSafeJSONNumber
+		} && pointWidth > 0 && pointHeight > 0
+			&& (x + pointWidth).isFinite && abs(x + pointWidth) <= maximumSafeJSONNumber
+			&& (y + pointHeight).isFinite && abs(y + pointHeight) <= maximumSafeJSONNumber
+		let hasSafeScale = scale.isFinite && scale > 0 && scale <= maximumSensiblePixelsPerPoint
+		let hasConsistentPixels = sourceWidth.isFinite && sourceHeight.isFinite
+			&& sourceWidth > 0 && sourceHeight > 0
+			&& sourceWidth <= maximumSafeJSONNumber && sourceHeight <= maximumSafeJSONNumber
+			&& abs((pointWidth * scale) - sourceWidth) <= sourcePixelRoundingTolerance
+			&& abs((pointHeight * scale) - sourceHeight) <= sourcePixelRoundingTolerance
+
+		if hasSafeRect, hasSafeScale, hasConsistentPixels {
+			return SourcePointGeometry(
+				contentRectPoints: contentRectPoints,
+				pixelsPerPoint: pixelsPerPoint,
+				method: method
+			)
+		}
+
+		let safeSourceSize = sanitizedPixelSize(sourcePixelSize)
+		return SourcePointGeometry(
+			contentRectPoints: CGRect(origin: .zero, size: safeSourceSize),
+			pixelsPerPoint: 1,
+			method: .sanitizedFallback
+		)
 	}
 
 	static func fittedDimensions(for sourceSize: CGSize) -> CaptureDimensions {

@@ -15,6 +15,9 @@ describe("native macOS recording-started events", () => {
 		sourcePixelWidth: 2880,
 		sourcePixelHeight: 1864,
 		scale: 1,
+		sourceGeometryMethod: "screen-capture-kit-content-rect",
+		sourceContentRectPoints: { x: -1440, y: 0, width: 1440, height: 932 },
+		sourcePixelsPerPoint: 2,
 	});
 
 	it("returns a complete trusted event when all geometry is valid", () => {
@@ -27,6 +30,22 @@ describe("native macOS recording-started events", () => {
 			sourcePixelWidth: 2880,
 			sourcePixelHeight: 1864,
 			scale: 1,
+			sourceGeometryMethod: "screen-capture-kit-content-rect",
+			sourceContentRectPoints: { x: -1440, y: 0, width: 1440, height: 932 },
+			sourcePixelsPerPoint: 2,
+		});
+	});
+
+	it("accepts display-mode fallback geometry and half-pixel rounding tolerance", () => {
+		expect(
+			parseNativeMacHelperRecordingStartedEvent({
+				...validEvent(),
+				sourceGeometryMethod: "display-mode-fallback",
+				sourcePixelWidth: 2880.5,
+			}),
+		).toMatchObject({
+			sourceGeometryMethod: "display-mode-fallback",
+			sourcePixelWidth: 2880.5,
 		});
 	});
 
@@ -39,6 +58,7 @@ describe("native macOS recording-started events", () => {
 				sourcePixelWidth: 5120,
 				sourcePixelHeight: 2880,
 				scale: 0.75,
+				sourceContentRectPoints: { x: 0, y: 0, width: 2560, height: 1440 },
 			}),
 		).toMatchObject({ width: 3840, height: 2160, scale: 0.75 });
 	});
@@ -79,6 +99,28 @@ describe("native macOS recording-started events", () => {
 		["non-positive bounds width", { captureBounds: { x: 0, y: 0, width: 0, height: 1 } }],
 		["NaN source width", { sourcePixelWidth: Number.NaN }],
 		["unsafe source height", { sourcePixelHeight: 2 ** 53 }],
+		["missing source geometry method", { sourceGeometryMethod: undefined }],
+		["unknown source geometry method", { sourceGeometryMethod: "content-rect" }],
+		["missing source point rect", { sourceContentRectPoints: undefined }],
+		[
+			"NaN source point origin",
+			{
+				sourceContentRectPoints: {
+					x: Number.NaN,
+					y: 0,
+					width: 1440,
+					height: 932,
+				},
+			},
+		],
+		[
+			"non-positive source point width",
+			{ sourceContentRectPoints: { x: 0, y: 0, width: 0, height: 932 } },
+		],
+		["NaN source pixels per point", { sourcePixelsPerPoint: Number.NaN }],
+		["zero source pixels per point", { sourcePixelsPerPoint: 0 }],
+		["implausible source pixels per point", { sourcePixelsPerPoint: 17 }],
+		["source pixels outside rounding tolerance", { sourcePixelWidth: 2880.51 }],
 		["NaN scale", { scale: Number.NaN }],
 		["zero scale", { scale: 0 }],
 		["scale above one", { scale: 1.01 }],

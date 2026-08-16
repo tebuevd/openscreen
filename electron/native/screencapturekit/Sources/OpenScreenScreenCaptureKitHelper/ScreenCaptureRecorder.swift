@@ -126,6 +126,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		let height: Int
 		let sourcePixelSize: CGSize
 		let scale: Double
+		let sourcePointGeometry: SourcePointGeometry
 		let capturesIndependentWindow: Bool
 		// Global frame (points, top-left origin) of the captured region. Used by the
 		// renderer to normalize cursor positions into the captured window's space.
@@ -154,6 +155,11 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	private var outputHeight = 1080
 	private var sourcePixelSize = CGSize(width: 1920, height: 1080)
 	private var captureScale = 1.0
+	private var sourcePointGeometry = SourcePointGeometry(
+		contentRectPoints: CGRect(x: 0, y: 0, width: 1920, height: 1080),
+		pixelsPerPoint: 1,
+		method: .sanitizedFallback
+	)
 	private var captureFrame = CGRect.zero
 	private let microphoneOutputTypeRawValue = 2
 	private let hostClock = CMClockGetHostTimeClock()
@@ -174,6 +180,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		outputHeight = target.height
 		sourcePixelSize = target.sourcePixelSize
 		captureScale = target.scale
+		sourcePointGeometry = target.sourcePointGeometry
 		captureFrame = target.captureFrame
 		let configuration = makeStreamConfiguration(for: target)
 		let stream = SCStream(filter: target.filter, configuration: configuration, delegate: self)
@@ -328,7 +335,10 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 					"sourcePixelWidth": Double(sourcePixelSize.width),
 					"sourcePixelHeight": Double(sourcePixelSize.height),
 					"scale": captureScale,
-					"captureBounds": captureBoundsPayload(),
+					"sourceGeometryMethod": sourcePointGeometry.method.rawValue,
+					"sourceContentRectPoints": rectanglePayload(sourcePointGeometry.contentRectPoints),
+					"sourcePixelsPerPoint": Double(sourcePointGeometry.pixelsPerPoint),
+					"captureBounds": rectanglePayload(captureFrame),
 				])
 			} else if !appended {
 				reportWriterFailure("video append")
@@ -391,12 +401,12 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		}
 	}
 
-	private func captureBoundsPayload() -> [String: Double] {
+	private func rectanglePayload(_ rectangle: CGRect) -> [String: Double] {
 		return [
-			"x": CaptureGeometry.jsonSafeNumber(captureFrame.origin.x),
-			"y": CaptureGeometry.jsonSafeNumber(captureFrame.origin.y),
-			"width": CaptureGeometry.jsonSafeNumber(captureFrame.size.width),
-			"height": CaptureGeometry.jsonSafeNumber(captureFrame.size.height),
+			"x": CaptureGeometry.jsonSafeNumber(rectangle.origin.x),
+			"y": CaptureGeometry.jsonSafeNumber(rectangle.origin.y),
+			"width": CaptureGeometry.jsonSafeNumber(rectangle.size.width),
+			"height": CaptureGeometry.jsonSafeNumber(rectangle.size.height),
 		]
 	}
 
@@ -411,18 +421,36 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			}
 			let filter = SCContentFilter(display: display, excludingWindows: [])
 			let rawSourceSize: CGSize
+			let sourceContentRectPoints: CGRect
+			let sourcePixelsPerPoint: CGFloat
+			let sourceGeometryMethod: SourceGeometryMethod
 			if #available(macOS 14.0, *) {
+				sourceContentRectPoints = filter.contentRect
+				sourcePixelsPerPoint = CGFloat(filter.pointPixelScale)
+				sourceGeometryMethod = .screenCaptureKitContentRect
 				rawSourceSize = CaptureGeometry.pixelSize(
-					for: filter.contentRect.size,
-					pointPixelScale: CGFloat(filter.pointPixelScale)
+					for: sourceContentRectPoints.size,
+					pointPixelScale: sourcePixelsPerPoint
 				)
 			} else {
+				sourceContentRectPoints = display.frame
+				sourceGeometryMethod = .displayModeFallback
 				rawSourceSize = Self.displayPixelSize(
 					for: display.displayID,
 					fallback: display.frame.size
 				)
+				sourcePixelsPerPoint = CaptureGeometry.derivedPixelsPerPoint(
+					pointSize: sourceContentRectPoints.size,
+					pixelSize: rawSourceSize
+				)
 			}
 			let sourceSize = CaptureGeometry.sanitizedPixelSize(rawSourceSize)
+			let sourcePointGeometry = CaptureGeometry.sourcePointGeometry(
+				contentRectPoints: sourceContentRectPoints,
+				pixelsPerPoint: sourcePixelsPerPoint,
+				sourcePixelSize: sourceSize,
+				method: sourceGeometryMethod
+			)
 			let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize)
 			return CaptureTarget(
 				filter: filter,
@@ -430,6 +458,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 				height: dimensions.height,
 				sourcePixelSize: sourceSize,
 				scale: dimensions.scale,
+				sourcePointGeometry: sourcePointGeometry,
 				capturesIndependentWindow: false,
 				captureFrame: display.frame
 			)
@@ -442,10 +471,16 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			}
 			let filter = SCContentFilter(desktopIndependentWindow: window)
 			let rawSourceSize: CGSize
+			let sourceContentRectPoints: CGRect
+			let sourcePixelsPerPoint: CGFloat
+			let sourceGeometryMethod: SourceGeometryMethod
 			if #available(macOS 14.0, *) {
+				sourceContentRectPoints = filter.contentRect
+				sourcePixelsPerPoint = CGFloat(filter.pointPixelScale)
+				sourceGeometryMethod = .screenCaptureKitContentRect
 				rawSourceSize = CaptureGeometry.pixelSize(
-					for: filter.contentRect.size,
-					pointPixelScale: CGFloat(filter.pointPixelScale)
+					for: sourceContentRectPoints.size,
+					pointPixelScale: sourcePixelsPerPoint
 				)
 			} else {
 				let displayIndex = CaptureGeometry.displayIndex(
@@ -453,12 +488,21 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 					displayFrames: content.displays.map(\.frame)
 				)
 				let displayId = displayIndex.map { content.displays[$0].displayID } ?? CGMainDisplayID()
+				sourceContentRectPoints = window.frame
+				sourcePixelsPerPoint = Self.pointPixelScale(for: displayId)
+				sourceGeometryMethod = .displayModeFallback
 				rawSourceSize = CaptureGeometry.pixelSize(
-					for: window.frame.size,
-					pointPixelScale: Self.pointPixelScale(for: displayId)
+					for: sourceContentRectPoints.size,
+					pointPixelScale: sourcePixelsPerPoint
 				)
 			}
 			let sourceSize = CaptureGeometry.sanitizedPixelSize(rawSourceSize)
+			let sourcePointGeometry = CaptureGeometry.sourcePointGeometry(
+				contentRectPoints: sourceContentRectPoints,
+				pixelsPerPoint: sourcePixelsPerPoint,
+				sourcePixelSize: sourceSize,
+				method: sourceGeometryMethod
+			)
 			let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize)
 			return CaptureTarget(
 				filter: filter,
@@ -466,6 +510,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 				height: dimensions.height,
 				sourcePixelSize: sourceSize,
 				scale: dimensions.scale,
+				sourcePointGeometry: sourcePointGeometry,
 				capturesIndependentWindow: true,
 				captureFrame: window.frame
 			)

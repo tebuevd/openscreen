@@ -2528,12 +2528,17 @@ export function registerIpcHandlers(
 			const captureBounds = recordingStarted.captureBounds;
 			activeMacCaptureBounds = captureBounds;
 			console.info("[native-sck] capture geometry", {
-				sourcePointBounds: captureBounds,
+				cursorNormalizationBoundsPoints: captureBounds,
+				sourcePointGeometry: {
+					method: recordingStarted.sourceGeometryMethod,
+					contentRectPoints: recordingStarted.sourceContentRectPoints,
+					pixelsPerPoint: recordingStarted.sourcePixelsPerPoint,
+				},
 				uncappedSourcePixels: {
 					width: recordingStarted.sourcePixelWidth,
 					height: recordingStarted.sourcePixelHeight,
 				},
-				appliedScale: recordingStarted.scale,
+				capFitScale: recordingStarted.scale,
 				finalCapturePixels: {
 					width: recordingStarted.width,
 					height: recordingStarted.height,

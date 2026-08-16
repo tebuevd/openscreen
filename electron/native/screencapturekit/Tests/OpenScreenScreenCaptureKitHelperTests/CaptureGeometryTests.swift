@@ -5,11 +5,21 @@ import XCTest
 
 final class CaptureGeometryTests: XCTestCase {
 	func testRetinaPointSizeUsesBackingPixels() {
+		let contentRectPoints = CGRect(x: -1440, y: 0, width: 1440, height: 932)
 		let sourceSize = CaptureGeometry.pixelSize(
-			for: CGSize(width: 1440, height: 932),
+			for: contentRectPoints.size,
 			pointPixelScale: 2
 		)
+		let sourceGeometry = CaptureGeometry.sourcePointGeometry(
+			contentRectPoints: contentRectPoints,
+			pixelsPerPoint: 2,
+			sourcePixelSize: sourceSize,
+			method: .screenCaptureKitContentRect
+		)
 
+		XCTAssertEqual(sourceGeometry.contentRectPoints, contentRectPoints)
+		XCTAssertEqual(sourceGeometry.pixelsPerPoint, 2)
+		XCTAssertEqual(sourceGeometry.method, .screenCaptureKitContentRect)
 		XCTAssertEqual(
 			CaptureGeometry.fittedDimensions(for: sourceSize),
 			CaptureDimensions(width: 2880, height: 1864, scale: 1)
@@ -93,6 +103,42 @@ final class CaptureGeometryTests: XCTestCase {
 			CaptureGeometry.jsonSafeNumber(CaptureGeometry.maximumSafeJSONNumber + 1),
 			0
 		)
+	}
+
+	func testDisplayModeFallbackDerivesPixelsPerPoint() {
+		let contentRectPoints = CGRect(x: 0, y: 0, width: 1440, height: 932)
+		let sourceSize = CGSize(width: 2880, height: 1864)
+		let pixelsPerPoint = CaptureGeometry.derivedPixelsPerPoint(
+			pointSize: contentRectPoints.size,
+			pixelSize: sourceSize
+		)
+		let sourceGeometry = CaptureGeometry.sourcePointGeometry(
+			contentRectPoints: contentRectPoints,
+			pixelsPerPoint: pixelsPerPoint,
+			sourcePixelSize: sourceSize,
+			method: .displayModeFallback
+		)
+
+		XCTAssertEqual(sourceGeometry.contentRectPoints, contentRectPoints)
+		XCTAssertEqual(sourceGeometry.pixelsPerPoint, 2)
+		XCTAssertEqual(sourceGeometry.method, .displayModeFallback)
+	}
+
+	func testInvalidSourcePointGeometryUsesJSONSafeFallback() {
+		let sourceGeometry = CaptureGeometry.sourcePointGeometry(
+			contentRectPoints: CGRect(x: CGFloat.nan, y: 0, width: 1440, height: 932),
+			pixelsPerPoint: CGFloat.infinity,
+			sourcePixelSize: CGSize(width: 2880, height: 1864),
+			method: .screenCaptureKitContentRect
+		)
+
+		XCTAssertEqual(sourceGeometry.contentRectPoints, CGRect(x: 0, y: 0, width: 2880, height: 1864))
+		XCTAssertEqual(sourceGeometry.pixelsPerPoint, 1)
+		XCTAssertEqual(sourceGeometry.method, .sanitizedFallback)
+		XCTAssertTrue(sourceGeometry.contentRectPoints.origin.x.isFinite)
+		XCTAssertTrue(sourceGeometry.contentRectPoints.origin.y.isFinite)
+		XCTAssertTrue(sourceGeometry.contentRectPoints.width.isFinite)
+		XCTAssertTrue(sourceGeometry.contentRectPoints.height.isFinite)
 	}
 
 	func testOutputsArePositiveEvenAndWithinLimits() {
