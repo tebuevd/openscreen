@@ -226,6 +226,7 @@ export interface AiEditionDocumentResult {
 	success: boolean;
 	document?: unknown;
 	error?: string;
+	notFound?: boolean;
 }
 
 export interface AiEditionLlmConfig {

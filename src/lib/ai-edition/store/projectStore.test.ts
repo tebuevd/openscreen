@@ -209,8 +209,9 @@ describe("useProjectStore", () => {
 		});
 	});
 
-	it("keeps the current project usable when an import fails", async () => {
+	it("reloads the current project when an import fails", async () => {
 		bridgeMocks.save.mockResolvedValue({ success: false, error: "invalid import" });
+		bridgeMocks.get.mockResolvedValue({ success: true, document: sampleDoc });
 		loadDocument();
 		const oldGeneration = useProjectStore.getState().documentGeneration;
 
@@ -225,6 +226,7 @@ describe("useProjectStore", () => {
 			error: null,
 		});
 		expect(useProjectStore.getState().documentGeneration).toBeGreaterThan(oldGeneration);
+		expect(bridgeMocks.get).toHaveBeenCalledWith("proj_test");
 	});
 
 	it("does not apply an import response after another project is opened", async () => {
@@ -294,8 +296,9 @@ describe("useProjectStore", () => {
 		});
 	});
 
-	it("keeps an active project usable when deletion fails", async () => {
+	it("reloads an active project when deletion fails", async () => {
 		bridgeMocks.delete.mockResolvedValue({ success: false, error: "permission denied" });
+		bridgeMocks.get.mockResolvedValue({ success: true, document: sampleDoc });
 		loadDocument();
 		const oldGeneration = useProjectStore.getState().documentGeneration;
 
@@ -310,6 +313,7 @@ describe("useProjectStore", () => {
 			error: null,
 		});
 		expect(useProjectStore.getState().documentGeneration).toBeGreaterThan(oldGeneration);
+		expect(bridgeMocks.get).toHaveBeenCalledWith("proj_test");
 	});
 
 	it("does not clear a project opened while deletion is pending", async () => {

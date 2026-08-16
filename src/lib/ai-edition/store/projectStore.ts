@@ -113,6 +113,78 @@ function mergeAddedAsset(
 	};
 }
 
+interface LifecycleRecoveryOptions {
+	documentGeneration: number;
+	activeProjectId: string | null;
+	targetProjectId: string;
+	fallbackDocument: AxcutDocument | null;
+	operationError: unknown;
+	clearIfMissing: boolean;
+}
+
+async function reconcileLifecycleFailure(
+	get: () => ProjectState,
+	set: (partial: Partial<ProjectState>) => void,
+	options: LifecycleRecoveryOptions,
+): Promise<void> {
+	const isCurrentOperation = () => {
+		const current = get();
+		return (
+			current.documentGeneration === options.documentGeneration &&
+			current.projectId === options.activeProjectId
+		);
+	};
+
+	if (!isCurrentOperation()) return;
+	try {
+		const result = await nativeBridgeClient.aiEdition.get(options.targetProjectId);
+		if (!isCurrentOperation()) return;
+		if (!result.success || !result.document) {
+			if (options.clearIfMissing && result.notFound) {
+				get().clear();
+				return;
+			}
+			throw new Error(result.error ?? "Failed to reload project after lifecycle failure");
+		}
+
+		const document = parseDocument(result.document);
+		if (document.project.id !== options.targetProjectId) {
+			throw new Error(
+				`Reloaded project ${document.project.id}, expected ${options.targetProjectId}`,
+			);
+		}
+		if (!isCurrentOperation()) return;
+		set({
+			projectId: document.project.id,
+			document,
+			revision: get().revision + 1,
+			status: "ready",
+			error: null,
+			dirty: false,
+			lastSavedAt: new Date(),
+		});
+		void import("./undo").then(({ clearHistory }) => clearHistory());
+	} catch (reconciliationError) {
+		if (!isCurrentOperation()) return;
+		const operationMessage =
+			options.operationError instanceof Error
+				? options.operationError.message
+				: String(options.operationError);
+		const reconciliationMessage =
+			reconciliationError instanceof Error
+				? reconciliationError.message
+				: String(reconciliationError);
+		set({
+			projectId: options.fallbackDocument?.project.id ?? options.activeProjectId,
+			document: options.fallbackDocument,
+			revision: get().revision + 1,
+			status: "error",
+			error: `${operationMessage} Recovery failed: ${reconciliationMessage}`,
+			dirty: options.fallbackDocument !== null,
+		});
+	}
+}
+
 export const useProjectStore = create<ProjectState>((set, get) => ({
 	projectId: null,
 	document: null,
@@ -207,9 +279,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			void import("./undo").then(({ clearHistory }) => clearHistory());
 			return true;
 		} catch (error) {
-			if (get().documentGeneration === documentGeneration) {
-				set({ status: before.status, error: before.error });
-			}
+			await reconcileLifecycleFailure(get, set, {
+				documentGeneration,
+				activeProjectId: before.projectId,
+				targetProjectId: imported.project.id,
+				fallbackDocument: before.document ?? imported,
+				operationError: error,
+				clearIfMissing: false,
+			});
 			throw error;
 		}
 	},
@@ -228,12 +305,15 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			const result = await nativeBridgeClient.aiEdition.delete(projectId);
 			if (!result.success) throw new Error(result.error ?? "Failed to delete project");
 		} catch (error) {
-			if (
-				documentGeneration !== null &&
-				get().documentGeneration === documentGeneration &&
-				get().projectId === projectId
-			) {
-				set({ status: before.status, error: before.error });
+			if (documentGeneration !== null) {
+				await reconcileLifecycleFailure(get, set, {
+					documentGeneration,
+					activeProjectId: before.projectId,
+					targetProjectId: projectId,
+					fallbackDocument: before.document,
+					operationError: error,
+					clearIfMissing: true,
+				});
 			}
 			throw error;
 		}

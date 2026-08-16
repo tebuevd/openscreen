@@ -346,7 +346,7 @@ function createShimBridgeClient() {
 				return Promise.resolve(
 					migrated
 						? { success: true, document: migrated }
-						: { success: false, error: "Project not found" },
+						: { success: false, error: "Project not found", notFound: true },
 				);
 			},
 			create: (title?: string) => {

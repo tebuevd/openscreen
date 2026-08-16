@@ -20,7 +20,7 @@ import {
 	translateCaptionSegments,
 } from "../../ai-edition/caption-translate";
 import type { ChatEventSink } from "../../ai-edition/chat-service";
-import type { DocumentService } from "../../ai-edition/document-service";
+import { DocumentNotFoundError, type DocumentService } from "../../ai-edition/document-service";
 import type { LlmConfigStore, LlmCredential } from "../../ai-edition/llm-config-store";
 import {
 	listAnthropicModels,
@@ -110,6 +110,7 @@ export class AiEditionService {
 			return {
 				success: false,
 				error: error instanceof Error ? error.message : String(error),
+				notFound: error instanceof DocumentNotFoundError,
 			};
 		}
 	}
