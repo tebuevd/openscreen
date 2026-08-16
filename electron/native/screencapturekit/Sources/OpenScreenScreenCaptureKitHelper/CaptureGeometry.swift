@@ -3,6 +3,7 @@ import CoreGraphics
 struct CaptureDimensions: Equatable {
 	let width: Int
 	let height: Int
+	let scale: Double
 }
 
 enum CaptureGeometry {
@@ -19,7 +20,7 @@ enum CaptureGeometry {
 		let sourceHeight = Double(sourceSize.height)
 
 		guard sourceWidth.isFinite, sourceHeight.isFinite, sourceWidth > 0, sourceHeight > 0 else {
-			return CaptureDimensions(width: 2, height: 2)
+			return CaptureDimensions(width: 2, height: 2, scale: 1)
 		}
 
 		let scale = min(
@@ -29,7 +30,8 @@ enum CaptureGeometry {
 		)
 		return CaptureDimensions(
 			width: positiveEvenFloor(sourceWidth * scale),
-			height: positiveEvenFloor(sourceHeight * scale)
+			height: positiveEvenFloor(sourceHeight * scale),
+			scale: scale
 		)
 	}
 

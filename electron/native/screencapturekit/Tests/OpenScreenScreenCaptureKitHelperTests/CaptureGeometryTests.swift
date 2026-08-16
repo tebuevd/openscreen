@@ -12,7 +12,7 @@ final class CaptureGeometryTests: XCTestCase {
 
 		XCTAssertEqual(
 			CaptureGeometry.fittedDimensions(for: sourceSize),
-			CaptureDimensions(width: 2880, height: 1864)
+			CaptureDimensions(width: 2880, height: 1864, scale: 1)
 		)
 	}
 
@@ -24,35 +24,35 @@ final class CaptureGeometryTests: XCTestCase {
 
 		XCTAssertEqual(
 			CaptureGeometry.fittedDimensions(for: sourceSize),
-			CaptureDimensions(width: 1920, height: 1080)
+			CaptureDimensions(width: 1920, height: 1080, scale: 1)
 		)
 	}
 
 	func testSourceBelowCaptureLimitRemainsUnchanged() {
 		XCTAssertEqual(
 			CaptureGeometry.fittedDimensions(for: CGSize(width: 2560, height: 1440)),
-			CaptureDimensions(width: 2560, height: 1440)
+			CaptureDimensions(width: 2560, height: 1440, scale: 1)
 		)
 	}
 
 	func testFiveKSourceFitsInsideFourK() {
 		XCTAssertEqual(
 			CaptureGeometry.fittedDimensions(for: CGSize(width: 5120, height: 2880)),
-			CaptureDimensions(width: 3840, height: 2160)
+			CaptureDimensions(width: 3840, height: 2160, scale: 0.75)
 		)
 	}
 
 	func testUltrawideSourcePreservesAspectRatio() {
 		XCTAssertEqual(
 			CaptureGeometry.fittedDimensions(for: CGSize(width: 5120, height: 1440)),
-			CaptureDimensions(width: 3840, height: 1080)
+			CaptureDimensions(width: 3840, height: 1080, scale: 0.75)
 		)
 	}
 
 	func testPortraitSourcePreservesAspectRatio() {
 		XCTAssertEqual(
 			CaptureGeometry.fittedDimensions(for: CGSize(width: 2160, height: 3840)),
-			CaptureDimensions(width: 1214, height: 2160)
+			CaptureDimensions(width: 1214, height: 2160, scale: 0.5625)
 		)
 	}
 
@@ -64,7 +64,7 @@ final class CaptureGeometryTests: XCTestCase {
 
 		XCTAssertEqual(
 			CaptureGeometry.fittedDimensions(for: sourceSize),
-			CaptureDimensions(width: 152, height: 80)
+			CaptureDimensions(width: 152, height: 80, scale: 1)
 		)
 	}
 
@@ -87,6 +87,9 @@ final class CaptureGeometryTests: XCTestCase {
 			XCTAssertEqual(dimensions.height % 2, 0)
 			XCTAssertLessThanOrEqual(dimensions.width, CaptureGeometry.maximumWidth)
 			XCTAssertLessThanOrEqual(dimensions.height, CaptureGeometry.maximumHeight)
+			XCTAssertTrue(dimensions.scale.isFinite)
+			XCTAssertGreaterThan(dimensions.scale, 0)
+			XCTAssertLessThanOrEqual(dimensions.scale, 1)
 		}
 	}
 

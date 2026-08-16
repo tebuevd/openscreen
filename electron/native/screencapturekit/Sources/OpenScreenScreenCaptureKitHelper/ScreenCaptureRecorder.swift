@@ -124,6 +124,8 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		let filter: SCContentFilter
 		let width: Int
 		let height: Int
+		let sourcePixelSize: CGSize
+		let scale: Double
 		let capturesIndependentWindow: Bool
 		// Global frame (points, top-left origin) of the captured region. Used by the
 		// renderer to normalize cursor positions into the captured window's space.
@@ -150,6 +152,8 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	private var nativeMicrophoneEnabled = false
 	private var outputWidth = 1920
 	private var outputHeight = 1080
+	private var sourcePixelSize = CGSize(width: 1920, height: 1080)
+	private var captureScale = 1.0
 	private var captureFrame = CGRect.zero
 	private let microphoneOutputTypeRawValue = 2
 	private let hostClock = CMClockGetHostTimeClock()
@@ -168,6 +172,8 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		let target = try makeCaptureTarget(from: content)
 		outputWidth = target.width
 		outputHeight = target.height
+		sourcePixelSize = target.sourcePixelSize
+		captureScale = target.scale
 		captureFrame = target.captureFrame
 		let configuration = makeStreamConfiguration(for: target)
 		let stream = SCStream(filter: target.filter, configuration: configuration, delegate: self)
@@ -319,6 +325,9 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 					"timestampMs": Int(Date().timeIntervalSince1970 * 1000),
 					"width": outputWidth,
 					"height": outputHeight,
+					"sourcePixelWidth": Double(sourcePixelSize.width),
+					"sourcePixelHeight": Double(sourcePixelSize.height),
+					"scale": captureScale,
 					"captureBounds": captureBoundsPayload(),
 				])
 			} else if !appended {
@@ -418,6 +427,8 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 				filter: filter,
 				width: dimensions.width,
 				height: dimensions.height,
+				sourcePixelSize: sourceSize,
+				scale: dimensions.scale,
 				capturesIndependentWindow: false,
 				captureFrame: display.frame
 			)
@@ -451,6 +462,8 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 				filter: filter,
 				width: dimensions.width,
 				height: dimensions.height,
+				sourcePixelSize: sourceSize,
+				scale: dimensions.scale,
 				capturesIndependentWindow: true,
 				captureFrame: window.frame
 			)

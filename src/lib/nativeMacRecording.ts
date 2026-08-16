@@ -56,7 +56,12 @@ export type NativeMacHelperReadyEvent = {
 export type NativeMacHelperRecordingStartedEvent = {
 	event: "recording-started";
 	timestampMs: number;
+	width: number;
+	height: number;
 	captureBounds?: Rectangle;
+	sourcePixelWidth?: number;
+	sourcePixelHeight?: number;
+	scale?: number;
 };
 
 export type NativeMacHelperRecordingStoppedEvent = {
@@ -88,8 +93,34 @@ export type NativeMacRecordingStartResult = {
 	recordingId?: number;
 	path?: string;
 	helperPath?: string;
+	width?: number;
+	height?: number;
 	error?: string;
 };
+
+function isValidCaptureDimension(value: unknown): value is number {
+	return (
+		typeof value === "number" &&
+		Number.isFinite(value) &&
+		Number.isInteger(value) &&
+		value > 0 &&
+		value % 2 === 0
+	);
+}
+
+export function parseNativeMacHelperRecordingStartedEvent(event: Record<string, unknown>) {
+	if (event.event !== "recording-started") {
+		return null;
+	}
+
+	if (!isValidCaptureDimension(event.width) || !isValidCaptureDimension(event.height)) {
+		throw new Error(
+			`Native macOS capture reported invalid dimensions (${String(event.width)}x${String(event.height)}). Expected finite, positive, even integers.`,
+		);
+	}
+
+	return event as unknown as NativeMacHelperRecordingStartedEvent;
+}
 
 export function parseMacWindowIdFromSourceId(sourceId?: string | null) {
 	if (!sourceId?.startsWith("window:")) {
