@@ -36,16 +36,22 @@ describe("native macOS recording-started events", () => {
 		});
 	});
 
-	it("accepts display-mode fallback geometry and half-pixel rounding tolerance", () => {
+	it("accepts negative origins and rounded fractional point geometry", () => {
 		expect(
 			parseNativeMacHelperRecordingStartedEvent({
 				...validEvent(),
 				sourceGeometryMethod: "display-mode-fallback",
-				sourcePixelWidth: 2880.5,
+				sourceContentRectPoints: {
+					x: -1440.25,
+					y: -0.25,
+					width: 1440.2,
+					height: 931.8,
+				},
 			}),
 		).toMatchObject({
 			sourceGeometryMethod: "display-mode-fallback",
-			sourcePixelWidth: 2880.5,
+			sourcePixelWidth: 2880,
+			sourcePixelHeight: 1864,
 		});
 	});
 
@@ -98,8 +104,10 @@ describe("native macOS recording-started events", () => {
 		],
 		["non-positive bounds width", { captureBounds: { x: 0, y: 0, width: 0, height: 1 } }],
 		["NaN source width", { sourcePixelWidth: Number.NaN }],
+		["fractional source width", { sourcePixelWidth: 2880.5 }],
 		["unsafe source height", { sourcePixelHeight: 2 ** 53 }],
 		["missing source geometry method", { sourceGeometryMethod: undefined }],
+		["removed sanitized fallback method", { sourceGeometryMethod: "sanitized-fallback" }],
 		["unknown source geometry method", { sourceGeometryMethod: "content-rect" }],
 		["missing source point rect", { sourceContentRectPoints: undefined }],
 		[
@@ -120,7 +128,14 @@ describe("native macOS recording-started events", () => {
 		["NaN source pixels per point", { sourcePixelsPerPoint: Number.NaN }],
 		["zero source pixels per point", { sourcePixelsPerPoint: 0 }],
 		["implausible source pixels per point", { sourcePixelsPerPoint: 17 }],
-		["source pixels outside rounding tolerance", { sourcePixelWidth: 2880.51 }],
+		[
+			"sub-pixel source geometry",
+			{ sourceContentRectPoints: { x: 0, y: 0, width: 0.5, height: 932 } },
+		],
+		[
+			"source pixels inconsistent after rounding",
+			{ sourceContentRectPoints: { x: 0, y: 0, width: 1440.6, height: 932 } },
+		],
 		["NaN scale", { scale: Number.NaN }],
 		["zero scale", { scale: 0 }],
 		["scale above one", { scale: 1.01 }],

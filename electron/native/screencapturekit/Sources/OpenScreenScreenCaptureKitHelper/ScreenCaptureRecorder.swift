@@ -80,6 +80,7 @@ enum HelperError: Error, CustomStringConvertible {
 	case invalidSourceType(String)
 	case permissionDenied(String)
 	case writerSetupFailed(String)
+	case invalidCaptureGeometry(String)
 
 	var description: String {
 		switch self {
@@ -97,6 +98,8 @@ enum HelperError: Error, CustomStringConvertible {
 			return message
 		case .writerSetupFailed(let message):
 			return message
+		case .invalidCaptureGeometry(let message):
+			return "Invalid capture geometry: \(message)"
 		}
 	}
 }
@@ -158,7 +161,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	private var sourcePointGeometry = SourcePointGeometry(
 		contentRectPoints: CGRect(x: 0, y: 0, width: 1920, height: 1080),
 		pixelsPerPoint: 1,
-		method: .sanitizedFallback
+		method: .screenCaptureKitContentRect
 	)
 	private var captureFrame = CGRect.zero
 	private let microphoneOutputTypeRawValue = 2
@@ -435,23 +438,40 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			} else {
 				sourceContentRectPoints = display.frame
 				sourceGeometryMethod = .displayModeFallback
-				rawSourceSize = Self.displayPixelSize(
-					for: display.displayID,
-					fallback: display.frame.size
-				)
-				sourcePixelsPerPoint = CaptureGeometry.derivedPixelsPerPoint(
+				guard let displayPixelSize = Self.displayPixelSize(for: display.displayID) else {
+					throw HelperError.invalidCaptureGeometry(
+						"Unable to read the selected display's backing pixel dimensions."
+					)
+				}
+				rawSourceSize = displayPixelSize
+				guard let derivedScale = CaptureGeometry.derivedPixelsPerPoint(
 					pointSize: sourceContentRectPoints.size,
 					pixelSize: rawSourceSize
+				) else {
+					throw HelperError.invalidCaptureGeometry(
+						"Unable to derive the selected display's backing pixels-per-point scale."
+					)
+				}
+				sourcePixelsPerPoint = derivedScale
+			}
+			guard let sourceSize = CaptureGeometry.validatedPixelSize(rawSourceSize) else {
+				throw HelperError.invalidCaptureGeometry(
+					"Display source pixels must round to positive safe integer dimensions."
 				)
 			}
-			let sourceSize = CaptureGeometry.sanitizedPixelSize(rawSourceSize)
-			let sourcePointGeometry = CaptureGeometry.sourcePointGeometry(
+			guard let sourcePointGeometry = CaptureGeometry.sourcePointGeometry(
 				contentRectPoints: sourceContentRectPoints,
 				pixelsPerPoint: sourcePixelsPerPoint,
 				sourcePixelSize: sourceSize,
 				method: sourceGeometryMethod
-			)
-			let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize)
+			) else {
+				throw HelperError.invalidCaptureGeometry(
+					"Display point bounds, backing scale, and source pixels are inconsistent."
+				)
+			}
+			guard let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize) else {
+				throw HelperError.invalidCaptureGeometry("Unable to fit the display source pixels.")
+			}
 			return CaptureTarget(
 				filter: filter,
 				width: dimensions.width,
@@ -489,21 +509,36 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 				)
 				let displayId = displayIndex.map { content.displays[$0].displayID } ?? CGMainDisplayID()
 				sourceContentRectPoints = window.frame
-				sourcePixelsPerPoint = Self.pointPixelScale(for: displayId)
+				guard let displayScale = Self.pointPixelScale(for: displayId) else {
+					throw HelperError.invalidCaptureGeometry(
+						"Unable to read the selected window display's backing pixels-per-point scale."
+					)
+				}
+				sourcePixelsPerPoint = displayScale
 				sourceGeometryMethod = .displayModeFallback
 				rawSourceSize = CaptureGeometry.pixelSize(
 					for: sourceContentRectPoints.size,
 					pointPixelScale: sourcePixelsPerPoint
 				)
 			}
-			let sourceSize = CaptureGeometry.sanitizedPixelSize(rawSourceSize)
-			let sourcePointGeometry = CaptureGeometry.sourcePointGeometry(
+			guard let sourceSize = CaptureGeometry.validatedPixelSize(rawSourceSize) else {
+				throw HelperError.invalidCaptureGeometry(
+					"Window source pixels must round to positive safe integer dimensions."
+				)
+			}
+			guard let sourcePointGeometry = CaptureGeometry.sourcePointGeometry(
 				contentRectPoints: sourceContentRectPoints,
 				pixelsPerPoint: sourcePixelsPerPoint,
 				sourcePixelSize: sourceSize,
 				method: sourceGeometryMethod
-			)
-			let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize)
+			) else {
+				throw HelperError.invalidCaptureGeometry(
+					"Window point bounds, backing scale, and source pixels are inconsistent."
+				)
+			}
+			guard let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize) else {
+				throw HelperError.invalidCaptureGeometry("Unable to fit the window source pixels.")
+			}
 			return CaptureTarget(
 				filter: filter,
 				width: dimensions.width,
@@ -765,24 +800,25 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		return status == .complete
 	}
 
-	private static func displayPixelSize(for displayId: CGDirectDisplayID, fallback: CGSize) -> CGSize {
+	private static func displayPixelSize(for displayId: CGDirectDisplayID) -> CGSize? {
 		guard let mode = CGDisplayCopyDisplayMode(displayId) else {
-			return fallback
+			return nil
 		}
 
-		return CaptureGeometry.orientedPixelSize(
+		return CaptureGeometry.displayModePixelSize(
 			CGSize(width: mode.pixelWidth, height: mode.pixelHeight),
 			rotationDegrees: CGDisplayRotation(displayId)
 		)
 	}
 
-	private static func pointPixelScale(for displayId: CGDirectDisplayID) -> CGFloat {
-		guard let mode = CGDisplayCopyDisplayMode(displayId), mode.width > 0 else {
-			return 1
+	private static func pointPixelScale(for displayId: CGDirectDisplayID) -> CGFloat? {
+		guard let mode = CGDisplayCopyDisplayMode(displayId) else {
+			return nil
 		}
-
-		let scale = CGFloat(mode.pixelWidth) / CGFloat(mode.width)
-		return scale.isFinite && scale > 0 ? scale : 1
+		return CaptureGeometry.displayModePixelsPerPoint(
+			pixelWidth: mode.pixelWidth,
+			pointWidth: mode.width
+		)
 	}
 
 	private func supportsNativeMicrophoneCapture(streamConfig: SCStreamConfiguration) -> Bool {

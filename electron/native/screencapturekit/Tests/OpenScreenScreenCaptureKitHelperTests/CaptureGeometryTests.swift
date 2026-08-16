@@ -4,18 +4,19 @@ import XCTest
 @testable import OpenScreenScreenCaptureKitHelper
 
 final class CaptureGeometryTests: XCTestCase {
-	func testRetinaPointSizeUsesBackingPixels() {
+	func testRetinaPointSizeUsesBackingPixels() throws {
 		let contentRectPoints = CGRect(x: -1440, y: 0, width: 1440, height: 932)
 		let sourceSize = CaptureGeometry.pixelSize(
 			for: contentRectPoints.size,
 			pointPixelScale: 2
 		)
-		let sourceGeometry = CaptureGeometry.sourcePointGeometry(
+		let validatedSourceSize = try XCTUnwrap(CaptureGeometry.validatedPixelSize(sourceSize))
+		let sourceGeometry = try XCTUnwrap(CaptureGeometry.sourcePointGeometry(
 			contentRectPoints: contentRectPoints,
 			pixelsPerPoint: 2,
-			sourcePixelSize: sourceSize,
+			sourcePixelSize: validatedSourceSize,
 			method: .screenCaptureKitContentRect
-		)
+		))
 
 		XCTAssertEqual(sourceGeometry.contentRectPoints, contentRectPoints)
 		XCTAssertEqual(sourceGeometry.pixelsPerPoint, 2)
@@ -66,32 +67,40 @@ final class CaptureGeometryTests: XCTestCase {
 		)
 	}
 
-	func testFractionalPointSizesAreScaledBeforeRounding() {
+	func testFractionalPointSizesAreScaledBeforeRounding() throws {
 		let sourceSize = CaptureGeometry.pixelSize(
 			for: CGSize(width: 101.9, height: 53.9),
 			pointPixelScale: 1.5
 		)
+		let validatedSourceSize = try XCTUnwrap(CaptureGeometry.validatedPixelSize(sourceSize))
+		let sourceGeometry = try XCTUnwrap(CaptureGeometry.sourcePointGeometry(
+			contentRectPoints: CGRect(x: -20.5, y: 0, width: 101.9, height: 53.9),
+			pixelsPerPoint: 1.5,
+			sourcePixelSize: validatedSourceSize,
+			method: .screenCaptureKitContentRect
+		))
 
+		XCTAssertEqual(validatedSourceSize, CGSize(width: 153, height: 81))
+		XCTAssertEqual(sourceGeometry.contentRectPoints.origin.x, -20.5)
 		XCTAssertEqual(
 			CaptureGeometry.fittedDimensions(for: sourceSize),
 			CaptureDimensions(width: 152, height: 80, scale: 1)
 		)
 	}
 
-	func testInvalidSourcePixelsAreSanitizedBeforeDiagnostics() {
+	func testInvalidSourcePixelsFailValidation() {
 		let invalidSizes = [
 			CGSize(width: CGFloat.nan, height: 1080),
 			CGSize(width: CGFloat.infinity, height: 1080),
 			CGSize(width: CaptureGeometry.maximumSafeJSONNumber + 1, height: 1080),
 			CGSize(width: -100, height: 100),
+			CGSize(width: 0.4, height: 100),
 			CGSize.zero,
 		]
 
 		for sourceSize in invalidSizes {
-			XCTAssertEqual(
-				CaptureGeometry.sanitizedPixelSize(sourceSize),
-				CGSize(width: 2, height: 2)
-			)
+			XCTAssertNil(CaptureGeometry.validatedPixelSize(sourceSize))
+			XCTAssertNil(CaptureGeometry.fittedDimensions(for: sourceSize))
 		}
 	}
 
@@ -105,55 +114,71 @@ final class CaptureGeometryTests: XCTestCase {
 		)
 	}
 
-	func testDisplayModeFallbackDerivesPixelsPerPoint() {
+	func testDisplayModeFallbackDerivesPixelsPerPoint() throws {
 		let contentRectPoints = CGRect(x: 0, y: 0, width: 1440, height: 932)
 		let sourceSize = CGSize(width: 2880, height: 1864)
-		let pixelsPerPoint = CaptureGeometry.derivedPixelsPerPoint(
+		let pixelsPerPoint = try XCTUnwrap(CaptureGeometry.derivedPixelsPerPoint(
 			pointSize: contentRectPoints.size,
 			pixelSize: sourceSize
-		)
-		let sourceGeometry = CaptureGeometry.sourcePointGeometry(
+		))
+		let sourceGeometry = try XCTUnwrap(CaptureGeometry.sourcePointGeometry(
 			contentRectPoints: contentRectPoints,
 			pixelsPerPoint: pixelsPerPoint,
 			sourcePixelSize: sourceSize,
 			method: .displayModeFallback
-		)
+		))
 
 		XCTAssertEqual(sourceGeometry.contentRectPoints, contentRectPoints)
 		XCTAssertEqual(sourceGeometry.pixelsPerPoint, 2)
 		XCTAssertEqual(sourceGeometry.method, .displayModeFallback)
 	}
 
-	func testInvalidSourcePointGeometryUsesJSONSafeFallback() {
-		let sourceGeometry = CaptureGeometry.sourcePointGeometry(
+	func testInvalidSourcePointGeometryFailsValidation() {
+		XCTAssertNil(CaptureGeometry.sourcePointGeometry(
 			contentRectPoints: CGRect(x: CGFloat.nan, y: 0, width: 1440, height: 932),
 			pixelsPerPoint: CGFloat.infinity,
 			sourcePixelSize: CGSize(width: 2880, height: 1864),
 			method: .screenCaptureKitContentRect
-		)
+		))
+		XCTAssertNil(CaptureGeometry.sourcePointGeometry(
+			contentRectPoints: CGRect(x: 0, y: 0, width: 0.5, height: 100),
+			pixelsPerPoint: 1,
+			sourcePixelSize: CGSize(width: 1, height: 100),
+			method: .screenCaptureKitContentRect
+		))
+		XCTAssertNil(CaptureGeometry.sourcePointGeometry(
+			contentRectPoints: CGRect(x: 0, y: 0, width: -100, height: 100),
+			pixelsPerPoint: 1,
+			sourcePixelSize: CGSize(width: 100, height: 100),
+			method: .screenCaptureKitContentRect
+		))
+		XCTAssertNil(CaptureGeometry.sourcePointGeometry(
+			contentRectPoints: CGRect(x: 0, y: 0, width: 100, height: 100),
+			pixelsPerPoint: 0,
+			sourcePixelSize: CGSize(width: 100, height: 100),
+			method: .screenCaptureKitContentRect
+		))
+	}
 
-		XCTAssertEqual(sourceGeometry.contentRectPoints, CGRect(x: 0, y: 0, width: 2880, height: 1864))
-		XCTAssertEqual(sourceGeometry.pixelsPerPoint, 1)
-		XCTAssertEqual(sourceGeometry.method, .sanitizedFallback)
-		XCTAssertTrue(sourceGeometry.contentRectPoints.origin.x.isFinite)
-		XCTAssertTrue(sourceGeometry.contentRectPoints.origin.y.isFinite)
-		XCTAssertTrue(sourceGeometry.contentRectPoints.width.isFinite)
-		XCTAssertTrue(sourceGeometry.contentRectPoints.height.isFinite)
+	func testMissingDisplayModeGeometryFailsValidation() {
+		XCTAssertNil(CaptureGeometry.displayModePixelSize(nil, rotationDegrees: 0))
+		XCTAssertNil(CaptureGeometry.displayModePixelsPerPoint(pixelWidth: nil, pointWidth: 1440))
+		XCTAssertNil(CaptureGeometry.displayModePixelsPerPoint(pixelWidth: 2880, pointWidth: nil))
 	}
 
 	func testOutputsArePositiveEvenAndWithinLimits() {
 		let sourceSizes = [
-			CGSize.zero,
-			CGSize(width: -100, height: 100),
 			CGSize(width: 1, height: 1),
 			CGSize(width: 3839, height: 2159),
 			CGSize(width: 10_000, height: 1),
 			CGSize(width: 1, height: 10_000),
-			CGSize(width: CGFloat.nan, height: 1080),
 		]
 
 		for sourceSize in sourceSizes {
-			let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize)
+			guard let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize) else {
+				XCTFail("Expected valid dimensions for \(sourceSize)")
+				continue
+			}
 			XCTAssertGreaterThan(dimensions.width, 0)
 			XCTAssertGreaterThan(dimensions.height, 0)
 			XCTAssertEqual(dimensions.width % 2, 0)

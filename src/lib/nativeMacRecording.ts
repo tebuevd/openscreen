@@ -55,8 +55,7 @@ export type NativeMacHelperReadyEvent = {
 
 export type NativeMacSourceGeometryMethod =
 	| "screen-capture-kit-content-rect"
-	| "display-mode-fallback"
-	| "sanitized-fallback";
+	| "display-mode-fallback";
 
 export type NativeMacHelperRecordingStartedEvent = {
 	event: "recording-started";
@@ -109,7 +108,6 @@ export type NativeMacRecordingStartResult = {
 const NATIVE_MAC_MAX_CAPTURE_WIDTH = 3840;
 const NATIVE_MAC_MAX_CAPTURE_HEIGHT = 2160;
 const NATIVE_MAC_MAX_SENSIBLE_PIXELS_PER_POINT = 16;
-const SOURCE_PIXEL_ROUNDING_TOLERANCE = 0.5;
 
 function isFiniteSafeNumber(value: unknown): value is number {
 	return (
@@ -145,16 +143,11 @@ function isExpectedScale(actual: number, expected: number) {
 }
 
 function isSourceGeometryMethod(value: unknown): value is NativeMacSourceGeometryMethod {
-	return (
-		value === "screen-capture-kit-content-rect" ||
-		value === "display-mode-fallback" ||
-		value === "sanitized-fallback"
-	);
+	return value === "screen-capture-kit-content-rect" || value === "display-mode-fallback";
 }
 
 function matchesSourcePixels(actual: number, expected: number) {
-	const floatingPointTolerance = Number.EPSILON * 8 * Math.max(1, Math.abs(expected));
-	return Math.abs(actual - expected) <= SOURCE_PIXEL_ROUNDING_TOLERANCE + floatingPointTolerance;
+	return isFiniteSafeNumber(expected) && expected >= 1 && Math.round(expected) === actual;
 }
 
 export function parseNativeMacHelperRecordingStartedEvent(
@@ -199,12 +192,10 @@ export function parseNativeMacHelperRecordingStartedEvent(
 	}
 
 	if (
-		!isFiniteSafeNumber(event.sourcePixelWidth) ||
-		!isFiniteSafeNumber(event.sourcePixelHeight) ||
-		event.sourcePixelWidth <= 0 ||
-		event.sourcePixelHeight <= 0
+		!isPositiveSafeInteger(event.sourcePixelWidth) ||
+		!isPositiveSafeInteger(event.sourcePixelHeight)
 	) {
-		invalidRecordingStartedEvent("source pixel dimensions must be positive finite safe numbers");
+		invalidRecordingStartedEvent("source pixel dimensions must be positive safe integers");
 	}
 	if (!isFiniteSafeNumber(event.scale) || event.scale <= 0 || event.scale > 1) {
 		invalidRecordingStartedEvent("scale must be a finite safe number in the range (0, 1]");
@@ -236,11 +227,11 @@ export function parseNativeMacHelperRecordingStartedEvent(
 	}
 	if (
 		!isFiniteSafeNumber(event.sourcePixelsPerPoint) ||
-		event.sourcePixelsPerPoint <= 0 ||
+		event.sourcePixelsPerPoint < 1 ||
 		event.sourcePixelsPerPoint > NATIVE_MAC_MAX_SENSIBLE_PIXELS_PER_POINT
 	) {
 		invalidRecordingStartedEvent(
-			`sourcePixelsPerPoint must be in the range (0, ${NATIVE_MAC_MAX_SENSIBLE_PIXELS_PER_POINT}]`,
+			`sourcePixelsPerPoint must be in the range [1, ${NATIVE_MAC_MAX_SENSIBLE_PIXELS_PER_POINT}]`,
 		);
 	}
 	if (
