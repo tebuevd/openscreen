@@ -6,7 +6,8 @@ Status: Implemented in code; manual macOS hardware validation pending.
 
 Retain OpenScreen's existing `3840x2160` capture ceiling. Capture Retina displays at their
 backing-pixel resolution when that resolution fits within the ceiling, and downscale larger
-sources uniformly so their aspect ratio is preserved.
+sources uniformly so their aspect ratio is preserved. The cap does not scale a source that fits,
+but an odd source axis is floored to a positive even encoder dimension.
 
 For the affected 15-inch MacBook Air:
 
@@ -17,25 +18,31 @@ For the affected 15-inch MacBook Air:
 
 ## Implementation Outcome
 
-The implementation described below is now in code and covered by Swift, TypeScript, and Rust
-tests. The historical analysis, implementation plan, and acceptance criteria remain as design
-context; no hardware-only criterion is marked passed, and the manual macOS run is still required.
+The implementation described below is now in code. Pure Swift geometry, TypeScript event and
+persistence behavior, and the Rust export contract have automated coverage. The historical
+analysis, implementation plan, and acceptance criteria remain as design context; no hardware-only
+criterion is marked passed, and the manual macOS run is still required.
 
 - macOS capture now derives Retina backing pixels from ScreenCaptureKit point geometry and scale
   (with the macOS 13 display/window fallbacks described below), then applies one proportional fit
   inside `3840x2160` and floors both output axes to positive even values. A `2880x1864` source is
   retained, while an above-limit `5120x1440` source becomes `3840x1080` rather than being distorted.
-- The helper reports point bounds, uncapped source pixels, applied scale, and final capture pixels
-  after the first frame is appended. Electron validates that geometry before accepting startup.
-  The start/stop lifecycle is validated by automated process tests covering success, early exit,
-  malformed or late events, timeouts, failed cleanup, and stale-process races; this is not a claim
-  that the real-hardware procedure below has run.
+- The helper reports `sourceGeometryMethod`, `sourceContentRectPoints`, `sourcePixelsPerPoint`,
+  uncapped source pixels, cap `scale`, and final pixels after the first frame is appended. Invalid,
+  missing, or inconsistent source geometry aborts helper startup, and Electron rejects a malformed
+  `recording-started` event. There is no sanitized `2x2` fallback.
+- Parser tests cover valid and malformed start geometry. Process-utility tests cover output
+  isolation, stop races and failures, bounded termination, and failed-start cleanup; renderer-hook
+  tests cover webcam cleanup and stale or rejected starts. No test directly invokes the private
+  `waitForNativeMacCaptureStart` function or the registered IPC start handler, so the real start/stop
+  integration remains part of pending hardware validation.
 - Asset dimension backfill, asset mutations, project saves, and project lifecycle transitions are
   serialized and generation-safe, so a completed metadata probe or project operation cannot be
   overwritten by a concurrent stale save.
-- Export hydrates valid source dimensions for every visible asset before constructing clips or the
-  scene. Missing geometry is probed into an export-only document clone; if it remains unavailable,
-  export fails closed instead of constructing a scene or silently falling back to `1920x1080`.
+- Export hydrates dimensions for source clips retained by `resolveVisibleClips`. Missing or invalid
+  dimensions are probed into an export-only document clone, and a required probe failure blocks
+  export instead of silently falling back to `1920x1080`. Existing dangling-asset and absent
+  `originalPath` clip filtering is separate; hydration is not general file-existence validation.
 - MP4 export requires explicit positive even dimensions, with an `8192` maximum per axis and a
   `35,389,440`-pixel area limit. The native contract also accepts an optional bitrate override in
   bits per second (up to `200,000,000`); omission retains the area-based native fallback with a
@@ -63,7 +70,8 @@ recording dimensions.
 ## Intended Behavior
 
 - Raw macOS capture uses backing pixels, not logical display points.
-- Sources at or below the 4K ceiling are not downscaled.
+- Sources at or below the 4K ceiling receive no cap-driven scaling; odd axes are still floored to
+  positive even encoder dimensions.
 - Sources above the ceiling are fit inside `3840x2160` with one common scale factor.
 - Cursor and source bounds remain in macOS points because cursor normalization operates in point
   space.
@@ -222,20 +230,24 @@ lookup in the recorder, but place the pure conversion and fitting arithmetic in 
 Cover at least:
 
 - `1440x932` points at 2x becomes `2880x1864` pixels.
-- A 1x external display remains unchanged.
-- A source below both caps remains unchanged.
+- An even-sized 1x external display remains unchanged.
+- An even-sized source below both caps remains unchanged.
+- Odd source axes below the cap are floored to positive even dimensions without aspect-ratio cap
+  scaling.
 - `5120x2880` becomes `3840x2160`.
 - `5120x1440` becomes `3840x1080` without distortion.
 - Portrait sources fit within the same landscape limits without becoming square.
 - Fractional window point sizes are multiplied before rounding.
 - Every output dimension is positive and even.
+- Invalid or inconsistent source geometry fails instead of substituting a synthetic `2x2` source.
 - Window display selection prefers the center or largest intersection on mixed-DPI setups.
 
 ### TypeScript tests
 
 Add or extend tests for:
 
-- Parsing and retaining `recording-started.width` and `height`.
+- Parsing and retaining all `recording-started` source-geometry fields, and rejecting missing or
+  inconsistent geometry.
 - A delayed metadata probe surviving an unrelated document save.
 - A failed probe not spinning continuously.
 - Source export refusing to use implicit native defaults when dimensions are unknown.
@@ -266,17 +278,25 @@ confirm the running binary contains the new implementation before trusting a res
 On the built-in 2x Retina display:
 
 1. Record the entire display with no crop or display-mode change during capture.
-2. Inspect the raw recording before opening or exporting it:
+2. Record the exact `recording-started` geometry fields: `sourceGeometryMethod`,
+   `sourceContentRectPoints`, `sourcePixelsPerPoint`, `sourcePixelWidth`, `sourcePixelHeight`,
+   `scale`, `width`, and `height`. On macOS 14 or newer the method must be
+   `screen-capture-kit-content-rect`; on macOS 13 it must be `display-mode-fallback`, backed by the
+   selected display's real `CGDisplayMode` pixel dimensions.
+3. Confirm rounded `sourceContentRectPoints.size * sourcePixelsPerPoint` equals the uncapped source
+   pixels, then confirm `scale` and the positive-even final dimensions match the `3840x2160` fit.
+4. Stop normally. The editor opens automatically; before interacting with it or starting an export,
+   inspect the raw recording:
 
    ```sh
    ffprobe -v error -select_streams v:0 \
      -show_entries stream=width,height -of csv=p=0 recording.mp4
    ```
 
-3. Confirm the raw track is `2880,1864`, not `1440,932`.
-4. Export with the default 16:9 + 1080p settings and confirm `1920,1080` remains intentional.
-5. Select Original aspect ratio + Source resolution and confirm the export is `2880,1864`.
-6. Extract a frame from the Source export and inspect text and one-pixel edges at 100% zoom.
+5. Confirm the raw track is `2880,1864`, not `1440,932`.
+6. Export with the default 16:9 + 1080p settings and confirm `1920,1080` remains intentional.
+7. Select Original aspect ratio + Source resolution and confirm the export is `2880,1864`.
+8. Extract a frame from the Source export and inspect text and one-pixel edges at 100% zoom.
 
 Also validate where hardware is available:
 
@@ -295,7 +315,10 @@ pass by judging only the preview.
 
 - A `1440x932` point display at 2x records as `2880x1864` backing pixels.
 - Raw capture dimensions match the helper's `recording-started` dimensions.
-- Sources below the 4K ceiling are never downscaled by capture.
+- Invalid, missing, or inconsistent source geometry aborts startup instead of recording a
+  synthetic `2x2` source.
+- Sources below the 4K ceiling receive no cap-driven scaling; odd axes are floored to valid positive
+  even encoder dimensions.
 - Sources above the ceiling retain their aspect ratio and fit within `3840x2160`.
 - Width and height are always valid even values.
 - Cursor normalization remains correct because point-space bounds are unchanged.

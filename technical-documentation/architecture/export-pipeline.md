@@ -1,57 +1,58 @@
 # Export pipeline
 
-The MP4 export drives the same Rust + Direct3D 11 compositor that powers the
-live preview ([preview.md](preview.md) /
-[native-compositor.md](native-compositor.md)), one segment at a time. The
-Electron renderer turns the project document into the same `SceneDescription`
-the live preview uses plus an ordered clip list, hands both to the napi addon
-through the `compositor` IPC domain, and the addon drives `openscreen-compositor`'s
-`Player` + `Compositor::compose_frame` + AMF encoder + muxer to write one
-`.mp4`. The renderer only watches progress; the actual rendering does not
-leave the native process. Performance numbers, the bench, and the rejected
-alternatives that drove the design live in
-[engineering/rendering-performance.md](../engineering/rendering-performance.md).
+MP4 and GIF export use the same native Rust compositor and `SceneDescription` as
+the live preview ([preview.md](preview.md) /
+[native-compositor.md](native-compositor.md)). The renderer sends an ordered clip
+list, scene JSON, and format parameters through the `compositor` IPC domain to the
+napi-rs addon; a libuv worker performs the render while the renderer reports
+progress. The platform implementation is selected at build time:
 
-GIF is out of scope here: it has no native encoder yet, so it keeps its own
-dedicated code path in `src/lib/exporter/gifExporter.ts` — the one format
-the document adapter still renders in the renderer.
+| Platform | Compositing and decode | MP4 encoding |
+| --- | --- | --- |
+| Windows | Direct3D 11; D3D11VA decode on the hardware backend, with software decode and WARP rendering when required | First usable H.264/H.265 candidate: AMF/NVENC zero-copy, QSV/Media Foundation system-frame paths, then `libopenh264`/`libkvazaar` software fallback |
+| macOS | Metal; VideoToolbox decode with a software-decode upload fallback | `h264_videotoolbox`/`hevc_videotoolbox`, then `libopenh264`/`libkvazaar` software fallback |
+| Linux | wgpu/Vulkan on a GPU or Mesa lavapipe, with software decode and texture upload | RGBA readback and YUV420P conversion into software `libopenh264`/`libkvazaar` |
+
+GIF is native too. `ExportDialog` calls `exportGifNative` with the same clips and
+scene used for MP4. The addon drives the shared timeline walk and platform
+compositor, reads each composed RGBA frame back, then the pure-Rust GIF pipeline
+quantizes it and writes GIF89a/LZW output. There is no renderer-side GIF fallback.
+Performance numbers and rejected alternatives live in
+[engineering/rendering-performance.md](../engineering/rendering-performance.md).
 
 ```mermaid
 flowchart LR
     DOC["AxcutDocument"]
     TSD["src/native/sceneDescription.ts<br/>resolveVisibleClips / buildSceneDescription"]
     RP["clips + SceneDescription JSON<br/>layout + effects + background + zoom + cursor + webcam"]
-    ADDON["compositor_view.node addon<br/>exportMulti (Electron IPC)"]
-    NATIVE["openscreen_compositor::live::Player<br/>Compositor::compose_frame<br/>h264_amf encoder + mux"]
-    FILE["output.mp4"]
-    DOC --> TSD --> RP --> ADDON --> NATIVE --> FILE
+    ADDON["compositor_view.node addon<br/>exportMulti / exportGif"]
+    NATIVE["platform compositor<br/>shared timeline walk"]
+    MP4["platform MP4 encoder + muxer"]
+    GIF["RGBA readback + Rust GIF writer"]
+    DOC --> TSD --> RP --> ADDON --> NATIVE
+    NATIVE --> MP4
+    NATIVE --> GIF
 ```
 
 ## Segment loop
 
-The renderer hands the addon `exportMulti(clips, outPath, sceneJson, params)`
-through `compositorViewService.exportMulti`
-([`compositorViewService.ts:425`](../../electron/native-bridge/services/compositorViewService.ts)).
-The service resolves the same asset paths the renderer used (wallpaper
-images, cursor theme sprite) and forwards the call to the addon
-([`compositorViewService.ts:437`](../../electron/native-bridge/services/compositorViewService.ts)).
-The addon loads `openscreen-compositor`'s `Player` with the clip list and the shared
-`SceneDescription` JSON, then walks the segments with **one** compositor
-and **one** encoder + muxer pair:
+The renderer calls
+[`CompositorViewService.exportMulti`](../../electron/native-bridge/services/compositorViewService.ts)
+for MP4 or `CompositorViewService.exportGif` for GIF. The service resolves
+renderer-relative scene assets such as wallpaper images and cursor sprites, then
+forwards the same clips and scene to the addon. Both tasks pause active previews,
+construct one platform compositor, and drive the shared timeline walk. MP4 keeps
+one encoder and muxer for the whole output; GIF keeps one Rust GIF writer.
 
-- Per segment: load metadata, hand the asset to the `Player` (so screen
-  and webcam decode land on `openscreen-compositor`'s shared `ID3D11Device`), drive
-  `compose_frame` at the segment's source time, and let the AMF encoder
-  consume the rendered RT. The compositor is paused on the live preview
-  for the duration of the export (`set_playing(false)` on every active
-  preview view), which the addon does automatically — the only cost of
-  running export against a live preview is GPU contention from the preview
-  still composing; the bench measures that overhead at ~10 % of wall time
-  in the measurement scenario, recovered by the auto-pause.
+- Per segment: load metadata, decode screen and webcam frames through the
+  platform pipeline, and call `compose_frame` at source time. MP4 hands the
+  result to that platform's selected encoder and muxer. GIF performs
+  `readback_direct`, palette quantization, optional dithering, and LZW output.
+  Preview transport is restored when either export task finishes or fails.
 
-- **Time projection.** The encoder timestamp is contiguous **output**
-  time, so junctions between segments are seamless. `compose_frame`
-  receives **source** time (`source_t = frame / FPS`), so
+- **Time projection.** The output frame clock is contiguous **output**
+  time, so junctions between segments are seamless for MP4 timestamps and GIF
+  frame cadence. `compose_frame` receives **source** time (`source_t = frame / FPS`), so
   zoom / annotation / cursor match the frame's content even when a speed
   region retimes the segment. An earlier draft proposed keying effects in
   virtual time throughout; that does not survive speed regions, and the
@@ -59,9 +60,9 @@ and **one** encoder + muxer pair:
 
 - **Clips are contiguous** — no gaps, no overlap. The renderer sums
   per-segment rounded frame counts into a single output frame counter;
-  audio follows the same integer accumulation (`AudioConcatPlan`).
+  MP4 audio follows the same integer accumulation (`AudioConcatPlan`).
 
-- **Audio and video junctions are seamless.** Audio is decoded per
+- **MP4 audio and video junctions are seamless.** Audio is decoded per
   segment up front (`audio.rs::decode_clip_audio`), WSOLA stretches each
   speed sub-segment to its output sample count, and
   `assemble_concatenated_pcm` concatenates the per-segment PCM at the
@@ -74,13 +75,17 @@ and **one** encoder + muxer pair:
   The WSOLA stretch is kicked off before the video loop so it overlaps
   the encode and does not add to the wall.
 
-- **Source geometry is hydrated before scene construction.** Export resolves
-  every visible clip's asset, reuses practical stored dimensions, and probes
-  missing or invalid dimensions from the media file into an export-only document
-  clone. Clip sizing, output sizing, and `buildSceneDescription` all read that
-  same clone. A missing asset or geometry that cannot be probed fails the export
-  before scene construction or any native call; it never substitutes an implicit
-  `1920x1080` source.
+- **Clip filtering and geometry hydration are separate.** `resolveVisibleClips`
+  first omits timeline segments whose asset is dangling or has no non-empty
+  `originalPath`. `hydrateExportDocumentDimensions` then processes only the asset
+  IDs retained by that filter, reuses practical stored dimensions, and probes
+  missing or invalid dimensions into an export-only document clone. A required
+  probe failure blocks output sizing and scene construction rather than using an
+  implicit `1920x1080` source. This is not general path validation: a retained
+  stale path with already-valid stored dimensions is left for native media open
+  to accept or reject. The explicit `nothingToExport` guard itself runs after
+  scene JSON is built, although MP4 output sizing can reject some empty
+  submissions earlier. No empty submission reaches a native export call.
 
 - **Output** honours the timeline's selected aspect ratio
   (`resolveAspectRatioValue` over `getEditorSettings(document).aspectRatio` —
@@ -109,21 +114,18 @@ max(2,000,000, floor(width * height * 8,000,000 / (1920 * 1080)))
 
 The codec parameter accepts `"h264"` and `"h265"`, with H.264 as the omitted
 default. Unsupported values such as `"vp9"` fail explicitly instead of silently
-changing codecs. GIF remains a separate native export contract and does not use
-these MP4 dimension or bitrate parameters.
+changing codecs. GIF has its own native size, frame-rate, loop, and dithering
+parameters; the MP4 dimension and bitrate contract does not apply to it.
 
 ## Licensing
 
 The app is MIT and stays MIT. Any bundled ffmpeg must be built **without**
-`--enable-gpl` and without `--enable-nonfree` — those flags pull
-x264/x265/xvid and fdk-aac, and licensing is all-or-nothing. The same
-rule applies to the BtbN build the addon links against (see
-[native-compositor.md](native-compositor.md#build)): LGPL-shared
-`*lgpl-shared`, not GPL. `scripts/fetch-ffmpeg.mjs` vendors a pinned,
-checksum-verified BtbN LGPL build and gates it on three independent
-signals (`-L` says "Lesser General Public License"; no GPL flags or GPL
-libs in `-buildconf`/`-version`; no `libx264` / `libx265` in
-`-encoders`). It fails closed.
+`--enable-gpl` and without `--enable-nonfree`; those flags pull GPL or
+non-redistributable components and licensing is all-or-nothing.
+`scripts/fetch-ffmpeg.mjs` provisions pinned, checksum-verified Windows/Linux
+artifacts, while `scripts/fetch-ffmpeg-macos.mjs` builds the pinned macOS shared
+libraries from source. Both paths verify LGPL signals and fail closed. See
+[native-compositor.md](native-compositor.md#build) for packaging details.
 
 Note `ffmpeg -version` has **no** `License:` line — only `configuration:`.
 The licence text is behind `-L`. An early gate looked for the former,
@@ -174,7 +176,8 @@ when a bench fixture disappears.
 
 Two concurrent saves used to be able to produce exactly that. They no longer can:
 `DocumentService` serialises saves through a per-project write queue and writes
-atomically (unique temp file → `fsync` → rename, `electron/ai-edition/document-service.ts:354`).
+atomically (unique temp file → `fsync` → rename) in
+`electron/ai-edition/document-service.ts`.
 One fixture from before the fix is still corrupt — see the Known gaps in
 [../engineering/rendering-performance.md](../engineering/rendering-performance.md).
 

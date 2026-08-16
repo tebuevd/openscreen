@@ -414,22 +414,67 @@ shasum -a 256 "$OPENSCREEN_SCK_CAPTURE_EXE"
 npm run dev
 ```
 
-1. In macOS Displays settings, record the built-in display's logical mode and backing scale. Use
-   `1440x932` at `2x` when that mode is available; otherwise record the available mode and calculate
-   expected backing pixels as `SCContentFilter.contentRect.size * pointPixelScale`.
+1. In macOS Displays settings, record the built-in display's logical mode. Use `1440x932` when that
+   mode is available; otherwise retain the current mode. Do not infer the backing scale from the UI:
+   the helper now reports the exact point rectangle and pixels-per-point value used for capture.
 2. Select the full built-in Retina display from the Screens tab, with no crop or display-mode change
    during capture. Move the cursor through the four corners and across a small fixed target so
    alignment can be checked later, then start recording.
 3. In the main-process log, confirm `[native-sck] starting macOS capture` names the forced helper and
-   save its `outputPath`. Read the following `[native-sck] capture geometry` diagnostic, including
-   `sourcePointBounds`, `uncappedSourcePixels`, `appliedScale`, and `finalCapturePixels`.
-4. For a logical `1440x932` display at `2x`, require `uncappedSourcePixels=2880x1864`,
-   `appliedScale=1`, and `finalCapturePixels=2880x1864`. For any other Retina mode, require the
-   uncapped dimensions to equal `contentRect * pointPixelScale`; final dimensions must use one scale
-   `min(1, 3840/sourceWidth, 2160/sourceHeight)`, with each axis floored to a positive even integer.
-5. Stop normally and confirm the editor opens without a startup/stop error or saving hang. Leave the
-   editor untouched: before relying on editor metadata or starting an export, run `ffprobe` against
-   the raw `outputPath` from the start log.
+   save its `outputPath`. The helper's `recording-started` event emits the exact fields
+   `sourceGeometryMethod`, `sourceContentRectPoints`, `sourcePixelsPerPoint`, `sourcePixelWidth`,
+   `sourcePixelHeight`, `scale`, `width`, and `height`. The main log mirrors them as
+   `sourcePointGeometry.method`, `sourcePointGeometry.contentRectPoints`,
+   `sourcePointGeometry.pixelsPerPoint`, `uncappedSourcePixels`, `capFitScale`, and
+   `finalCapturePixels`.
+4. On macOS 14 or newer, require `sourceGeometryMethod=screen-capture-kit-content-rect`: the point
+   rectangle and scale come directly from `SCContentFilter.contentRect` and `pointPixelScale`. On
+   macOS 13, require `sourceGeometryMethod=display-mode-fallback`: full-display pixels come from the
+   selected display's current, rotation-aware `CGDisplayMode.pixelWidth`/`pixelHeight`, and
+   `sourcePixelsPerPoint` is derived from that real mode and the display's point width. Missing,
+   unknown, or inconsistent geometry must abort startup; a `2x2` capture is not a valid fallback.
+5. Copy the width/height values from either log shape into this check. It verifies the same rounded
+   point-to-pixel conversion, proportional cap, and positive-even flooring enforced by the helper
+   and Electron parser.
+
+```bash
+RECT_W=1440 RECT_H=932 PPP=2 SOURCE_W=2880 SOURCE_H=1864 \
+CAP_SCALE=1 FINAL_W=2880 FINAL_H=1864 node <<'NODE'
+const read = (name) => Number(process.env[name]);
+const rectWidth = read("RECT_W");
+const rectHeight = read("RECT_H");
+const pixelsPerPoint = read("PPP");
+const sourceWidth = read("SOURCE_W");
+const sourceHeight = read("SOURCE_H");
+const scale = read("CAP_SCALE");
+const finalWidth = read("FINAL_W");
+const finalHeight = read("FINAL_H");
+const expectedSourceWidth = Math.round(rectWidth * pixelsPerPoint);
+const expectedSourceHeight = Math.round(rectHeight * pixelsPerPoint);
+const expectedScale = Math.min(1, 3840 / sourceWidth, 2160 / sourceHeight);
+const evenFloor = (value) => Math.max(2, Math.floor(value / 2) * 2);
+if (sourceWidth !== expectedSourceWidth || sourceHeight !== expectedSourceHeight) {
+	throw new Error("content rect and pixels-per-point do not match uncapped source pixels");
+}
+if (Math.abs(scale - expectedScale) > 1e-12) {
+	throw new Error("reported cap scale does not match the proportional fit");
+}
+if (
+	finalWidth !== evenFloor(sourceWidth * scale) ||
+	finalHeight !== evenFloor(sourceHeight * scale)
+) {
+	throw new Error("final pixels do not match the positive-even fitted dimensions");
+}
+console.log({ sourceWidth, sourceHeight, scale, finalWidth, finalHeight });
+NODE
+```
+
+6. For a logical `1440x932` display at `2x`, require source pixels `2880x1864`, `scale=1`, and final
+   pixels `2880x1864`. For any other Retina mode, use its logged values in the command above rather
+   than assuming `2x`.
+7. Stop normally and confirm the editor opens automatically without a startup/stop error or saving
+   hang. Before interacting with the opened editor or starting an export, run `ffprobe` against the
+   raw `outputPath` from the start log.
 
 ```bash
 RAW_RECORDING="/absolute/path/from-the-start-log.mp4"
@@ -437,16 +482,17 @@ ffprobe -v error -select_streams v:0 \
   -show_entries stream=width,height -of csv=p=0 "$RAW_RECORDING"
 ```
 
-6. Require raw `2880,1864` for the `1440x932` at `2x` case, never `1440,932`, and require the raw
-   result to equal `finalCapturePixels` for every mode. Scrub the cursor route and confirm the cursor
-   hotspot remains aligned with the recorded targets and display edges.
-7. Keep the default `16:9` project aspect ratio and `1080p` MP4 quality, export, and run the same
+8. Require raw `2880,1864` for the `1440x932` at `2x` case, never `1440,932`, and require the raw
+   result to equal event `width`/`height` (`finalCapturePixels` in the main log) for every mode.
+   Scrub the cursor route and confirm the cursor hotspot remains aligned with the recorded targets
+   and display edges.
+9. Keep the default `16:9` project aspect ratio and `1080p` MP4 quality, export, and run the same
    `ffprobe` command on the output. Require `1920,1080`; the Retina source must not change this
    intentional default.
-8. Change the project aspect ratio to `Original` and MP4 quality to `Source`, export again, and
+10. Change the project aspect ratio to `Original` and MP4 quality to `Source`, export again, and
    require the output dimensions to equal the raw recording (`2880,1864` for the reference mode).
    Confirm cursor alignment in this export as well.
-9. Where hardware permits, repeat full-source capture with an above-limit or ultrawide display.
+11. Where hardware permits, repeat full-source capture with an above-limit or ultrawide display.
    Require the helper diagnostic and raw file to preserve aspect ratio while fitting within
    `3840x2160`; for example, `5120x1440` must become `3840x1080`, not `3840x1440`. Confirm both axes
    are even and the cursor remains aligned after scaling. If suitable hardware is unavailable, log
@@ -456,7 +502,7 @@ Append one Results log row in this form, retaining every field so a later releas
 fresh native run from a stale-helper result:
 
 ```text
-| YYYY-MM-DD | <build/tag>; helper <commit>, sha256 <hash> | macOS <version>, <hardware>, <logical WxH> @ <scale>x | <Pass/fail/partial> | Retina: contentRect/sourcePointBounds=<WxH points>; pointPixelScale=<n>; uncapped=<WxH>; appliedScale=<n>; raw=<WxH>; 16:9+1080p=<WxH>; Original+Source=<WxH>; cap=<source -> raw or skipped reason>; cursor=<result> |
+| YYYY-MM-DD | <build/tag>; helper <commit>, sha256 <hash> | macOS <version>, <hardware>, <logical WxH> | <Pass/fail/partial> | Retina: sourceGeometryMethod=<method>; sourceContentRectPoints=<x,y,WxH>; sourcePixelsPerPoint=<n>; sourcePixelWidth=<w>; sourcePixelHeight=<h>; scale=<n>; width=<w>; height=<h>; raw=<WxH>; 16:9+1080p=<WxH>; Original+Source=<WxH>; cap=<source -> raw or skipped reason>; cursor=<result> |
 ```
 
 ### Linux
