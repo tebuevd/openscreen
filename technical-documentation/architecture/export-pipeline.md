@@ -74,27 +74,43 @@ and **one** encoder + muxer pair:
   The WSOLA stretch is kicked off before the video loop so it overlaps
   the encode and does not add to the wall.
 
+- **Source geometry is hydrated before scene construction.** Export resolves
+  every visible clip's asset, reuses practical stored dimensions, and probes
+  missing or invalid dimensions from the media file into an export-only document
+  clone. Clip sizing, output sizing, and `buildSceneDescription` all read that
+  same clone. A missing asset or geometry that cannot be probed fails the export
+  before scene construction or any native call; it never substitutes an implicit
+  `1920x1080` source.
+
 - **Output** honours the timeline's selected aspect ratio
   (`resolveAspectRatioValue` over `getEditorSettings(document).aspectRatio` —
   the same typed façade `buildSceneDescription` reads, so the dialog cannot
-  drift from the compositor). `ExportDialog`'s `tierOutputDims` feeds the
-  crop-aware **smallest** clip on the timeline to
-  [`calculateMp4ExportSettings`](../../src/lib/exporter/mp4ExportSettings.ts),
-  which maps quality + source dims + aspect ratio to the encoder
-  width / height / bitrate, and passes `width` / `height` to `exportMulti`.
-  Only "Source" quality targets those source dims; 720p / 1080p target a
-  fixed short side regardless.
+  drift from the compositor). The hydrated, crop-aware clip dimensions feed
+  [`resolveMp4ExportSettings`](../../src/lib/exporter/mp4ExportSettings.ts),
+  which resolves a complete width / height / bitrate tuple before submission.
+  Only "Source" quality targets source dimensions; 720p / 1080p target a fixed
+  short side regardless.
 
 ## Output formats and codecs
 
-The native MP4 export takes `width`, `height`, `frameRate`, and `codec` as
-parameters on `exportMulti` and writes H.264 (AMF) by default. The
-user-facing codec choice crosses as the plain `ExportVideoCodec` string
-(`"h264"` / `"h265"` / `"vp9"`) in those params; VP9
-falls back to the same H.264 path on machines without a hardware VP9
-encoder (software VP9 was measured too slow and removed — see
-[native-compositor.md](native-compositor.md#known-gaps)). GIF is a
-separate path through `GifExporter` and does not use the native addon.
+The MP4 `exportMulti` contract requires an explicit `width` and `height`. Both
+must be positive even integers, each axis must be at most `8192`, and their area
+must be at most `35,389,440` pixels (`8192x4320`). The renderer client, Electron
+service, and N-API boundary enforce the same limits before native allocation.
+
+`bitrate` is optional and is expressed in bits per second. When supplied it must
+be a positive safe integer no greater than `200,000,000`; the editor and CLI
+normally pass the bitrate selected by the export policy. When omitted, every
+platform uses the native fallback:
+
+```text
+max(2,000,000, floor(width * height * 8,000,000 / (1920 * 1080)))
+```
+
+The codec parameter accepts `"h264"` and `"h265"`, with H.264 as the omitted
+default. Unsupported values such as `"vp9"` fail explicitly instead of silently
+changing codecs. GIF remains a separate native export contract and does not use
+these MP4 dimension or bitrate parameters.
 
 ## Licensing
 
