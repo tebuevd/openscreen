@@ -44,23 +44,22 @@ forwards the same clips and scene to the addon. Both tasks pause active previews
 construct one platform compositor, and drive the shared timeline walk. MP4 keeps
 one encoder and muxer for the whole output; GIF keeps one Rust GIF writer.
 
-- Per segment: load metadata, decode screen and webcam frames through the
-  platform pipeline, and call `compose_frame` at source time. MP4 hands the
-  result to that platform's selected encoder and muxer. GIF performs
-  `readback_direct`, palette quantization, optional dithering, and LZW output.
+- Per segment: load metadata and decode screen and webcam frames through the
+  platform pipeline. The native walk composes each output frame as described
+  below. MP4 hands the result to that platform's selected encoder and muxer.
+  GIF performs `readback_direct`, palette quantization, optional dithering, and LZW output.
   Preview transport is restored when either export task finishes or fails.
 
-- **Time projection.** The output frame clock is contiguous **output**
-  time, so junctions between segments are seamless for MP4 timestamps and GIF
-  frame cadence. `compose_frame` receives **source** time (`source_t = frame / FPS`), so
-  zoom / annotation / cursor match the frame's content even when a speed
-  region retimes the segment. An earlier draft proposed keying effects in
-  virtual time throughout; that does not survive speed regions, and the
-  two-clock split is why.
+- **Time projection.** The native timeline walk owns and increments one contiguous
+  output frame counter. For each segment frame it computes source time as
+  `segment.start_sec + segment_frame * segment.speed / out_fps`, installs that
+  timeline override, then calls `compose_frame` with the running output frame
+  index. `frame_geometry` uses `frame / FPS` only when no timeline override is
+  present.
 
-- **Clips are contiguous** — no gaps, no overlap. The renderer sums
-  per-segment rounded frame counts into a single output frame counter;
-  MP4 audio follows the same integer accumulation (`AudioConcatPlan`).
+- **Clips are contiguous** — no gaps, no overlap. Per-clip counts produced by
+  the native walk feed MP4 audio's matching integer accumulation
+  (`AudioConcatPlan`).
 
 - **MP4 audio and video junctions are seamless.** Audio is decoded per
   segment up front (`audio.rs::decode_clip_audio`), WSOLA stretches each
