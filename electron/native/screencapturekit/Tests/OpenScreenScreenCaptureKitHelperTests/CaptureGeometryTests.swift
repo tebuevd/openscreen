@@ -76,7 +76,7 @@ final class CaptureGeometryTests: XCTestCase {
 			CGSize(width: 3839, height: 2159),
 			CGSize(width: 10_000, height: 1),
 			CGSize(width: 1, height: 10_000),
-			CGSize(width: .nan, height: 1080),
+			CGSize(width: CGFloat.nan, height: 1080),
 		]
 
 		for sourceSize in sourceSizes {
