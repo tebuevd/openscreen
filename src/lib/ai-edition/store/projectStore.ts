@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { nativeBridgeClient } from "@/native/client";
 import {
 	type Interval,
+	removeAsset as removeAssetFromDocument,
 	replaceTimeline as replaceTimelineOp,
 	restoreFullTimeline as restoreFullTimelineOp,
 } from "../document/timeline";
@@ -89,6 +90,27 @@ function parseDocument(value: unknown): AxcutDocument {
 	return documentSchema.parse(value);
 }
 
+function mergeAddedAsset(
+	document: AxcutDocument,
+	persisted: AxcutDocument,
+	addedAsset: AxcutAsset,
+): AxcutDocument {
+	const existing = document.assets.find((asset) => asset.id === addedAsset.id);
+	return {
+		...document,
+		assets: existing
+			? document.assets.map((asset) =>
+					asset.id === addedAsset.id ? { ...addedAsset, ...asset } : asset,
+				)
+			: [...document.assets, addedAsset],
+		project: {
+			...document.project,
+			primaryAssetId: document.project.primaryAssetId ?? persisted.project.primaryAssetId,
+			updatedAt: persisted.project.updatedAt,
+		},
+	};
+}
+
 export const useProjectStore = create<ProjectState>((set, get) => ({
 	projectId: null,
 	document: null,
@@ -170,17 +192,48 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	async addAsset(path, label) {
-		const { projectId, documentGeneration } = get();
+		const { projectId, documentGeneration, status } = get();
 		if (!projectId) throw new Error("No project loaded");
-		const result = await nativeBridgeClient.aiEdition.addAsset(projectId, path, label);
-		if (get().documentGeneration !== documentGeneration || get().projectId !== projectId) {
-			return null;
-		}
-		let document = parseDocument(result.document);
-		const addedAsset =
-			document.assets.find((a) => a.originalPath === path && (label ? a.label === label : true)) ??
-			document.assets.at(-1) ??
-			null;
+		if (status !== "ready") return null;
+		const addedAsset = await enqueueSave(documentGeneration, async () => {
+			const before = get();
+			if (
+				before.documentGeneration !== documentGeneration ||
+				before.status !== "ready" ||
+				before.projectId !== projectId ||
+				!before.document
+			) {
+				return null;
+			}
+			const revision = before.revision;
+			const result = await nativeBridgeClient.aiEdition.addAsset(projectId, path, label);
+			const persisted = parseDocument(result.document);
+			const added =
+				persisted.assets.find((asset) => asset.id === result.assetId) ??
+				persisted.assets.find(
+					(asset) => asset.originalPath === path && (label ? asset.label === label : true),
+				) ??
+				persisted.assets.at(-1) ??
+				null;
+			const current = get();
+			if (
+				!added ||
+				current.documentGeneration !== documentGeneration ||
+				current.projectId !== projectId ||
+				!current.document
+			) {
+				return null;
+			}
+			const mustMerge = before.dirty || current.revision !== revision;
+			set({
+				document: mustMerge ? mergeAddedAsset(current.document, persisted, added) : persisted,
+				revision: current.revision + 1,
+				dirty: mustMerge ? current.dirty || before.dirty : false,
+				lastSavedAt: new Date(),
+			});
+			return added;
+		});
+		if (!addedAsset) return null;
 
 		// P4 — auto-link the camera track from the recording-links registry (or
 		// its legacy sidecar) for EVERY asset added, not just the first one in
@@ -215,14 +268,32 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 						offsetMs: Math.round(camera.offsetMs ?? 0),
 						visible: true,
 					};
-					const next: AxcutDocument = {
-						...document,
-						assets: document.assets.map((a) =>
-							a.id === addedAsset.id ? { ...a, cameraTrack: linked } : a,
-						),
-					};
-					await get().saveDocument(next);
-					document = parseDocument(next);
+					await get().saveDocumentUpdate(
+						documentGeneration,
+						(document) => {
+							const asset = document.assets.find((candidate) => candidate.id === addedAsset.id);
+							if (!asset || asset.originalPath !== addedAsset.originalPath) return null;
+							return {
+								...document,
+								assets: document.assets.map((candidate) =>
+									candidate.id === addedAsset.id
+										? { ...candidate, cameraTrack: linked }
+										: candidate,
+								),
+							};
+						},
+						() => {
+							const current = get();
+							const asset = current.document?.assets.find(
+								(candidate) => candidate.id === addedAsset.id,
+							);
+							return (
+								current.documentGeneration === documentGeneration &&
+								current.projectId === projectId &&
+								asset?.originalPath === addedAsset.originalPath
+							);
+						},
+					);
 				}
 				// success:false just means no camera was found for this asset —
 				// the normal case for a plain imported video. Nothing to surface.
@@ -231,6 +302,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				// Logged as well as toasted: a toast is gone in five seconds, and the
 				// symptom this produces (a recording that silently loses its camera)
 				// is reported from the editor, long after.
+				if (get().documentGeneration !== documentGeneration || get().projectId !== projectId) {
+					return null;
+				}
 				console.warn("[project] camera auto-link failed:", err);
 				const name = addedAsset.originalPath.split(/[\\/]/).pop() ?? addedAsset.originalPath;
 				void import("sonner").then(({ toast }) =>
@@ -240,30 +314,50 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				);
 			}
 		}
-
 		if (get().documentGeneration !== documentGeneration || get().projectId !== projectId) {
 			return null;
 		}
-		set({
-			document,
-			revision: get().revision + 1,
-			dirty: false,
-			lastSavedAt: new Date(),
-		});
-		return addedAsset;
+		return get().document?.assets.find((asset) => asset.id === addedAsset.id) ?? addedAsset;
 	},
 
 	async removeAsset(assetId) {
-		const { projectId, documentGeneration } = get();
+		const { projectId, documentGeneration, status } = get();
 		if (!projectId) throw new Error("No project loaded");
-		const result = await nativeBridgeClient.aiEdition.removeAsset(projectId, assetId);
-		if (get().documentGeneration !== documentGeneration || get().projectId !== projectId) return;
-		const document = parseDocument(result.document);
-		set({
-			document,
-			revision: get().revision + 1,
-			dirty: false,
-			lastSavedAt: new Date(),
+		if (status !== "ready") return;
+		await enqueueSave(documentGeneration, async () => {
+			const before = get();
+			if (
+				before.documentGeneration !== documentGeneration ||
+				before.status !== "ready" ||
+				before.projectId !== projectId ||
+				!before.document
+			) {
+				return;
+			}
+			const revision = before.revision;
+			const result = await nativeBridgeClient.aiEdition.removeAsset(projectId, assetId);
+			const persisted = parseDocument(result.document);
+			const current = get();
+			if (
+				current.documentGeneration !== documentGeneration ||
+				current.projectId !== projectId ||
+				!current.document
+			) {
+				return;
+			}
+			const mustMerge = before.dirty || current.revision !== revision;
+			const merged = removeAssetFromDocument(current.document, assetId);
+			set({
+				document: mustMerge
+					? {
+							...merged,
+							project: { ...merged.project, updatedAt: persisted.project.updatedAt },
+						}
+					: persisted,
+				revision: current.revision + 1,
+				dirty: mustMerge ? current.dirty || before.dirty : false,
+				lastSavedAt: new Date(),
+			});
 		});
 	},
 

@@ -13,7 +13,7 @@
 import fs, { type FileHandle } from "node:fs/promises";
 import path from "node:path";
 import { createId } from "../../src/lib/ai-edition/document/ids";
-import { removeClip } from "../../src/lib/ai-edition/document/timeline";
+import { removeAsset as removeAssetFromDocument } from "../../src/lib/ai-edition/document/timeline";
 import {
 	type AxcutAsset,
 	type AxcutDocument,
@@ -118,8 +118,8 @@ export class DocumentService {
 	private readonly projectsRoot: string;
 	private readonly mediaRegistryDir: string;
 	private legacyMigrationDone = false;
-	/** Tail of the in-flight save chain per project id — see writeProject. */
-	private readonly writeQueues = new Map<string, Promise<void>>();
+	/** Tail of every read-modify-write operation per project id. */
+	private readonly operationQueues = new Map<string, Promise<void>>();
 
 	// `mediaRegistryDir` is where the media-links registry file lives
 	// (RECORDINGS_DIR in production) — see getProject. Injected for the same
@@ -207,10 +207,13 @@ export class DocumentService {
 	}
 
 	async getProject(projectId: string): Promise<AxcutDocument> {
-		// A load or read-modify-write operation (add/remove asset) must observe every
-		// save invoked before it. The write tail settles on failures too, leaving the
-		// previous atomic file as the authoritative fallback.
-		await this.writeQueues.get(projectId);
+		// A load must observe every operation invoked before it. The queue tail settles
+		// on failures, leaving the previous atomic file as the authoritative fallback.
+		await this.operationQueues.get(projectId);
+		return this.getProjectNow(projectId);
+	}
+
+	private async getProjectNow(projectId: string): Promise<AxcutDocument> {
 		// Prefer the canonical `.openscreen` file, falling back to a not-yet-migrated
 		// legacy `.axcut` so a project opened before its migration pass still loads.
 		let raw: string;
@@ -255,35 +258,33 @@ export class DocumentService {
 			projectId,
 			title: title?.trim() || "Untitled Project",
 		});
-		await this.writeProject(doc);
+		await this.enqueueProjectOperation(projectId, async () => {
+			await this.writeProjectNow(doc);
+		});
 		return doc;
 	}
 
 	async saveProject(document: AxcutDocument): Promise<AxcutDocument> {
 		const parsed = documentSchema.parse(document);
-		const stamped: AxcutDocument = {
-			...parsed,
-			project: { ...parsed.project, updatedAt: new Date().toISOString() },
-		};
-		await this.writeProject(stamped);
-		return stamped;
+		return this.enqueueProjectOperation(parsed.project.id, () => this.saveProjectNow(parsed));
 	}
 
 	async deleteProject(projectId: string): Promise<void> {
-		// Remove the canonical file and any lingering legacy `.axcut` for this id.
-		for (const filePath of [this.fileFor(projectId), this.legacyFileFor(projectId)]) {
-			try {
-				await fs.unlink(filePath);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
-					throw error;
+		await this.enqueueProjectOperation(projectId, async () => {
+			// Remove the canonical file and any lingering legacy `.axcut` for this id.
+			for (const filePath of [this.fileFor(projectId), this.legacyFileFor(projectId)]) {
+				try {
+					await fs.unlink(filePath);
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") {
+						throw error;
+					}
 				}
 			}
-		}
+		});
 	}
 
 	async addAsset(projectId: string, input: AddAssetInput): Promise<AxcutDocument> {
-		const doc = await this.getProject(projectId);
 		if (!input.path) {
 			throw new ProjectFileError("Asset path is required.", projectId);
 		}
@@ -293,66 +294,52 @@ export class DocumentService {
 				projectId,
 			);
 		}
-		const absolutePath = path.isAbsolute(input.path) ? input.path : path.resolve(input.path);
-		// P3.1 — capture the file size at import. Non-fatal: a stat failure
-		// (network drive, permissions) just leaves sizeBytes undefined.
-		let sizeBytes: number | undefined;
-		try {
-			sizeBytes = (await fs.stat(absolutePath)).size;
-		} catch {
-			sizeBytes = undefined;
-		}
-		const asset: AxcutAsset = {
-			id: createId("asset"),
-			kind: "video",
-			label: input.label?.trim() || path.basename(absolutePath),
-			originalPath: absolutePath,
-			sizeBytes,
-			cameraTrack: null,
-		};
-		const next: AxcutDocument = {
-			...doc,
-			assets: [...doc.assets, asset],
-			project: {
-				...doc.project,
-				...(doc.project.primaryAssetId ? {} : { primaryAssetId: asset.id }),
-				updatedAt: new Date().toISOString(),
-			},
-		};
-		return this.saveProject(next);
+		return this.enqueueProjectOperation(projectId, async () => {
+			const absolutePath = path.isAbsolute(input.path) ? input.path : path.resolve(input.path);
+			// P3.1 — capture the file size at import. Non-fatal: a stat failure
+			// (network drive, permissions) just leaves sizeBytes undefined.
+			let sizeBytes: number | undefined;
+			try {
+				sizeBytes = (await fs.stat(absolutePath)).size;
+			} catch {
+				sizeBytes = undefined;
+			}
+			const asset: AxcutAsset = {
+				id: createId("asset"),
+				kind: "video",
+				label: input.label?.trim() || path.basename(absolutePath),
+				originalPath: absolutePath,
+				sizeBytes,
+				cameraTrack: null,
+			};
+			const doc = await this.getProjectNow(projectId);
+			const next: AxcutDocument = {
+				...doc,
+				assets: [...doc.assets, asset],
+				project: {
+					...doc.project,
+					...(doc.project.primaryAssetId ? {} : { primaryAssetId: asset.id }),
+				},
+			};
+			return this.saveProjectNow(next);
+		});
 	}
 
 	async removeAsset(projectId: string, assetId: string): Promise<AxcutDocument> {
-		const doc = await this.getProject(projectId);
-		if (!doc.assets.some((a) => a.id === assetId)) {
-			throw new ProjectFileError(`Asset ${assetId} not found in project ${projectId}.`, projectId);
-		}
-		const assets = doc.assets.filter((a) => a.id !== assetId);
-		const primaryAssetId =
-			doc.project.primaryAssetId === assetId
-				? (assets[0]?.id ?? undefined)
-				: doc.project.primaryAssetId;
-		const withoutAssetClips = doc.timeline.clips
-			.filter((clip) => clip.assetId === assetId)
-			.reduce((current, clip) => removeClip(current, clip.id), doc);
-		const next: AxcutDocument = {
-			...withoutAssetClips,
-			assets,
-			timeline: {
-				...withoutAssetClips.timeline,
-				trimRanges: withoutAssetClips.timeline.trimRanges.filter((r) => r.assetId !== assetId),
-			},
-			project: {
-				...withoutAssetClips.project,
-				primaryAssetId,
-				updatedAt: new Date().toISOString(),
-			},
-		};
-		return this.saveProject(next);
+		return this.enqueueProjectOperation(projectId, async () => {
+			const doc = await this.getProjectNow(projectId);
+			if (!doc.assets.some((asset) => asset.id === assetId)) {
+				throw new ProjectFileError(
+					`Asset ${assetId} not found in project ${projectId}.`,
+					projectId,
+				);
+			}
+			return this.saveProjectNow(removeAssetFromDocument(doc, assetId));
+		});
 	}
 
 	/**
-	 * Serialise saves per project, then write atomically.
+	 * Serialise complete operations per project, then write atomically.
 	 *
 	 * This has destroyed real project files. `fs.writeFile` opens with O_TRUNC and
 	 * writes from offset 0, so two concurrent saves of the SAME project interleave
@@ -362,29 +349,42 @@ export class DocumentService {
 	 * gone. Two projects on this machine were lost exactly that way (a complete
 	 * document followed by the tail of a longer, older version).
 	 *
-	 * Both halves are load-bearing:
-	 *  - the queue makes concurrent saves of one project sequential, so a save
-	 *    always writes over a settled file, never a half-written one;
+	 * All three parts are load-bearing:
+	 *  - the queue makes concurrent operations on one project sequential, so an
+	 *    asset mutation owns its read + update + write as one transaction;
+	 *  - a save always writes over a settled file, never a half-written one;
 	 *  - temp + rename makes each save all-or-nothing, so a crash (or a full disk)
 	 *    mid-write leaves the previous document intact instead of a truncated one.
 	 * The queue alone would still leave a torn file on a crash; the rename alone
 	 * would still let two saves race for the same destination.
 	 */
-	private writeProject(doc: AxcutDocument): Promise<void> {
-		const projectId = doc.project.id;
-		const tail = this.writeQueues.get(projectId) ?? Promise.resolve();
-		// Chained on both settlements: one save failing must not cancel the next.
-		const run = tail.then(
-			() => this.writeProjectNow(doc),
-			() => this.writeProjectNow(doc),
+	private enqueueProjectOperation<T>(projectId: string, operation: () => Promise<T>): Promise<T> {
+		const tail = this.operationQueues.get(projectId) ?? Promise.resolve();
+		// Chained on both settlements: one failure must not cancel the next operation.
+		const run = tail.then(operation, operation);
+		const settled = run.then(
+			() => undefined,
+			() => undefined,
 		);
-		const settled = run.catch(() => undefined);
-		this.writeQueues.set(projectId, settled);
+		this.operationQueues.set(projectId, settled);
 		void settled.then(() => {
-			// Only the tail clears the entry — a later save may already own it.
-			if (this.writeQueues.get(projectId) === settled) this.writeQueues.delete(projectId);
+			// Only the tail clears the entry — a later operation may already own it.
+			if (this.operationQueues.get(projectId) === settled) {
+				this.operationQueues.delete(projectId);
+			}
 		});
 		return run;
+	}
+
+	/** Persist while already holding the project's operation queue. Never enqueue from here. */
+	private async saveProjectNow(document: AxcutDocument): Promise<AxcutDocument> {
+		const parsed = documentSchema.parse(document);
+		const stamped: AxcutDocument = {
+			...parsed,
+			project: { ...parsed.project, updatedAt: new Date().toISOString() },
+		};
+		await this.writeProjectNow(stamped);
+		return stamped;
 	}
 
 	private async writeProjectNow(doc: AxcutDocument): Promise<void> {

@@ -943,6 +943,30 @@ export function removeClip(document: AxcutDocument, clipId: string): AxcutDocume
 		: withoutRemovedRegions;
 }
 
+/** Remove an asset and every timeline object carried by one of its clips. Pure. */
+export function removeAsset(document: AxcutDocument, assetId: string): AxcutDocument {
+	if (!document.assets.some((asset) => asset.id === assetId)) return document;
+	const withoutAssetClips = document.timeline.clips
+		.filter((clip) => clip.assetId === assetId)
+		.reduce((current, clip) => removeClip(current, clip.id), document);
+	const assets = withoutAssetClips.assets.filter((asset) => asset.id !== assetId);
+	return {
+		...withoutAssetClips,
+		assets,
+		timeline: {
+			...withoutAssetClips.timeline,
+			trimRanges: withoutAssetClips.timeline.trimRanges.filter((trim) => trim.assetId !== assetId),
+		},
+		project: {
+			...withoutAssetClips.project,
+			primaryAssetId:
+				withoutAssetClips.project.primaryAssetId === assetId
+					? assets[0]?.id
+					: withoutAssetClips.project.primaryAssetId,
+		},
+	};
+}
+
 export function restoreFullTimeline(document: AxcutDocument): AxcutDocument {
 	const duration = primaryAssetDuration(document);
 	if (duration <= 0) return document;

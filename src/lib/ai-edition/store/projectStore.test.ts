@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { removeAsset as removeAssetFromDocument } from "../document/timeline";
 import type { AxcutDocument } from "../schema";
 import { useProjectStore } from "./projectStore";
 
@@ -66,6 +67,36 @@ const sampleDoc = {
 	legacyEditor: null,
 };
 
+const assetDoc: AxcutDocument = {
+	...sampleDoc,
+	project: { ...sampleDoc.project, primaryAssetId: "asset_1" },
+	assets: [
+		{
+			id: "asset_1",
+			kind: "video",
+			label: "screen.webm",
+			originalPath: "/tmp/screen.webm",
+			cameraTrack: null,
+		},
+	],
+	timeline: {
+		...sampleDoc.timeline,
+		clips: [
+			{
+				id: "clip_1",
+				assetId: "asset_1",
+				sourceStartSec: 0,
+				sourceEndSec: 10,
+				timelineStartSec: 0,
+				timelineEndSec: 10,
+				wordRefs: [],
+				origin: "user",
+				reason: "",
+			},
+		],
+	},
+};
+
 function deferred<T>() {
 	let resolve!: (value: T) => void;
 	const promise = new Promise<T>((next) => {
@@ -93,7 +124,12 @@ describe("useProjectStore", () => {
 		}
 		toastMocks.error.mockReset();
 		// biome-ignore lint/suspicious/noExplicitAny: test-only stub of the legacy contextBridge surface
-		(window as any).electronAPI = { findRecordingCamera: vi.fn() };
+		(window as any).electronAPI = {
+			findRecordingCamera: vi.fn().mockResolvedValue({
+				success: false,
+				error: "No camera attached to this recording",
+			}),
+		};
 	});
 
 	afterEach(() => {
@@ -237,6 +273,236 @@ describe("useProjectStore", () => {
 			dirty: true,
 		});
 		expect(useProjectStore.getState().documentGeneration).toBeGreaterThan(firstGeneration);
+	});
+
+	it("merges a delayed add response without clearing a newer dirty edit", async () => {
+		const pending = deferred<{ assetId: string; document: AxcutDocument }>();
+		bridgeMocks.addAsset.mockReturnValue(pending.promise);
+		loadDocument();
+
+		const adding = useProjectStore.getState().addAsset("/tmp/screen.webm");
+		await waitFor(() => expect(bridgeMocks.addAsset).toHaveBeenCalledTimes(1));
+		useProjectStore.getState().setDocument({
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Newer dirty title" },
+		});
+		pending.resolve({ assetId: "asset_1", document: assetDoc });
+		await adding;
+
+		expect(useProjectStore.getState()).toMatchObject({
+			document: {
+				project: { title: "Newer dirty title" },
+				assets: [{ id: "asset_1" }],
+			},
+			dirty: true,
+		});
+	});
+
+	it("does not let a later ordinary save drop an asset added while it was queued", async () => {
+		const pendingAdd = deferred<{ assetId: string; document: AxcutDocument }>();
+		bridgeMocks.addAsset.mockReturnValue(pendingAdd.promise);
+		bridgeMocks.save.mockImplementation(async (document: AxcutDocument) => ({
+			success: true,
+			document,
+		}));
+		loadDocument();
+
+		const adding = useProjectStore.getState().addAsset("/tmp/screen.webm");
+		await waitFor(() => expect(bridgeMocks.addAsset).toHaveBeenCalledTimes(1));
+		const stale = useProjectStore.getState().document!;
+		const saving = useProjectStore.getState().saveDocument({
+			...stale,
+			project: { ...stale.project, title: "Save queued after add" },
+		});
+		pendingAdd.resolve({ assetId: "asset_1", document: assetDoc });
+		await adding;
+		await saving;
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(bridgeMocks.save.mock.calls[0]?.[0]).toMatchObject({
+			project: { title: "Save queued after add" },
+			assets: [{ id: "asset_1" }],
+		});
+		expect(useProjectStore.getState().document).toMatchObject({
+			project: { title: "Save queued after add" },
+			assets: [{ id: "asset_1" }],
+		});
+	});
+
+	it("orders remove before a later ordinary save and preserves its newer edit", async () => {
+		const pendingRemove = deferred<{ assetId: string; document: AxcutDocument }>();
+		const pendingSave = deferred<{ success: true; document: AxcutDocument }>();
+		let saveSnapshot: AxcutDocument | null = null;
+		bridgeMocks.removeAsset.mockReturnValue(pendingRemove.promise);
+		bridgeMocks.save.mockImplementation((document: AxcutDocument) => {
+			saveSnapshot = document;
+			return pendingSave.promise;
+		});
+		loadDocument(assetDoc);
+
+		const removing = useProjectStore.getState().removeAsset("asset_1");
+		await waitFor(() => expect(bridgeMocks.removeAsset).toHaveBeenCalledTimes(1));
+		const current = useProjectStore.getState().document!;
+		const saving = useProjectStore.getState().saveDocument({
+			...current,
+			project: { ...current.project, title: "Edit queued after remove" },
+		});
+		pendingRemove.resolve({
+			assetId: "asset_1",
+			document: removeAssetFromDocument(assetDoc, "asset_1"),
+		});
+		await removing;
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+
+		expect(saveSnapshot).toMatchObject({
+			project: { title: "Edit queued after remove" },
+			assets: [],
+			timeline: { clips: [] },
+		});
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Edit queued after remove" }, assets: [] },
+			dirty: true,
+		});
+
+		pendingSave.resolve({ success: true, document: saveSnapshot! });
+		await saving;
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Edit queued after remove" }, assets: [] },
+			dirty: false,
+		});
+	});
+
+	it("orders an atomic updater after add and includes the new asset", async () => {
+		const pendingAdd = deferred<{ assetId: string; document: AxcutDocument }>();
+		bridgeMocks.addAsset.mockReturnValue(pendingAdd.promise);
+		bridgeMocks.save.mockImplementation(async (document: AxcutDocument) => ({
+			success: true,
+			document,
+		}));
+		loadDocument();
+
+		const adding = useProjectStore.getState().addAsset("/tmp/screen.webm");
+		await waitFor(() => expect(bridgeMocks.addAsset).toHaveBeenCalledTimes(1));
+		const generation = useProjectStore.getState().documentGeneration;
+		const updating = useProjectStore.getState().saveDocumentUpdate(generation, (document) => ({
+			...document,
+			project: { ...document.project, title: "Updater after add" },
+		}));
+		pendingAdd.resolve({ assetId: "asset_1", document: assetDoc });
+		await adding;
+		await updating;
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(bridgeMocks.save.mock.calls[0]?.[0]).toMatchObject({
+			project: { title: "Updater after add" },
+			assets: [{ id: "asset_1" }],
+		});
+		expect(useProjectStore.getState().document).toMatchObject({
+			project: { title: "Updater after add" },
+			assets: [{ id: "asset_1" }],
+		});
+	});
+
+	it("ignores an A-to-B-to-A stale asset-operation response", async () => {
+		const pendingRemove = deferred<{ assetId: string; document: AxcutDocument }>();
+		bridgeMocks.removeAsset.mockReturnValue(pendingRemove.promise);
+		loadDocument(assetDoc);
+		const firstGeneration = useProjectStore.getState().documentGeneration;
+		const removing = useProjectStore.getState().removeAsset("asset_1");
+		await waitFor(() => expect(bridgeMocks.removeAsset).toHaveBeenCalledTimes(1));
+
+		const projectB: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, id: "proj_b", title: "Project B" },
+		};
+		const reopenedA: AxcutDocument = {
+			...assetDoc,
+			project: { ...assetDoc.project, title: "Reopened A" },
+		};
+		bridgeMocks.get.mockResolvedValueOnce({ success: true, document: projectB });
+		bridgeMocks.get.mockResolvedValueOnce({ success: true, document: reopenedA });
+		await useProjectStore.getState().loadProject("proj_b");
+		await useProjectStore.getState().loadProject("proj_test");
+		pendingRemove.resolve({
+			assetId: "asset_1",
+			document: removeAssetFromDocument(assetDoc, "asset_1"),
+		});
+		await removing;
+
+		expect(useProjectStore.getState().document).toMatchObject({
+			project: { id: "proj_test", title: "Reopened A" },
+			assets: [{ id: "asset_1" }],
+		});
+		expect(useProjectStore.getState().documentGeneration).toBeGreaterThan(firstGeneration);
+	});
+
+	it("recovers the renderer queue after an asset operation rejects", async () => {
+		bridgeMocks.removeAsset.mockRejectedValueOnce(new Error("remove failed"));
+		bridgeMocks.save.mockImplementation(async (document: AxcutDocument) => ({
+			success: true,
+			document,
+		}));
+		loadDocument(assetDoc);
+
+		await expect(useProjectStore.getState().removeAsset("asset_1")).rejects.toThrow(
+			"remove failed",
+		);
+		const current = useProjectStore.getState().document!;
+		await useProjectStore.getState().saveDocument({
+			...current,
+			project: { ...current.project, title: "Save after rejection" },
+		});
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(useProjectStore.getState().document?.project.title).toBe("Save after rejection");
+	});
+
+	it("merges a delayed camera link into the newest document", async () => {
+		const camera = deferred<{
+			success: true;
+			webcamVideoPath: string;
+			offsetMs: number;
+		}>();
+		bridgeMocks.addAsset.mockResolvedValue({ assetId: "asset_1", document: assetDoc });
+		bridgeMocks.save.mockImplementation(async (document: AxcutDocument) => ({
+			success: true,
+			document,
+		}));
+		// biome-ignore lint/suspicious/noExplicitAny: test-only stub of the legacy contextBridge surface
+		(window as any).electronAPI.findRecordingCamera.mockReturnValue(camera.promise);
+		loadDocument();
+
+		const adding = useProjectStore.getState().addAsset("/tmp/screen.webm");
+		await waitFor(() => expect(useProjectStore.getState().document?.assets).toHaveLength(1));
+		const current = useProjectStore.getState().document!;
+		useProjectStore.getState().setDocument({
+			...current,
+			project: { ...current.project, title: "Edit during camera lookup" },
+		});
+		camera.resolve({
+			success: true,
+			webcamVideoPath: "/tmp/screen-webcam.webm",
+			offsetMs: 12.4,
+		});
+		await adding;
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(bridgeMocks.save.mock.calls[0]?.[0]).toMatchObject({
+			project: { title: "Edit during camera lookup" },
+			assets: [
+				{
+					id: "asset_1",
+					cameraTrack: { sourcePath: "/tmp/screen-webcam.webm", offsetMs: 12 },
+				},
+			],
+		});
+		expect(useProjectStore.getState()).toMatchObject({
+			document: {
+				project: { title: "Edit during camera lookup" },
+				assets: [{ cameraTrack: { sourcePath: "/tmp/screen-webcam.webm" } }],
+			},
+			dirty: false,
+		});
 	});
 
 	it("addAsset replaces the document and bumps revision", async () => {

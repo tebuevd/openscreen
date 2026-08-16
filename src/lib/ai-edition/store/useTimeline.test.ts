@@ -1,8 +1,13 @@
 // @vitest-environment jsdom
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { createElement, type PropsWithChildren, StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "@/contexts/I18nContext";
+import { DocumentService } from "../../../../electron/ai-edition/document-service";
+import { removeAsset as removeAssetFromDocument } from "../document/timeline";
 import type { AxcutDocument } from "../schema";
 import { axcutSchemaVersion } from "../schema";
 import { useProjectStore } from "./projectStore";
@@ -547,6 +552,106 @@ describe("useTimeline backfills missing source dimensions on load", () => {
 			width: 1024,
 			height: 768,
 		});
+	});
+
+	it("does not let a queued backfill resurrect an asset removed through the store", async () => {
+		const probe = deferred<{ width: number; height: number } | null>();
+		const remove = deferred<{ assetId: string; document: AxcutDocument }>();
+		let persisted = documentWithoutDimensions;
+		probeVideoDimensionsMock.mockReturnValue(probe.promise);
+		bridgeMocks.removeAsset.mockReturnValue(remove.promise);
+		bridgeMocks.save.mockImplementation(async (document: AxcutDocument) => {
+			persisted = document;
+			return { success: true, document };
+		});
+		loadDocument(documentWithoutDimensions);
+		renderTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+
+		const removing = useProjectStore.getState().removeAsset("asset_1");
+		await waitFor(() => expect(bridgeMocks.removeAsset).toHaveBeenCalledTimes(1));
+		await act(async () => {
+			probe.resolve({ width: 2880, height: 1864 });
+			await probe.promise;
+			await Promise.resolve();
+		});
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+
+		persisted = removeAssetFromDocument(persisted, "asset_1");
+		remove.resolve({ assetId: "asset_1", document: persisted });
+		await act(async () => removing);
+		await act(async () => Promise.resolve());
+
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+		expect(useProjectStore.getState().document?.assets).toEqual([]);
+		expect(persisted.assets).toEqual([]);
+	});
+
+	it("keeps a real persisted project asset-free when remove commits before queued backfill", async () => {
+		const projectsRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-timeline-race-"));
+		const mediaRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-timeline-media-"));
+		const service = new DocumentService(projectsRoot, mediaRoot);
+		const probe = deferred<{ width: number; height: number } | null>();
+		const removeStarted = deferred<void>();
+		const releaseRemove = deferred<void>();
+		let rendered: ReturnType<typeof renderTimeline> | undefined;
+
+		try {
+			const created = await service.createProject("Real remove race");
+			const withAsset = await service.addAsset(created.project.id, {
+				path: path.join(mediaRoot, "screen.webm"),
+			});
+			const assetId = withAsset.assets[0].id;
+			const persisted = await service.saveProject({
+				...withAsset,
+				timeline: {
+					...withAsset.timeline,
+					clips: [
+						{
+							id: "clip_real",
+							assetId,
+							sourceStartSec: 0,
+							sourceEndSec: 10,
+							timelineStartSec: 0,
+							timelineEndSec: 10,
+							wordRefs: [],
+							origin: "user",
+							reason: "",
+						},
+					],
+				},
+			});
+			probeVideoDimensionsMock.mockReturnValue(probe.promise);
+			bridgeMocks.save.mockImplementation(async (document: AxcutDocument) => ({
+				success: true,
+				document: await service.saveProject(document),
+			}));
+			bridgeMocks.removeAsset.mockImplementation(async (projectId: string, id: string) => {
+				removeStarted.resolve(undefined);
+				await releaseRemove.promise;
+				return { assetId: id, document: await service.removeAsset(projectId, id) };
+			});
+			loadDocument(persisted);
+			rendered = renderTimeline();
+			await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+
+			const removing = useProjectStore.getState().removeAsset(assetId);
+			await removeStarted.promise;
+			probe.resolve({ width: 2880, height: 1864 });
+			await probe.promise;
+			await Promise.resolve();
+			releaseRemove.resolve(undefined);
+			await removing;
+			await act(async () => Promise.resolve());
+
+			expect(useProjectStore.getState().document?.assets).toEqual([]);
+			expect((await service.getProject(created.project.id)).assets).toEqual([]);
+			expect(bridgeMocks.save).not.toHaveBeenCalled();
+		} finally {
+			rendered?.unmount();
+			await fs.rm(projectsRoot, { recursive: true, force: true });
+			await fs.rm(mediaRoot, { recursive: true, force: true });
+		}
 	});
 
 	it("re-probes and heals dimensions that disappear after a successful save", async () => {

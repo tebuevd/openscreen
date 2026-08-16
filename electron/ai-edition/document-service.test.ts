@@ -288,6 +288,35 @@ describe("DocumentService", () => {
 			expect(after.project.primaryAssetId).toBe(first.project.primaryAssetId);
 			expect(after.assets).toHaveLength(2);
 		});
+
+		it("serializes concurrent read-modify-write additions without dropping either asset", async () => {
+			const doc = await service.createProject("Concurrent assets");
+			await Promise.all([
+				service.addAsset(doc.project.id, { path: "/tmp/a.mp4" }),
+				service.addAsset(doc.project.id, { path: "/tmp/b.mp4" }),
+			]);
+
+			const onDisk = await service.getProject(doc.project.id);
+			expect(onDisk.assets.map((asset) => asset.originalPath)).toEqual([
+				"/tmp/a.mp4",
+				"/tmp/b.mp4",
+			]);
+		});
+
+		it("applies an add after an earlier ordinary save without losing that save", async () => {
+			const doc = await service.createProject("Save then add");
+			await Promise.all([
+				service.saveProject({
+					...doc,
+					project: { ...doc.project, title: "Saved title" },
+				}),
+				service.addAsset(doc.project.id, { path: "/tmp/added.mp4" }),
+			]);
+
+			const onDisk = await service.getProject(doc.project.id);
+			expect(onDisk.project.title).toBe("Saved title");
+			expect(onDisk.assets.map((asset) => asset.originalPath)).toEqual(["/tmp/added.mp4"]);
+		});
 	});
 
 	describe("removeAsset", () => {
@@ -376,6 +405,24 @@ describe("DocumentService", () => {
 			await expect(service.removeAsset(doc.project.id, "asset_x")).rejects.toBeInstanceOf(
 				ProjectFileError,
 			);
+		});
+
+		it("removes an asset after an earlier stale metadata save without resurrecting it", async () => {
+			const doc = await service.createProject("Backfill then remove");
+			const withAsset = await service.addAsset(doc.project.id, { path: "/tmp/a.mp4" });
+			const staleBackfill: AxcutDocument = {
+				...withAsset,
+				assets: withAsset.assets.map((asset) => ({
+					...asset,
+					video: { codec: "unknown", width: 1920, height: 1080, fps: 0 },
+				})),
+			};
+
+			await Promise.all([
+				service.saveProject(staleBackfill),
+				service.removeAsset(doc.project.id, withAsset.assets[0].id),
+			]);
+			expect((await service.getProject(doc.project.id)).assets).toEqual([]);
 		});
 	});
 
@@ -548,6 +595,55 @@ describe("DocumentService", () => {
 			open.mockRestore();
 
 			expect((await service.getProject(doc.project.id)).annotations).toHaveLength(7);
+		});
+
+		it("a failed asset transaction does not block the next one", async () => {
+			const doc = await service.createProject("Asset recovery");
+			const open = vi.spyOn(fs, "open").mockRejectedValueOnce(new Error("EIO"));
+
+			const failing = service.addAsset(doc.project.id, { path: "/tmp/fails.mp4" });
+			const following = service.addAsset(doc.project.id, { path: "/tmp/works.mp4" });
+			await expect(failing).rejects.toThrow(ProjectFileError);
+			await expect(following).resolves.toBeTruthy();
+			open.mockRestore();
+
+			const onDisk = await service.getProject(doc.project.id);
+			expect(onDisk.assets.map((asset) => asset.originalPath)).toEqual(["/tmp/works.mp4"]);
+		});
+
+		it("does not block another project's queue", async () => {
+			const projectA = await service.createProject("Project A");
+			const projectB = await service.createProject("Project B");
+			const enteredWrite = deferred<void>();
+			const releaseWrite = deferred<void>();
+			const realOpen = fs.open.bind(fs);
+			const open = vi.spyOn(fs, "open").mockImplementationOnce(async (...args) => {
+				enteredWrite.resolve(undefined);
+				await releaseWrite.promise;
+				return realOpen(...args);
+			});
+
+			const savingA = service.saveProject({
+				...projectA,
+				project: { ...projectA.project, title: "Blocked A" },
+			});
+			await enteredWrite.promise;
+			const savingB = service.saveProject({
+				...projectB,
+				project: { ...projectB.project, title: "Independent B" },
+			});
+			let timeout: ReturnType<typeof setTimeout> | undefined;
+			const bFinishedFirst = await Promise.race([
+				savingB.then(() => true),
+				new Promise<false>((resolve) => {
+					timeout = setTimeout(() => resolve(false), 1000);
+				}),
+			]);
+			clearTimeout(timeout);
+			releaseWrite.resolve(undefined);
+			expect(bFinishedFirst).toBe(true);
+			await savingA;
+			open.mockRestore();
 		});
 	});
 });
