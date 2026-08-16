@@ -1,4 +1,4 @@
-import { type AspectRatio, parseAspectRatio } from "@/utils/aspectRatioUtils";
+import { type AspectRatio, parseAspectRatio } from "../../utils/aspectRatioUtils";
 import type { ExportQuality } from "./types";
 
 export interface Mp4ExportSettings {
