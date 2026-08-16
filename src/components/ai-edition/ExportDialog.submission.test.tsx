@@ -184,7 +184,13 @@ describe("ExportDialog submission", () => {
 		await waitFor(() => expect(nativeMocks.exportMultiNative).toHaveBeenCalledOnce());
 		expect(probeVideoDimensionsMock).toHaveBeenCalledOnce();
 		const call = nativeMocks.exportMultiNative.mock.calls[0];
-		expect(call?.[3]).toEqual({ width: 2880, height: 1864, fps: 60, codec: "h264" });
+		expect(call?.[3]).toEqual({
+			width: 2880,
+			height: 1864,
+			fps: 60,
+			bitrate: 80_000_000,
+			codec: "h264",
+		});
 		expect(submittedScene(call).output).toEqual({ width: 2880, height: 1864, fps: null });
 	});
 
@@ -201,7 +207,7 @@ describe("ExportDialog submission", () => {
 		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
 	});
 
-	it("passes 1920x1080 but builds the 16:9 scene from probed source geometry", async () => {
+	it("passes the calculated default 1080p bitrate and builds the scene from source geometry", async () => {
 		probeVideoDimensionsMock.mockResolvedValue({ width: 2880, height: 1864 });
 		renderDialog(makeDocument(undefined));
 
@@ -210,7 +216,13 @@ describe("ExportDialog submission", () => {
 		await waitFor(() => expect(nativeMocks.exportMultiNative).toHaveBeenCalledOnce());
 		const call = nativeMocks.exportMultiNative.mock.calls[0];
 		expect(call?.[1]).toBe("/tmp/export.mp4");
-		expect(call?.[3]).toEqual({ width: 1920, height: 1080, fps: 60, codec: "h264" });
+		expect(call?.[3]).toEqual({
+			width: 1920,
+			height: 1080,
+			fps: 60,
+			bitrate: 20_000_000,
+			codec: "h264",
+		});
 		const scene = submittedScene(call);
 		expect(scene.output).toEqual({ width: 2880, height: 1620, fps: null });
 		expect(scene.layout.screenRect).not.toBeNull();
@@ -221,7 +233,7 @@ describe("ExportDialog submission", () => {
 		expect(renderedAspect).toBeCloseTo(2880 / 1864, 3);
 	});
 
-	it("passes exact source pixels for valid Original + Source", async () => {
+	it("passes exact source pixels and calculated bitrate for high-resolution Source", async () => {
 		renderDialog(makeDocument(video(2880, 1864), "native"));
 		fireEvent.click(screen.getByRole("button", { name: /^Source/ }));
 
@@ -230,13 +242,29 @@ describe("ExportDialog submission", () => {
 		await waitFor(() => expect(nativeMocks.exportMultiNative).toHaveBeenCalledOnce());
 		const call = nativeMocks.exportMultiNative.mock.calls[0];
 		expect(probeVideoDimensionsMock).not.toHaveBeenCalled();
-		expect(call?.[3]).toEqual({ width: 2880, height: 1864, fps: 60, codec: "h264" });
+		expect(call?.[3]).toEqual({
+			width: 2880,
+			height: 1864,
+			fps: 60,
+			bitrate: 80_000_000,
+			codec: "h264",
+		});
 		expect(submittedScene(call).output).toEqual({ width: 2880, height: 1864, fps: null });
 	});
 
 	it.each([
-		["portrait", "9:16" as const, { width: 1080, height: 1920 }, { width: 1080, height: 1920 }],
-		["square", "1:1" as const, { width: 1200, height: 1200 }, { width: 1080, height: 1080 }],
+		[
+			"portrait",
+			"9:16" as const,
+			{ width: 1080, height: 1920 },
+			{ width: 1080, height: 1920, bitrate: 20_000_000 },
+		],
+		[
+			"square",
+			"1:1" as const,
+			{ width: 1200, height: 1200 },
+			{ width: 1080, height: 1080, bitrate: 20_000_000 },
+		],
 	])("builds a hydrated %s scene while keeping fixed-tier output concrete", async (_label, aspectRatio, probed, expectedParams) => {
 		probeVideoDimensionsMock.mockResolvedValue(probed);
 		renderDialog(makeDocument(undefined, aspectRatio));

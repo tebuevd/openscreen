@@ -143,6 +143,7 @@ fn run_bench(args: &[String]) -> Result<()> {
             width: 1920,
             height: 1080,
             fps: None,
+            bitrate: None,
             codec: pipeline::ExportCodec::H264,
         };
         for cfg in &cfgs {

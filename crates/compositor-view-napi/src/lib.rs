@@ -11,6 +11,9 @@ use napi::{Env, JsFunction, Task};
 use napi_derive::napi;
 use openscreen_compositor::compositor::{live_params_from_scene, Compositor};
 use openscreen_compositor::d3d::{Backend, Gpu};
+use openscreen_compositor::export_bitrate::{
+    validate_requested_mp4_bitrate, MAX_MP4_EXPORT_BITRATE,
+};
 use openscreen_compositor::gif_export::{GifExportParams, GifStats};
 use openscreen_compositor::live::{LiveView, PausedPreviews};
 use openscreen_compositor::scene::Scene;
@@ -359,6 +362,9 @@ pub struct ExportParamsInput {
     pub width: f64,
     pub height: f64,
     pub fps: Option<u32>,
+    // Keep this raw for the same reason as dimensions: direct number-to-integer conversion would
+    // hide fractions and unsafe values before the native boundary can reject them.
+    pub bitrate: Option<f64>,
     /// "h264" | "h265". Toute autre valeur (ex. "vp9", pas d'équivalent matériel AMF) fait
     /// échouer l'export avec un message clair plutôt que de silencieusement retomber sur h264.
     pub codec: Option<String>,
@@ -396,8 +402,21 @@ fn validate_export_dimensions(width: f64, height: f64) -> Result<(u32, u32)> {
     Ok((width, height))
 }
 
+fn validate_export_bitrate(bitrate: Option<f64>) -> Result<Option<i64>> {
+    bitrate
+        .map(|value| {
+            validate_requested_mp4_bitrate(value).ok_or_else(|| {
+                Error::from_reason(format!(
+                    "MP4 export bitrate must be a positive safe integer no greater than {MAX_MP4_EXPORT_BITRATE} bits per second"
+                ))
+            })
+        })
+        .transpose()
+}
+
 fn resolve_export_params(params: ExportParamsInput) -> Result<pipeline::ExportParams> {
     let (width, height) = validate_export_dimensions(params.width, params.height)?;
+    let bitrate = validate_export_bitrate(params.bitrate)?;
     let codec = match params.codec.as_deref() {
         None | Some("h264") => pipeline::ExportCodec::H264,
         Some("h265") => pipeline::ExportCodec::H265,
@@ -411,6 +430,7 @@ fn resolve_export_params(params: ExportParamsInput) -> Result<pipeline::ExportPa
         width,
         height,
         fps: params.fps,
+        bitrate,
         codec,
     })
 }
@@ -552,6 +572,7 @@ mod export_dimension_tests {
                 width,
                 height,
                 fps: Some(60),
+                bitrate: None,
                 codec: Some("h264".to_string()),
             })
             .expect("valid export params");
@@ -579,6 +600,44 @@ mod export_dimension_tests {
                 validate_export_dimensions(width, height).is_err(),
                 "{width}x{height}"
             );
+        }
+    }
+
+    #[test]
+    fn preserves_omitted_and_supplied_bitrate() {
+        for (raw, expected) in [(None, None), (Some(80_000_000.0), Some(80_000_000))] {
+            let params = resolve_export_params(ExportParamsInput {
+                width: 1920.0,
+                height: 1080.0,
+                fps: Some(60),
+                bitrate: raw,
+                codec: Some("h264".to_string()),
+            })
+            .expect("valid export params");
+            assert_eq!(params.bitrate, expected);
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_raw_bitrate() {
+        for bitrate in [
+            0.0,
+            -1.0,
+            1.5,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            9_007_199_254_740_992.0,
+            (MAX_MP4_EXPORT_BITRATE + 1) as f64,
+        ] {
+            let result = resolve_export_params(ExportParamsInput {
+                width: 1920.0,
+                height: 1080.0,
+                fps: Some(60),
+                bitrate: Some(bitrate),
+                codec: Some("h264".to_string()),
+            });
+            assert!(result.is_err(), "{bitrate}");
         }
     }
 }

@@ -144,7 +144,7 @@ function appendAutoZoomRanges(
 	return suggestions.length;
 }
 
-async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
+export async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
 	const loaded = await nativeBridgeClient.project.loadProjectFileFromPath(request.projectPath);
 	if (!loaded.success || loaded.project === undefined) {
 		throw new Error(loaded.error ?? loaded.message ?? "Failed to load project file");
@@ -313,6 +313,7 @@ async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
 			width: mp4Resolution.settings.width,
 			height: mp4Resolution.settings.height,
 			fps: MP4_EXPORT_FPS,
+			bitrate: mp4Resolution.settings.bitrate,
 			codec: "h264",
 		});
 

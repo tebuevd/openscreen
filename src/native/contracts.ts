@@ -169,6 +169,8 @@ export interface CompositorExportParams {
 	width: number;
 	height: number;
 	fps?: number;
+	/** Video bitrate in bits per second. Omitted keeps the native area-based fallback. */
+	bitrate?: number;
 	/** "h264" | "h265" — pas de vp9 (aucun équivalent matériel AMF côté natif). */
 	codec?: string;
 }

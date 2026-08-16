@@ -378,6 +378,7 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 						width: mp4Output.width,
 						height: mp4Output.height,
 						fps,
+						bitrate: mp4Output.bitrate,
 						codec,
 					});
 				}

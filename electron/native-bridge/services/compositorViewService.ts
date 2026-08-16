@@ -5,7 +5,9 @@ import { fileURLToPath } from "node:url";
 import { app } from "electron";
 import { resolveCursorSprites } from "../../../src/lib/cursor/cursorThemes";
 import {
+	MP4_EXPORT_BITRATE_ERROR,
 	MP4_EXPORT_DIMENSIONS_ERROR,
+	validateMp4ExportBitrate,
 	validateMp4ExportDimensions,
 } from "../../../src/lib/exporter/mp4ExportSettings";
 import type {
@@ -153,6 +155,9 @@ export function validateExportParamsInput(params: unknown): ExportParamsInput {
 	}
 	const validation = validateMp4ExportDimensions(params as { width?: unknown; height?: unknown });
 	if (!validation.ok) throw new TypeError(MP4_EXPORT_DIMENSIONS_ERROR);
+	if (!validateMp4ExportBitrate((params as { bitrate?: unknown }).bitrate)) {
+		throw new TypeError(MP4_EXPORT_BITRATE_ERROR);
+	}
 	return { ...(params as ExportParamsInput), ...validation.dimensions };
 }
 

@@ -26,6 +26,7 @@ use crate::audio::{
 };
 use crate::config::Cfg;
 use crate::d3d::Gpu;
+use crate::export_bitrate::resolve_mp4_bitrate;
 use crate::ffi::AVFrame;
 use crate::linux_decode::SwDecoder;
 use crate::timeline_walk::NextFrameTime;
@@ -65,6 +66,7 @@ pub struct ExportParams {
     pub width: u32,
     pub height: u32,
     pub fps: Option<u32>,
+    pub bitrate: Option<i64>,
     pub codec: ExportCodec,
 }
 
@@ -393,8 +395,7 @@ pub fn run_composited_multi(
     }
     let (out_w, out_h) = (params.width, params.height);
     let out_fps = params.fps.unwrap_or(30) as i32;
-    // bitrate proportionnel a la surface (reference : 8 Mbps @ 1920x1080).
-    let bit_rate = ((out_w as i64 * out_h as i64 * 8_000_000) / (1920 * 1080)).max(2_000_000);
+    let bit_rate = resolve_mp4_bitrate(out_w, out_h, params.bitrate);
     let t0 = std::time::Instant::now();
 
     let mut enc = VideoEncoder::open(&params.codec, out_w as i32, out_h as i32, out_fps, bit_rate)?;

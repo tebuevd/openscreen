@@ -8,7 +8,9 @@
  */
 
 import {
+	MP4_EXPORT_BITRATE_ERROR,
 	MP4_EXPORT_DIMENSIONS_ERROR,
+	validateMp4ExportBitrate,
 	validateMp4ExportDimensions,
 } from "@/lib/exporter/mp4ExportSettings";
 import { requireNativeBridgeData } from "./client";
@@ -146,6 +148,9 @@ export function exportMultiNative(
 ): Promise<CompositorExportResult> {
 	if (!validateMp4ExportDimensions(params).ok) {
 		return Promise.reject(new Error(MP4_EXPORT_DIMENSIONS_ERROR));
+	}
+	if (!validateMp4ExportBitrate((params as { bitrate?: unknown }).bitrate)) {
+		return Promise.reject(new Error(MP4_EXPORT_BITRATE_ERROR));
 	}
 	return requireNativeBridgeData<CompositorExportResult>({
 		domain: "compositor",

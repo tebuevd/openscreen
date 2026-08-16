@@ -24,6 +24,12 @@ export const MAX_MP4_EXPORT_DIMENSION = 8192;
 export const MAX_MP4_EXPORT_PIXEL_AREA = 8192 * 4320;
 export const MP4_EXPORT_DIMENSIONS_ERROR = `MP4 export width and height must both be positive even integers, no greater than ${MAX_MP4_EXPORT_DIMENSION} per axis or ${MAX_MP4_EXPORT_PIXEL_AREA} total pixels.`;
 
+// Bits per second. This covers the current UI policy maximum (80 Mbps) and the legacy
+// area-based fallback at the largest allowed DCI-8K frame (~136.5 Mbps), while bounding raw
+// callers that accidentally submit another unit or an otherwise unreasonable encoder target.
+export const MAX_MP4_EXPORT_BITRATE = 200_000_000;
+export const MP4_EXPORT_BITRATE_ERROR = `MP4 export bitrate must be a positive safe integer no greater than ${MAX_MP4_EXPORT_BITRATE} bits per second.`;
+
 export type Mp4ExportDimensionValidation =
 	| { ok: true; dimensions: ExportDimensions }
 	| { ok: false; reason: "missing" | "invalid" | "too-large" };
@@ -101,6 +107,17 @@ export function validateMp4ExportDimensions(
 		return { ok: false, reason: "too-large" };
 	}
 	return { ok: true, dimensions: { width, height } };
+}
+
+export function validateMp4ExportBitrate(bitrate: unknown): bitrate is number | undefined {
+	return (
+		bitrate === undefined ||
+		(typeof bitrate === "number" &&
+			Number.isFinite(bitrate) &&
+			Number.isSafeInteger(bitrate) &&
+			bitrate > 0 &&
+			bitrate <= MAX_MP4_EXPORT_BITRATE)
+	);
 }
 
 const MEDIUM_SHORT_SIDE = 720;

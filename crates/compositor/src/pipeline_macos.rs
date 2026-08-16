@@ -35,6 +35,7 @@ use crate::audio::{
 };
 use crate::compositor::Compositor;
 use crate::d3d::Gpu;
+use crate::export_bitrate::resolve_mp4_bitrate;
 use crate::timeline_walk::NextFrameTime;
 use anyhow::{anyhow, bail, Result};
 use std::ffi::{c_void, CString};
@@ -609,6 +610,7 @@ pub struct ExportParams {
     pub width: u32,
     pub height: u32,
     pub fps: Option<u32>,
+    pub bitrate: Option<i64>,
     pub codec: ExportCodec,
 }
 
@@ -992,8 +994,7 @@ pub fn run_composited_multi(
 
     // fps : explicite > dérivé du premier clip.
     let out_fps = params.fps.unwrap_or(30) as i32;
-    // bitrate proportionnel à la surface de sortie (référence : 8Mbps @ 1920x1080).
-    let bit_rate = ((out_w as i64 * out_h as i64 * 8_000_000) / (1920 * 1080)).max(2_000_000);
+    let bit_rate = resolve_mp4_bitrate(out_w, out_h, params.bitrate);
 
     // ---- decodeurs : un par chemin, réutilisés entre clips (screen ≠ webcam → 2 maps) ----
     let mut screen_decs: std::collections::HashMap<String, Decoder> =

@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { MAX_MP4_EXPORT_BITRATE } from "@/lib/exporter/mp4ExportSettings";
 
 const requireNativeBridgeDataMock = vi.hoisted(() => vi.fn());
 
@@ -8,7 +9,7 @@ vi.mock("./client", () => ({
 
 import { exportMultiNative } from "./compositorViewClient";
 
-describe("exportMultiNative dimensions", () => {
+describe("exportMultiNative params", () => {
 	beforeEach(() => {
 		requireNativeBridgeDataMock.mockReset();
 		requireNativeBridgeDataMock.mockResolvedValue({});
@@ -28,7 +29,7 @@ describe("exportMultiNative dimensions", () => {
 
 	it.each([
 		{ width: 1920, height: 1080, fps: 60, codec: "h264" },
-		{ width: 2880, height: 1864, fps: 60, codec: "h264" },
+		{ width: 2880, height: 1864, fps: 60, bitrate: 80_000_000, codec: "h264" },
 	])("submits exact valid dimensions: $width x $height", async (params) => {
 		await exportMultiNative([], "/tmp/out.mp4", "{}", params);
 		expect(requireNativeBridgeDataMock).toHaveBeenCalledWith({
@@ -41,5 +42,25 @@ describe("exportMultiNative dimensions", () => {
 				params,
 			},
 		});
+	});
+
+	it.each([
+		["zero", 0],
+		["negative", -1],
+		["fractional", 1.5],
+		["NaN", Number.NaN],
+		["positive infinity", Number.POSITIVE_INFINITY],
+		["negative infinity", Number.NEGATIVE_INFINITY],
+		["unsafe integer", Number.MAX_SAFE_INTEGER + 1],
+		["excessive", MAX_MP4_EXPORT_BITRATE + 1],
+	])("rejects %s bitrate before IPC", async (_label, bitrate) => {
+		await expect(
+			exportMultiNative([], "/tmp/out.mp4", "{}", {
+				width: 1920,
+				height: 1080,
+				bitrate,
+			}),
+		).rejects.toThrow(/bitrate.*positive safe integer/);
+		expect(requireNativeBridgeDataMock).not.toHaveBeenCalled();
 	});
 });

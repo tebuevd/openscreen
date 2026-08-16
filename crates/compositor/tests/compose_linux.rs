@@ -796,6 +796,7 @@ fn export_linux_mp4() {
         width: 640,
         height: 360,
         fps: Some(30),
+        bitrate: None,
         codec: ExportCodec::H264,
     };
 

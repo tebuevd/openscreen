@@ -82,6 +82,8 @@ export interface ExportParamsInput {
 	width: number;
 	height: number;
 	fps?: number;
+	/** Video bitrate in bits per second. Omitted keeps the native area-based fallback. */
+	bitrate?: number;
 	/** "h264" | "h265". Anything else (e.g. "vp9", no AMF hardware equivalent) fails the export
 	 *  with a clear error instead of silently falling back to h264. */
 	codec?: string;
@@ -157,7 +159,7 @@ export interface CompositorViewAddon {
 	/** Renders the real timeline (ordered clips + trims) to `outPath`, auto-pausing previews.
 	 *  `sceneJson` — same `SceneDescription` as the live preview (background/layout/webcam/cursor/
 	 *  effects); omitted or invalid → nothing configured is applied (not a masking fallback).
-	 *  `params` — required output size plus optional fps/codec.
+	 *  `params` — required output size plus optional fps/bitrate/codec.
 	 *  `onProgress` (frames encoded so far) is optional, throttled to ~10/s. */
 	exportMulti(
 		clips: ClipInput[],

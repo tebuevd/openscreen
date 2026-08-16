@@ -30,6 +30,7 @@
 pub mod audio;
 pub mod config;
 pub mod cursor;
+pub mod export_bitrate;
 pub mod ffi;
 pub mod frame_geometry;
 pub mod gif_export;

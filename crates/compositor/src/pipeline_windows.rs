@@ -11,6 +11,7 @@ use crate::config::Cfg;
 use crate::cpu_frames::CpuFrames;
 use crate::cursor::CursorTrack;
 use crate::d3d::{Backend, Gpu};
+use crate::export_bitrate::resolve_mp4_bitrate;
 use crate::ffi::*;
 use crate::regions::{speed_segments_for_window, SpeedSegment};
 use crate::scene::Scene;
@@ -1303,6 +1304,7 @@ pub struct ExportParams {
     pub width: u32,
     pub height: u32,
     pub fps: Option<u32>,
+    pub bitrate: Option<i64>,
     pub codec: ExportCodec,
 }
 
@@ -1347,9 +1349,7 @@ unsafe fn run_multi_inner(
     } else {
         make_enc_frames(gpu, out_w as i32, out_h as i32)?
     };
-    // débit proportionnel à la surface de sortie (référence : 8Mbps @ 1920x1080), plancher
-    // 2Mbps pour rester regardable sur les petites tailles.
-    let bit_rate = ((out_w as i64 * out_h as i64 * 8_000_000) / (1920 * 1080)).max(2_000_000);
+    let bit_rate = resolve_mp4_bitrate(out_w, out_h, params.bitrate);
     let mut enc = VideoEncoder::open(
         &params.codec,
         out_w as i32,

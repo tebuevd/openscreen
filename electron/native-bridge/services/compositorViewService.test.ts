@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { CURSOR_THEMES, DEFAULT_CURSOR_SPRITES } from "../../../src/lib/cursor/cursorThemes";
+import { MAX_MP4_EXPORT_BITRATE } from "../../../src/lib/exporter/mp4ExportSettings";
 import {
 	buildCandidatePaths,
 	CompositorViewService,
@@ -41,11 +42,26 @@ describe("validateExportParamsInput", () => {
 
 	it.each([
 		{ width: 1920, height: 1080, fps: 60, codec: "h264" },
-		{ width: 2880, height: 1864, fps: 60, codec: "h264" },
+		{ width: 2880, height: 1864, fps: 60, bitrate: 80_000_000, codec: "h264" },
 		{ width: 8192, height: 4320 },
 		{ width: 4320, height: 8192 },
 	])("accepts a bounded coherent pair: $width x $height", (params) => {
 		expect(validateExportParamsInput(params)).toEqual(params);
+	});
+
+	it.each([
+		["zero", 0],
+		["negative", -1],
+		["fractional", 1.5],
+		["NaN", Number.NaN],
+		["positive infinity", Number.POSITIVE_INFINITY],
+		["negative infinity", Number.NEGATIVE_INFINITY],
+		["unsafe integer", Number.MAX_SAFE_INTEGER + 1],
+		["excessive", MAX_MP4_EXPORT_BITRATE + 1],
+	])("rejects %s bitrate before the native addon boundary", (_label, bitrate) => {
+		expect(() => validateExportParamsInput({ width: 1920, height: 1080, bitrate })).toThrow(
+			/bitrate.*positive safe integer/,
+		);
 	});
 
 	it("rejects a raw missing params object before attempting to load the addon", async () => {
