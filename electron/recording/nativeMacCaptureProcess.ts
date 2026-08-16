@@ -4,8 +4,27 @@ import fs from "node:fs/promises";
 
 type NativeMacHelperEvent = Record<string, unknown>;
 type NativeMacHelperEventListener = (event: NativeMacHelperEvent) => void;
+type WarningReporter = (message: string, ...details: unknown[]) => void;
 
 export const NATIVE_MAC_CAPTURE_KILL_GRACE_MS = 1_000;
+export const NATIVE_MAC_CAPTURE_STOP_TIMEOUT_MS = 30_000;
+
+function reportCleanupFailure(
+	warn: WarningReporter | undefined,
+	message: string,
+	...details: unknown[]
+) {
+	try {
+		if (warn) warn(message, ...details);
+		else console.warn(message, ...details);
+	} catch {
+		// Cleanup diagnostics must never replace the capture error being preserved.
+	}
+}
+
+function toError(error: unknown) {
+	return error instanceof Error ? error : new Error(String(error));
+}
 
 function isHelperEvent(value: unknown): value is NativeMacHelperEvent {
 	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -145,6 +164,120 @@ function waitForExit(proc: ChildProcessWithoutNullStreams, timeoutMs: number) {
 		const onClose = () => settle(true);
 		const timer = setTimeout(() => settle(false), timeoutMs);
 		proc.once("close", onClose);
+		if (hasExited(proc)) settle(true);
+	});
+}
+
+function requestNativeMacCaptureStop(options: {
+	proc: ChildProcessWithoutNullStreams;
+	output: NativeMacCaptureOutput;
+	targetPath: string | null;
+	timeoutMs: number;
+}) {
+	const { proc, output, targetPath, timeoutMs } = options;
+	return new Promise<string>((resolve, reject) => {
+		let settled = false;
+		let timer: ReturnType<typeof setTimeout> | null = null;
+		const cleanup = () => {
+			if (timer !== null) clearTimeout(timer);
+			output.offEvent(onOutput);
+			proc.off("close", onClose);
+			proc.off("error", onProcessError);
+			proc.stdin.off("error", onStdinError);
+		};
+		const succeed = (screenPath: string) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			resolve(screenPath);
+		};
+		const fail = (error: unknown) => {
+			if (settled) return;
+			settled = true;
+			cleanup();
+			reject(toError(error));
+		};
+		const inspect = (event: NativeMacHelperEvent) => {
+			if (event.event === "recording-stopped") {
+				const screenPath =
+					typeof event.screenPath === "string" && event.screenPath.trim()
+						? event.screenPath
+						: targetPath;
+				if (screenPath) succeed(screenPath);
+				else fail(new Error("Native macOS capture did not return an output path."));
+				return;
+			}
+			if (event.event === "error") {
+				fail(new Error(String(event.message ?? event.code ?? "Native macOS capture failed")));
+			}
+		};
+		const settleFromTerminalState = () => {
+			if (!hasExited(proc)) return false;
+			if (proc.exitCode === 0 && targetPath) succeed(targetPath);
+			else {
+				fail(
+					new Error(
+						output.output.trim() ||
+							`Native macOS capture exited before stop completed (code=${proc.exitCode ?? "unknown"}, signal=${proc.signalCode ?? "none"})`,
+					),
+				);
+			}
+			return true;
+		};
+		const onOutput = (event: NativeMacHelperEvent) => inspect(event);
+		const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
+			if (code === 0 && targetPath) succeed(targetPath);
+			else {
+				fail(
+					new Error(
+						output.output.trim() ||
+							`Native macOS capture exited before stop completed (code=${code ?? "unknown"}, signal=${signal ?? "none"})`,
+					),
+				);
+			}
+		};
+		const onProcessError = (error: Error) => fail(error);
+		const onStdinError = (error: Error) => fail(error);
+
+		for (const event of output.events) {
+			inspect(event);
+			if (settled) return;
+		}
+		if (settleFromTerminalState()) return;
+
+		timer = setTimeout(
+			() =>
+				fail(
+					new Error(
+						`Timed out waiting for native macOS capture to stop. Output path: ${
+							targetPath ?? "unknown"
+						}. Output: ${output.output.trim()}`,
+					),
+				),
+			timeoutMs,
+		);
+		output.onEvent(onOutput);
+		proc.once("close", onClose);
+		proc.once("error", onProcessError);
+		proc.stdin.once("error", onStdinError);
+
+		// Close can happen between the first state check and listener registration.
+		if (settleFromTerminalState()) return;
+		if (!proc.stdin.writable || proc.stdin.destroyed || proc.stdin.writableEnded) {
+			fail(new Error("Native macOS capture command channel is closed."));
+			return;
+		}
+
+		try {
+			const accepted = proc.stdin.write("stop\n", (error) => {
+				if (error) fail(error);
+			});
+			if (!accepted) {
+				// The command is queued. Its callback or the child close/error event owns completion.
+			}
+		} catch (error) {
+			fail(error);
+		}
 	});
 }
 
@@ -170,26 +303,16 @@ export async function terminateNativeMacCapture(
 	return waitForExit(proc, graceMs);
 }
 
-export async function teardownFailedNativeMacCapture(options: {
+export async function teardownFailedNativeMacStop(options: {
 	proc: ChildProcessWithoutNullStreams;
-	output: NativeMacCaptureOutput | null;
-	outputPath: string | null;
+	output: NativeMacCaptureOutput;
 	graceMs?: number;
-	removeFile?: (filePath: string) => Promise<void>;
-	warn?: (message: string, ...details: unknown[]) => void;
+	warn?: WarningReporter;
 }) {
-	const reportCleanupFailure = (message: string, ...details: unknown[]) => {
-		try {
-			if (options.warn) options.warn(message, ...details);
-			else console.warn(message, ...details);
-		} catch {
-			// Diagnostics must not replace the start error this cleanup is preserving.
-		}
-	};
 	try {
-		options.output?.isolate();
+		options.output.isolate();
 	} catch (error) {
-		reportCleanupFailure("[native-sck] could not isolate failed helper output", error);
+		reportCleanupFailure(options.warn, "[native-sck] could not isolate failed-stop output", error);
 	}
 
 	let exited = false;
@@ -199,10 +322,91 @@ export async function teardownFailedNativeMacCapture(options: {
 			options.graceMs ?? NATIVE_MAC_CAPTURE_KILL_GRACE_MS,
 		);
 	} catch (error) {
-		reportCleanupFailure("[native-sck] failed-start termination raised an error", error);
+		reportCleanupFailure(
+			options.warn,
+			"[native-sck] failed-stop termination raised an error",
+			error,
+		);
 	}
 	if (!exited) {
-		reportCleanupFailure("[native-sck] helper survived failed-start termination", options.proc.pid);
+		reportCleanupFailure(
+			options.warn,
+			"[native-sck] helper survived failed-stop termination",
+			options.proc.pid,
+		);
+	}
+	return exited;
+}
+
+export type NativeMacCaptureStopResult =
+	| { ok: true; screenVideoPath: string }
+	| { ok: false; error: Error; exited: boolean };
+
+export async function stopNativeMacCapture(options: {
+	proc: ChildProcessWithoutNullStreams;
+	output: NativeMacCaptureOutput;
+	targetPath: string | null;
+	timeoutMs?: number;
+	killGraceMs?: number;
+	warn?: WarningReporter;
+}): Promise<NativeMacCaptureStopResult> {
+	try {
+		const screenVideoPath = await requestNativeMacCaptureStop({
+			proc: options.proc,
+			output: options.output,
+			targetPath: options.targetPath,
+			timeoutMs: options.timeoutMs ?? NATIVE_MAC_CAPTURE_STOP_TIMEOUT_MS,
+		});
+		return { ok: true, screenVideoPath };
+	} catch (error) {
+		const stopError = toError(error);
+		const exited = await teardownFailedNativeMacStop({
+			proc: options.proc,
+			output: options.output,
+			graceMs: options.killGraceMs,
+			warn: options.warn,
+		});
+		return { ok: false, error: stopError, exited };
+	}
+}
+
+export async function teardownFailedNativeMacCapture(options: {
+	proc: ChildProcessWithoutNullStreams;
+	output: NativeMacCaptureOutput | null;
+	outputPath: string | null;
+	graceMs?: number;
+	removeFile?: (filePath: string) => Promise<void>;
+	warn?: WarningReporter;
+}) {
+	try {
+		options.output?.isolate();
+	} catch (error) {
+		reportCleanupFailure(
+			options.warn,
+			"[native-sck] could not isolate failed helper output",
+			error,
+		);
+	}
+
+	let exited = false;
+	try {
+		exited = await terminateNativeMacCapture(
+			options.proc,
+			options.graceMs ?? NATIVE_MAC_CAPTURE_KILL_GRACE_MS,
+		);
+	} catch (error) {
+		reportCleanupFailure(
+			options.warn,
+			"[native-sck] failed-start termination raised an error",
+			error,
+		);
+	}
+	if (!exited) {
+		reportCleanupFailure(
+			options.warn,
+			"[native-sck] helper survived failed-start termination",
+			options.proc.pid,
+		);
 	}
 
 	if (options.outputPath) {
@@ -211,6 +415,7 @@ export async function teardownFailedNativeMacCapture(options: {
 			await removeFile(options.outputPath);
 		} catch (error) {
 			reportCleanupFailure(
+				options.warn,
 				"[native-sck] could not remove failed capture output",
 				options.outputPath,
 				error,

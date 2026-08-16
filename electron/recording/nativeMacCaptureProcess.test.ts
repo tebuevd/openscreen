@@ -7,6 +7,7 @@ import { PassThrough, Writable } from "node:stream";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	NativeMacCaptureOutput,
+	stopNativeMacCapture,
 	teardownFailedNativeMacCapture,
 	terminateNativeMacCapture,
 } from "./nativeMacCaptureProcess";
@@ -38,6 +39,25 @@ class FakeMacHelper extends EventEmitter {
 
 function asProc(helper: FakeMacHelper) {
 	return helper as unknown as ChildProcessWithoutNullStreams;
+}
+
+type WriteCallback = (error?: Error | null) => void;
+
+function mockStdinWrite(
+	helper: FakeMacHelper,
+	implementation: (callback: WriteCallback | undefined) => boolean,
+) {
+	const write = ((...args: unknown[]) => {
+		let callback: WriteCallback | undefined;
+		for (let index = args.length - 1; index >= 0; index--) {
+			if (typeof args[index] === "function") {
+				callback = args[index] as WriteCallback;
+				break;
+			}
+		}
+		return implementation(callback);
+	}) as typeof helper.stdin.write;
+	return vi.spyOn(helper.stdin, "write").mockImplementation(write);
 }
 
 let temporaryDirectories: string[];
@@ -104,6 +124,198 @@ describe("terminateNativeMacCapture", () => {
 
 		await expect(pending).resolves.toBe(false);
 		expect(helper.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+	});
+});
+
+describe("stopNativeMacCapture", () => {
+	it("completes immediately when the helper closed successfully before stop registration", async () => {
+		const helper = new FakeMacHelper();
+		const output = new NativeMacCaptureOutput(asProc(helper));
+		const write = vi.spyOn(helper.stdin, "write");
+		helper.exitCode = 0;
+		const baselineCloseListeners = helper.listenerCount("close");
+		const baselineErrorListeners = helper.listenerCount("error");
+		const baselineStdinErrorListeners = helper.stdin.listenerCount("error");
+
+		await expect(
+			stopNativeMacCapture({
+				proc: asProc(helper),
+				output,
+				targetPath: "/recordings/complete.mp4",
+				timeoutMs: 100,
+			}),
+		).resolves.toEqual({ ok: true, screenVideoPath: "/recordings/complete.mp4" });
+
+		expect(write).not.toHaveBeenCalled();
+		expect(helper.listenerCount("close")).toBe(baselineCloseListeners);
+		expect(helper.listenerCount("error")).toBe(baselineErrorListeners);
+		expect(helper.stdin.listenerCount("error")).toBe(baselineStdinErrorListeners);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("handles exit racing the terminal check and listener registration", async () => {
+		const helper = new FakeMacHelper();
+		const output = new NativeMacCaptureOutput(asProc(helper));
+		const write = vi.spyOn(helper.stdin, "write");
+		let exitCodeReads = 0;
+		Object.defineProperty(helper, "exitCode", {
+			configurable: true,
+			get() {
+				exitCodeReads += 1;
+				return exitCodeReads >= 2 ? 0 : null;
+			},
+		});
+
+		await expect(
+			stopNativeMacCapture({
+				proc: asProc(helper),
+				output,
+				targetPath: "/recordings/complete.mp4",
+				timeoutMs: 100,
+			}),
+		).resolves.toEqual({ ok: true, screenVideoPath: "/recordings/complete.mp4" });
+		expect(write).not.toHaveBeenCalled();
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("escalates a stop timeout without affecting a newer helper", async () => {
+		const failedHelper = new FakeMacHelper();
+		failedHelper.diesOnTerm = false;
+		const newerHelper = new FakeMacHelper();
+		const failedOutput = new NativeMacCaptureOutput(asProc(failedHelper));
+		new NativeMacCaptureOutput(asProc(newerHelper));
+
+		const pending = stopNativeMacCapture({
+			proc: asProc(failedHelper),
+			output: failedOutput,
+			targetPath: "/recordings/partial.mp4",
+			timeoutMs: 100,
+			killGraceMs: 50,
+		});
+		await vi.advanceTimersByTimeAsync(150);
+
+		const result = await pending;
+		expect(result).toMatchObject({ ok: false, exited: true });
+		if (!result.ok) expect(result.error.message).toMatch(/Timed out/);
+		expect(failedHelper.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(newerHelper.killSignals).toEqual([]);
+		expect(failedHelper.listenerCount("close")).toBe(0);
+		expect(failedHelper.listenerCount("error")).toBe(0);
+		expect(failedHelper.stdin.listenerCount("error")).toBe(0);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("removes waiter listeners even when the helper survives both stop signals", async () => {
+		const helper = new FakeMacHelper();
+		helper.diesOnTerm = false;
+		helper.diesOnKill = false;
+		const output = new NativeMacCaptureOutput(asProc(helper));
+		const baselineCloseListeners = helper.listenerCount("close");
+		const baselineErrorListeners = helper.listenerCount("error");
+		const baselineStdinErrorListeners = helper.stdin.listenerCount("error");
+
+		const pending = stopNativeMacCapture({
+			proc: asProc(helper),
+			output,
+			targetPath: "/recordings/partial.mp4",
+			timeoutMs: 100,
+			killGraceMs: 50,
+			warn: vi.fn(),
+		});
+		await vi.advanceTimersByTimeAsync(200);
+
+		await expect(pending).resolves.toMatchObject({ ok: false, exited: false });
+		expect(helper.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
+		expect(helper.listenerCount("close")).toBe(baselineCloseListeners);
+		expect(helper.listenerCount("error")).toBe(baselineErrorListeners);
+		expect(helper.stdin.listenerCount("error")).toBe(baselineStdinErrorListeners);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("disposes the waiter and terminates after a synchronous write failure", async () => {
+		const helper = new FakeMacHelper();
+		const output = new NativeMacCaptureOutput(asProc(helper));
+		const writeError = new Error("write threw");
+		mockStdinWrite(helper, () => {
+			throw writeError;
+		});
+
+		const result = await stopNativeMacCapture({
+			proc: asProc(helper),
+			output,
+			targetPath: "/recordings/partial.mp4",
+			timeoutMs: 100,
+		});
+
+		expect(result).toEqual({ ok: false, error: writeError, exited: true });
+		expect(helper.killSignals).toEqual(["SIGTERM"]);
+		expect(helper.listenerCount("close")).toBe(0);
+		expect(helper.listenerCount("error")).toBe(0);
+		expect(helper.stdin.listenerCount("error")).toBe(0);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("disposes the waiter and terminates after an asynchronous write failure", async () => {
+		const helper = new FakeMacHelper();
+		const output = new NativeMacCaptureOutput(asProc(helper));
+		const writeError = new Error("write callback failed");
+		mockStdinWrite(helper, (callback) => {
+			queueMicrotask(() => callback?.(writeError));
+			return true;
+		});
+
+		const result = await stopNativeMacCapture({
+			proc: asProc(helper),
+			output,
+			targetPath: "/recordings/partial.mp4",
+			timeoutMs: 100,
+		});
+
+		expect(result).toEqual({ ok: false, error: writeError, exited: true });
+		expect(helper.killSignals).toEqual(["SIGTERM"]);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("fails immediately when stdin is already closed", async () => {
+		const helper = new FakeMacHelper();
+		const output = new NativeMacCaptureOutput(asProc(helper));
+		helper.stdin.end();
+
+		const result = await stopNativeMacCapture({
+			proc: asProc(helper),
+			output,
+			targetPath: "/recordings/partial.mp4",
+			timeoutMs: 100,
+		});
+
+		expect(result).toMatchObject({ ok: false, exited: true });
+		if (!result.ok) expect(result.error.message).toMatch(/command channel is closed/);
+		expect(helper.killSignals).toEqual(["SIGTERM"]);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("accepts backpressure while the queued stop command completes", async () => {
+		const helper = new FakeMacHelper();
+		const output = new NativeMacCaptureOutput(asProc(helper));
+		mockStdinWrite(helper, (callback) => {
+			queueMicrotask(() => callback?.());
+			return false;
+		});
+
+		const pending = stopNativeMacCapture({
+			proc: asProc(helper),
+			output,
+			targetPath: "/recordings/complete.mp4",
+			timeoutMs: 100,
+		});
+		helper.stdout.write('{"event":"recording-stopped","screenPath":"/recordings/complete.mp4"}\n');
+
+		await expect(pending).resolves.toEqual({
+			ok: true,
+			screenVideoPath: "/recordings/complete.mp4",
+		});
+		expect(helper.killSignals).toEqual([]);
+		expect(vi.getTimerCount()).toBe(0);
 	});
 });
 
