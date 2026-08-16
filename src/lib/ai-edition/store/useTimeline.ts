@@ -59,6 +59,18 @@ interface RegionHandle {
 
 type Clip = AxcutDocument["timeline"]["clips"][number];
 
+type AssetDimensionProbeStatus = "in-flight" | "persisted" | "failed";
+
+interface AssetDimensionProbeSession {
+	projectId: string;
+	active: boolean;
+	assets: Map<string, AssetDimensionProbeStatus>;
+}
+
+function needsSourceDimensions(asset: AxcutDocument["assets"][number]): boolean {
+	return !asset.video?.width || !asset.video.height;
+}
+
 /**
  * Patch every region under the pill `id` belongs to. A payload edit must hit them all,
  * or the pieces of one pill would disagree — and then, by the merge rule, visibly split.
@@ -117,45 +129,110 @@ export function useTimeline() {
 	// cropped clip could show under ORIGINAL while an un-probed 16:9 sibling was missing entirely.
 	// Probe once on load and persist via saveDocument (which doesn't touch undo/dirty), so the fix
 	// sticks and every consumer agrees without each re-probing on its own (what the export dialog
-	// used to do). Attempt each asset at most once per session, even on failure, so a file that
-	// can't be probed doesn't spin the effect on every document change.
-	const probedAssetIdsRef = useRef<Set<string>>(new Set());
+	// used to do). Keep the attempt state per project: an unrelated document replacement must not
+	// cancel a valid in-flight result, while failed files must not spin on every document change.
+	const dimensionProbeSessionRef = useRef<AssetDimensionProbeSession | null>(null);
 	useEffect(() => {
-		if (!document) return;
+		const previous = dimensionProbeSessionRef.current;
+		if (!projectId) {
+			if (previous) previous.active = false;
+			dimensionProbeSessionRef.current = null;
+			return;
+		}
+
+		// React StrictMode replays effects on mount. Reuse the same project's status map so that
+		// replay cannot launch a duplicate probe, but replace it when another project is opened.
+		const session =
+			previous?.projectId === projectId
+				? previous
+				: {
+						projectId,
+						active: true,
+						assets: new Map<string, AssetDimensionProbeStatus>(),
+					};
+		if (previous && previous !== session) previous.active = false;
+		session.active = true;
+		dimensionProbeSessionRef.current = session;
+
+		return () => {
+			session.active = false;
+		};
+	}, [projectId]);
+
+	useEffect(() => {
+		if (!document || !projectId) return;
+		const session = dimensionProbeSessionRef.current;
+		if (!session?.active || session.projectId !== projectId) return;
+
 		const usedAssetIds = new Set(document.timeline.clips.map((c) => c.assetId));
 		const missing = document.assets.filter(
 			(a) =>
 				usedAssetIds.has(a.id) &&
 				a.originalPath &&
-				(!a.video || !a.video.width || !a.video.height) &&
-				!probedAssetIdsRef.current.has(a.id),
+				needsSourceDimensions(a) &&
+				!session.assets.has(a.id),
 		);
 		if (missing.length === 0) return;
-		let cancelled = false;
+		for (const asset of missing) session.assets.set(asset.id, "in-flight");
+
 		void (async () => {
-			const probed: Record<string, { width: number; height: number }> = {};
-			for (const a of missing) {
-				probedAssetIdsRef.current.add(a.id);
-				const dims = await probeVideoDimensions(toFileUrl(a.originalPath));
-				if (dims) probed[a.id] = dims;
+			for (const asset of missing) {
+				try {
+					const dimensions = await probeVideoDimensions(toFileUrl(asset.originalPath));
+					if (!session.active || dimensionProbeSessionRef.current !== session) return;
+					if (!dimensions) {
+						session.assets.set(asset.id, "failed");
+						continue;
+					}
+
+					// Build the patch from authoritative state immediately before persistence. The
+					// probe may have overlapped any number of unrelated document saves or live edits.
+					const state = useProjectStore.getState();
+					const current = state.document;
+					if (state.projectId !== session.projectId || current?.project.id !== session.projectId) {
+						return;
+					}
+					const currentAsset = current.assets.find((candidate) => candidate.id === asset.id);
+					if (!currentAsset || !needsSourceDimensions(currentAsset)) {
+						// The asset was removed or another writer supplied dimensions while probing.
+						// It can be attempted later if it becomes eligible again.
+						session.assets.delete(asset.id);
+						continue;
+					}
+
+					await state.saveDocument({
+						...current,
+						assets: current.assets.map((candidate) =>
+							candidate.id === asset.id
+								? {
+										...candidate,
+										video: {
+											codec: "unknown",
+											fps: 0,
+											...candidate.video,
+											...dimensions,
+										},
+									}
+								: candidate,
+						),
+					});
+
+					if (
+						!session.active ||
+						dimensionProbeSessionRef.current !== session ||
+						useProjectStore.getState().projectId !== session.projectId
+					) {
+						return;
+					}
+					session.assets.set(asset.id, "persisted");
+				} catch (error) {
+					if (!session.active || dimensionProbeSessionRef.current !== session) return;
+					session.assets.set(asset.id, "failed");
+					console.warn("[timeline] source-dimension backfill failed:", error);
+				}
 			}
-			if (cancelled || Object.keys(probed).length === 0) return;
-			// Re-read fresh state so a concurrent edit made while probing isn't stomped.
-			const current = useProjectStore.getState().document;
-			if (!current) return;
-			await useProjectStore.getState().saveDocument({
-				...current,
-				assets: current.assets.map((a) =>
-					probed[a.id]
-						? { ...a, video: { codec: "unknown", fps: 0, ...a.video, ...probed[a.id] } }
-						: a,
-				),
-			});
 		})();
-		return () => {
-			cancelled = true;
-		};
-	}, [document]);
+	}, [document, projectId]);
 
 	// Every add* below anchors the new region to the clip(s) it covers before storing it.
 	// A modifier MUST own a clip anchor to survive reorder/trim (see

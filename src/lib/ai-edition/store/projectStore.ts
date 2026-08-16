@@ -217,6 +217,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			throw new Error(result.error ?? "Failed to save project");
 		}
 		const parsed = parseDocument(result.document);
+		// A save can finish after the user has opened another project. The old project was
+		// persisted correctly, but its response must not replace the new active document.
+		if (get().projectId !== document.project.id) return;
 		set({
 			document: parsed,
 			revision: get().revision + 1,
