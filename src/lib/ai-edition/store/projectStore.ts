@@ -13,9 +13,42 @@ import { type AxcutAsset, type AxcutDocument, documentSchema } from "../schema";
 
 export type ProjectStatus = "idle" | "loading" | "ready" | "error";
 
+// Monotonic identity for one loaded document instance. A project can be opened,
+// replaced, then opened again with the same id; project id alone cannot distinguish them.
+let nextDocumentGeneration = 0;
+const saveQueues = new Map<number, Promise<void>>();
+
+function allocateDocumentGeneration(): number {
+	return ++nextDocumentGeneration;
+}
+
+function enqueueSave<T>(generation: number, task: () => Promise<T>): Promise<T> {
+	const tail = saveQueues.get(generation) ?? Promise.resolve();
+	const run = tail.then(task, task);
+	const settled = run.then(
+		() => undefined,
+		() => undefined,
+	);
+	saveQueues.set(generation, settled);
+	void settled.then(() => {
+		if (saveQueues.get(generation) === settled) saveQueues.delete(generation);
+	});
+	return run;
+}
+
+async function persistDocument(document: AxcutDocument): Promise<AxcutDocument> {
+	const result = await nativeBridgeClient.aiEdition.save(document);
+	if (!result.success || !result.document) {
+		throw new Error(result.error ?? "Failed to save project");
+	}
+	return parseDocument(result.document);
+}
+
 export interface ProjectState {
 	projectId: string | null;
 	document: AxcutDocument | null;
+	/** Changes for every load/create/clear, including reopening the same project id. */
+	documentGeneration: number;
 	revision: number;
 	status: ProjectStatus;
 	error: string | null;
@@ -37,6 +70,11 @@ export interface ProjectState {
 	addAsset: (path: string, label?: string) => Promise<AxcutAsset | null>;
 	removeAsset: (assetId: string) => Promise<void>;
 	saveDocument: (document: AxcutDocument) => Promise<void>;
+	saveDocumentUpdate: (
+		documentGeneration: number,
+		update: (document: AxcutDocument) => AxcutDocument | null,
+		isCurrent?: () => boolean,
+	) => Promise<boolean>;
 	setDocument: (document: AxcutDocument) => void;
 	replaceTimeline: (intervals: Interval[], reason: string) => Promise<void>;
 	restoreFullTimeline: () => Promise<void>;
@@ -54,6 +92,7 @@ function parseDocument(value: unknown): AxcutDocument {
 export const useProjectStore = create<ProjectState>((set, get) => ({
 	projectId: null,
 	document: null,
+	documentGeneration: 0,
 	revision: 0,
 	status: "idle",
 	error: null,
@@ -64,13 +103,15 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	lastSavedAt: null,
 
 	async loadProject(projectId) {
-		set({ status: "loading", error: null });
+		const documentGeneration = allocateDocumentGeneration();
+		set({ documentGeneration, status: "loading", error: null });
 		try {
 			const result = await nativeBridgeClient.aiEdition.get(projectId);
 			if (!result.success || !result.document) {
 				throw new Error(result.error ?? "Failed to load project");
 			}
 			const document = parseDocument(result.document);
+			if (get().documentGeneration !== documentGeneration) return;
 			set({
 				projectId,
 				document,
@@ -82,6 +123,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			});
 			void import("./undo").then(({ clearHistory }) => clearHistory());
 		} catch (error) {
+			if (get().documentGeneration !== documentGeneration) return;
 			set({
 				status: "error",
 				error: error instanceof Error ? error.message : String(error),
@@ -90,13 +132,15 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	async createProject(title) {
-		set({ status: "loading", error: null });
+		const documentGeneration = allocateDocumentGeneration();
+		set({ documentGeneration, status: "loading", error: null });
 		try {
 			const result = await nativeBridgeClient.aiEdition.create(title);
 			if (!result.success || !result.document) {
 				throw new Error(result.error ?? "Failed to create project");
 			}
 			const document = parseDocument(result.document);
+			if (get().documentGeneration !== documentGeneration) return document;
 			set({
 				projectId: document.project.id,
 				document,
@@ -109,10 +153,12 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			void import("./undo").then(({ clearHistory }) => clearHistory());
 			return document;
 		} catch (error) {
-			set({
-				status: "error",
-				error: error instanceof Error ? error.message : String(error),
-			});
+			if (get().documentGeneration === documentGeneration) {
+				set({
+					status: "error",
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
 			throw error;
 		}
 	},
@@ -124,9 +170,12 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	async addAsset(path, label) {
-		const { projectId } = get();
+		const { projectId, documentGeneration } = get();
 		if (!projectId) throw new Error("No project loaded");
 		const result = await nativeBridgeClient.aiEdition.addAsset(projectId, path, label);
+		if (get().documentGeneration !== documentGeneration || get().projectId !== projectId) {
+			return null;
+		}
 		let document = parseDocument(result.document);
 		const addedAsset =
 			document.assets.find((a) => a.originalPath === path && (label ? a.label === label : true)) ??
@@ -144,6 +193,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 		if (addedAsset && window.electronAPI?.findRecordingCamera) {
 			try {
 				const camera = await window.electronAPI.findRecordingCamera(addedAsset.originalPath);
+				if (get().documentGeneration !== documentGeneration || get().projectId !== projectId) {
+					return null;
+				}
 				if (camera.success && camera.webcamVideoPath) {
 					const linked = {
 						sourcePath: camera.webcamVideoPath,
@@ -189,6 +241,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			}
 		}
 
+		if (get().documentGeneration !== documentGeneration || get().projectId !== projectId) {
+			return null;
+		}
 		set({
 			document,
 			revision: get().revision + 1,
@@ -199,9 +254,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	async removeAsset(assetId) {
-		const { projectId } = get();
+		const { projectId, documentGeneration } = get();
 		if (!projectId) throw new Error("No project loaded");
 		const result = await nativeBridgeClient.aiEdition.removeAsset(projectId, assetId);
+		if (get().documentGeneration !== documentGeneration || get().projectId !== projectId) return;
 		const document = parseDocument(result.document);
 		set({
 			document,
@@ -212,19 +268,88 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	async saveDocument(document) {
-		const result = await nativeBridgeClient.aiEdition.save(document);
-		if (!result.success || !result.document) {
-			throw new Error(result.error ?? "Failed to save project");
+		const state = get();
+		const documentGeneration = state.documentGeneration;
+		if (
+			state.status !== "ready" ||
+			state.projectId !== document.project.id ||
+			state.document?.project.id !== document.project.id
+		) {
+			return;
 		}
-		const parsed = parseDocument(result.document);
-		// A save can finish after the user has opened another project. The old project was
-		// persisted correctly, but its response must not replace the new active document.
-		if (get().projectId !== document.project.id) return;
-		set({
-			document: parsed,
-			revision: get().revision + 1,
-			dirty: false,
-			lastSavedAt: new Date(),
+
+		// Publish direct snapshot mutations before waiting. Callers that already used
+		// setDocument pass the same object and do not create a second revision.
+		if (state.document !== document) {
+			set({ document, revision: state.revision + 1, dirty: true });
+		}
+
+		await enqueueSave(documentGeneration, async () => {
+			const before = get();
+			if (
+				before.documentGeneration !== documentGeneration ||
+				before.status !== "ready" ||
+				before.projectId !== document.project.id ||
+				!before.document
+			) {
+				return;
+			}
+			const revision = before.revision;
+			const parsed = await persistDocument(before.document);
+			const current = get();
+			if (
+				current.documentGeneration !== documentGeneration ||
+				current.projectId !== document.project.id ||
+				current.revision !== revision
+			) {
+				return;
+			}
+			set({
+				document: parsed,
+				revision: revision + 1,
+				dirty: false,
+				lastSavedAt: new Date(),
+			});
+		});
+	},
+
+	async saveDocumentUpdate(documentGeneration, update, isCurrent = () => true) {
+		return enqueueSave(documentGeneration, async () => {
+			for (;;) {
+				const before = get();
+				if (
+					!isCurrent() ||
+					before.documentGeneration !== documentGeneration ||
+					before.status !== "ready" ||
+					!before.projectId ||
+					!before.document ||
+					before.document.project.id !== before.projectId
+				) {
+					return false;
+				}
+
+				const next = update(before.document);
+				if (!next || next.project.id !== before.projectId) return false;
+				const revision = before.revision;
+				const parsed = await persistDocument(next);
+				const current = get();
+				if (
+					!isCurrent() ||
+					current.documentGeneration !== documentGeneration ||
+					current.projectId !== before.projectId
+				) {
+					return false;
+				}
+				if (current.revision !== revision) continue;
+
+				set({
+					document: parsed,
+					revision: revision + 1,
+					dirty: false,
+					lastSavedAt: new Date(),
+				});
+				return true;
+			}
 		});
 	},
 
@@ -274,6 +399,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 		set({
 			projectId: null,
 			document: null,
+			documentGeneration: allocateDocumentGeneration(),
 			revision: 0,
 			status: "idle",
 			error: null,

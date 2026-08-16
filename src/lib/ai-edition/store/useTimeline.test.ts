@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { act, renderHook, waitFor } from "@testing-library/react";
+import { createElement, type PropsWithChildren, StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { I18nProvider } from "@/contexts/I18nContext";
 import type { AxcutDocument } from "../schema";
@@ -13,6 +14,10 @@ import { useTimeline } from "./useTimeline";
  * wrapper argument on every call site.
  */
 const renderTimeline = () => renderHook(() => useTimeline(), { wrapper: I18nProvider });
+const StrictTimelineWrapper = ({ children }: PropsWithChildren) =>
+	createElement(StrictMode, null, createElement(I18nProvider, null, children));
+const renderStrictTimeline = () =>
+	renderHook(() => useTimeline(), { wrapper: StrictTimelineWrapper });
 
 const probeVideoDurationMock = vi.hoisted(() => vi.fn());
 const probeVideoDimensionsMock = vi.hoisted(() =>
@@ -272,13 +277,16 @@ describe("useTimeline backfills missing source dimensions on load", () => {
 		assets: [{ ...sampleDoc.assets[0], video: undefined }],
 	};
 
-	function loadDocument(document: AxcutDocument) {
+	function loadDocument(document: AxcutDocument, newGeneration = false) {
+		const state = useProjectStore.getState();
 		useProjectStore.setState({
 			projectId: document.project.id,
 			document,
+			documentGeneration: state.documentGeneration + (newGeneration ? 1 : 0),
 			revision: 1,
 			status: "ready",
 			error: null,
+			dirty: false,
 		});
 	}
 
@@ -287,80 +295,157 @@ describe("useTimeline backfills missing source dimensions on load", () => {
 		for (const mock of Object.values(bridgeMocks)) mock.mockReset();
 		probeVideoDimensionsMock.mockReset();
 		probeVideoDimensionsMock.mockResolvedValue({ width: 1920, height: 1080 });
-		bridgeMocks.save.mockImplementation(async (doc: typeof sampleDoc) => ({
+		bridgeMocks.save.mockImplementation(async (doc: AxcutDocument) => ({
 			success: true,
 			document: doc,
 		}));
 	});
 
 	afterEach(() => {
-		vi.clearAllMocks();
+		vi.restoreAllMocks();
 	});
 
-	// The reported bug: a project saved with a duration but no probed `video` dims (nothing
-	// re-probes it on open) drops that clip from everything reading asset.video — the ratio
-	// picker's ORIGINAL list, the output resolution, the export badges.
-	it("probes a used asset that has a duration but no video dims, and persists them", async () => {
+	it("probes a used asset with no dimensions and persists them", async () => {
 		loadDocument(documentWithoutDimensions);
 		renderTimeline();
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+
 		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
-		const saved = useProjectStore.getState().document?.assets.find((a) => a.id === "asset_1");
-		expect(saved?.video).toMatchObject({ width: 1920, height: 1080 });
+		expect(bridgeMocks.save.mock.calls[0]?.[0]).toMatchObject({
+			assets: [{ id: "asset_1", video: { width: 1920, height: 1080 } }],
+		});
+		expect(useProjectStore.getState().document?.assets[0].video).toMatchObject({
+			width: 1920,
+			height: 1080,
+		});
 	});
 
-	it("merges a delayed probe into the latest document after an unrelated save", async () => {
+	it("waits for a pending unrelated save and merges into its committed snapshot", async () => {
 		const probe = deferred<{ width: number; height: number } | null>();
+		const pendingSave = deferred<{ success: true; document: AxcutDocument }>();
+		let firstSnapshot: AxcutDocument | null = null;
 		probeVideoDimensionsMock.mockReturnValue(probe.promise);
+		bridgeMocks.save.mockImplementationOnce((document: AxcutDocument) => {
+			firstSnapshot = document;
+			return pendingSave.promise;
+		});
 		loadDocument(documentWithoutDimensions);
 		renderTimeline();
 		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
 
-		await act(async () => {
+		let unrelatedSave!: Promise<void>;
+		act(() => {
 			const current = useProjectStore.getState().document!;
-			await useProjectStore.getState().saveDocument({
+			unrelatedSave = useProjectStore.getState().saveDocument({
 				...current,
-				project: { ...current.project, title: "Renamed while probing" },
+				project: { ...current.project, title: "Pending unrelated edit" },
 			});
 		});
-		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
 
 		await act(async () => {
 			probe.resolve({ width: 2880, height: 1864 });
 			await probe.promise;
+			await Promise.resolve();
+		});
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			pendingSave.resolve({ success: true, document: firstSnapshot! });
+			await unrelatedSave;
 		});
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
 
-		const backfill = bridgeMocks.save.mock.calls[1]?.[0] as AxcutDocument;
-		expect(backfill.project.title).toBe("Renamed while probing");
-		expect(backfill.assets[0].video).toMatchObject({ width: 2880, height: 1864 });
-		expect(useProjectStore.getState().document?.project.title).toBe("Renamed while probing");
+		const backfillSnapshot = bridgeMocks.save.mock.calls[1]?.[0] as AxcutDocument;
+		expect(backfillSnapshot.project.title).toBe("Pending unrelated edit");
+		expect(backfillSnapshot.assets[0].video).toMatchObject({ width: 2880, height: 1864 });
+		expect(useProjectStore.getState().document).toMatchObject({
+			project: { title: "Pending unrelated edit" },
+			assets: [{ video: { width: 2880, height: 1864 } }],
+		});
 	});
 
-	it("leaves an asset that already has video dims untouched", async () => {
-		useProjectStore.setState({
-			projectId: "proj_test",
-			document: sampleDoc, // asset_1 already carries 1920x1080
-			revision: 1,
-			status: "ready",
-			error: null,
+	it("rebases an in-flight backfill over a later same-project save", async () => {
+		const firstSave = deferred<{ success: true; document: AxcutDocument }>();
+		let firstSnapshot: AxcutDocument | null = null;
+		bridgeMocks.save.mockImplementationOnce((document: AxcutDocument) => {
+			firstSnapshot = document;
+			return firstSave.promise;
 		});
-		renderTimeline();
-		// Give any stray effect a chance to fire before asserting it didn't.
-		await act(async () => {
-			await new Promise((r) => setTimeout(r, 0));
-		});
-		expect(probeVideoDimensionsMock).not.toHaveBeenCalled();
-		expect(bridgeMocks.save).not.toHaveBeenCalled();
-	});
-
-	it("does not re-probe a used asset with no reachable file more than once", async () => {
-		probeVideoDimensionsMock.mockResolvedValue(null); // probe fails (unreadable file)
 		loadDocument(documentWithoutDimensions);
 		renderTimeline();
-		await act(async () => {
-			await new Promise((r) => setTimeout(r, 0));
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+
+		let laterSave!: Promise<void>;
+		act(() => {
+			const current = useProjectStore.getState().document!;
+			laterSave = useProjectStore.getState().saveDocument({
+				...current,
+				project: { ...current.project, title: "Later same-project edit" },
+			});
 		});
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Later same-project edit" } },
+			dirty: true,
+		});
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			firstSave.resolve({ success: true, document: firstSnapshot! });
+			await firstSave.promise;
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(3));
+		await act(async () => laterSave);
+
+		for (const index of [1, 2]) {
+			const snapshot = bridgeMocks.save.mock.calls[index]?.[0] as AxcutDocument;
+			expect(snapshot.project.title).toBe("Later same-project edit");
+			expect(snapshot.assets[0].video).toMatchObject({ width: 1920, height: 1080 });
+		}
+		expect(useProjectStore.getState()).toMatchObject({
+			document: {
+				project: { title: "Later same-project edit" },
+				assets: [{ video: { width: 1920, height: 1080 } }],
+			},
+			dirty: false,
+		});
+	});
+
+	it("does not spin after persistence rejection and retries on the next document change", async () => {
+		vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		bridgeMocks.save.mockResolvedValueOnce({ success: false, error: "disk full" });
+		loadDocument(documentWithoutDimensions);
+		renderTimeline();
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
+		expect(useProjectStore.getState().document?.assets[0].video).toBeUndefined();
+
+		act(() => {
+			const current = useProjectStore.getState().document!;
+			useProjectStore.getState().setDocument({
+				...current,
+				project: { ...current.project, title: "Retry trigger" },
+			});
+		});
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+
+		const retrySnapshot = bridgeMocks.save.mock.calls[1]?.[0] as AxcutDocument;
+		expect(retrySnapshot).toMatchObject({
+			project: { title: "Retry trigger" },
+			assets: [{ video: { width: 1920, height: 1080 } }],
+		});
+	});
+
+	it("remembers a genuine probe failure without spinning", async () => {
+		probeVideoDimensionsMock.mockResolvedValue(null);
+		loadDocument(documentWithoutDimensions);
+		renderTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+		await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+
 		act(() => {
 			useProjectStore.setState({
 				document: {
@@ -369,15 +454,130 @@ describe("useTimeline backfills missing source dimensions on load", () => {
 				},
 			});
 		});
-		await act(async () => {
-			await new Promise((r) => setTimeout(r, 0));
-		});
-		// Attempted once; the failure is remembered so a document change doesn't spin it again.
+		await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
 		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
 		expect(bridgeMocks.save).not.toHaveBeenCalled();
+
+		probeVideoDimensionsMock.mockResolvedValue({ width: 1280, height: 720 });
+		act(() => {
+			const current = useProjectStore.getState().document!;
+			useProjectStore.getState().setDocument({
+				...current,
+				assets: current.assets.map((asset) => ({
+					...asset,
+					originalPath: "/tmp/replaced-after-failure.webm",
+				})),
+			});
+		});
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		expect((bridgeMocks.save.mock.calls[0]?.[0] as AxcutDocument).assets[0]).toMatchObject({
+			originalPath: "/tmp/replaced-after-failure.webm",
+			video: { width: 1280, height: 720 },
+		});
 	});
 
-	it("starts no duplicate probe while an asset is already in flight", async () => {
+	it("rejects a stale result when the same asset id gets a new path", async () => {
+		const oldProbe = deferred<{ width: number; height: number } | null>();
+		probeVideoDimensionsMock
+			.mockReturnValueOnce(oldProbe.promise)
+			.mockResolvedValueOnce({ width: 1280, height: 720 });
+		loadDocument(documentWithoutDimensions);
+		renderTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+
+		act(() => {
+			const current = useProjectStore.getState().document!;
+			useProjectStore.getState().setDocument({
+				...current,
+				assets: current.assets.map((asset) => ({
+					...asset,
+					originalPath: "/tmp/replaced.webm",
+					video: undefined,
+				})),
+			});
+		});
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+
+		await act(async () => {
+			oldProbe.resolve({ width: 2880, height: 1864 });
+			await oldProbe.promise;
+			await Promise.resolve();
+		});
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		const snapshot = bridgeMocks.save.mock.calls[0]?.[0] as AxcutDocument;
+		expect(snapshot.assets[0]).toMatchObject({
+			originalPath: "/tmp/replaced.webm",
+			video: { width: 1280, height: 720 },
+		});
+	});
+
+	it("prunes removed assets so re-adding the identity can be probed", async () => {
+		const removedProbe = deferred<{ width: number; height: number } | null>();
+		probeVideoDimensionsMock
+			.mockReturnValueOnce(removedProbe.promise)
+			.mockResolvedValueOnce({ width: 1024, height: 768 });
+		loadDocument(documentWithoutDimensions);
+		renderTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+
+		act(() => {
+			useProjectStore.getState().setDocument({
+				...documentWithoutDimensions,
+				assets: [],
+				timeline: { ...documentWithoutDimensions.timeline, clips: [] },
+			});
+		});
+		await act(async () => Promise.resolve());
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+
+		// Re-add before the old probe resolves. The same id and path still get a new
+		// attempt identity, so the old completion cannot impersonate this asset.
+		act(() => useProjectStore.getState().setDocument(documentWithoutDimensions));
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		await act(async () => {
+			removedProbe.resolve({ width: 4000, height: 3000 });
+			await removedProbe.promise;
+			await Promise.resolve();
+		});
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect((bridgeMocks.save.mock.calls[0]?.[0] as AxcutDocument).assets[0].video).toMatchObject({
+			width: 1024,
+			height: 768,
+		});
+	});
+
+	it("re-probes and heals dimensions that disappear after a successful save", async () => {
+		probeVideoDimensionsMock
+			.mockResolvedValueOnce({ width: 1920, height: 1080 })
+			.mockResolvedValueOnce({ width: 2880, height: 1864 });
+		loadDocument(documentWithoutDimensions);
+		renderTimeline();
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+
+		act(() => {
+			const persisted = useProjectStore.getState().document!;
+			useProjectStore.getState().setDocument({
+				...persisted,
+				assets: persisted.assets.map((asset) => ({ ...asset, video: undefined })),
+			});
+		});
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+
+		expect((bridgeMocks.save.mock.calls[1]?.[0] as AxcutDocument).assets[0].video).toMatchObject({
+			width: 2880,
+			height: 1864,
+		});
+		expect(useProjectStore.getState().document?.assets[0].video).toMatchObject({
+			width: 2880,
+			height: 1864,
+		});
+	});
+
+	it("starts no duplicate probe while the same asset path is in flight", async () => {
 		const probe = deferred<{ width: number; height: number } | null>();
 		probeVideoDimensionsMock.mockReturnValue(probe.promise);
 		loadDocument(documentWithoutDimensions);
@@ -392,9 +592,109 @@ describe("useTimeline backfills missing source dimensions on load", () => {
 				},
 			});
 		});
+		await act(async () => Promise.resolve());
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
+
 		await act(async () => {
+			probe.resolve({ width: 1920, height: 1080 });
+			await probe.promise;
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		expect((bridgeMocks.save.mock.calls[0]?.[0] as AxcutDocument).project.title).toBe(
+			"Updated in flight",
+		);
+	});
+
+	it("invalidates old work across an A-to-B-to-A project generation change", async () => {
+		const oldProbe = deferred<{ width: number; height: number } | null>();
+		probeVideoDimensionsMock
+			.mockReturnValueOnce(oldProbe.promise)
+			.mockResolvedValueOnce({ width: 1366, height: 768 });
+		loadDocument(documentWithoutDimensions);
+		renderTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+
+		const projectB: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, id: "proj_b", title: "Project B" },
+		};
+		act(() => loadDocument(projectB, true));
+		const reopenedA: AxcutDocument = {
+			...documentWithoutDimensions,
+			project: { ...documentWithoutDimensions.project, title: "Reopened A" },
+		};
+		act(() => loadDocument(reopenedA, true));
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+
+		await act(async () => {
+			oldProbe.resolve({ width: 2880, height: 1864 });
+			await oldProbe.promise;
 			await Promise.resolve();
 		});
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(useProjectStore.getState().document).toMatchObject({
+			project: { id: "proj_test", title: "Reopened A" },
+			assets: [{ video: { width: 1366, height: 768 } }],
+		});
+	});
+
+	it("does not apply an old save after unmount and remount", async () => {
+		const oldSave = deferred<{ success: true; document: AxcutDocument }>();
+		const newSave = deferred<{ success: true; document: AxcutDocument }>();
+		const snapshots: AxcutDocument[] = [];
+		bridgeMocks.save.mockImplementation((document: AxcutDocument) => {
+			snapshots.push(document);
+			return snapshots.length === 1 ? oldSave.promise : newSave.promise;
+		});
+		loadDocument(documentWithoutDimensions);
+		const first = renderTimeline();
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		first.unmount();
+
+		act(() => {
+			const current = useProjectStore.getState().document!;
+			useProjectStore.getState().setDocument({
+				...current,
+				project: { ...current.project, title: "New mount edit" },
+			});
+		});
+		renderTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
+
+		await act(async () => {
+			oldSave.resolve({ success: true, document: snapshots[0] });
+			await oldSave.promise;
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "New mount edit" }, assets: [{ video: undefined }] },
+			dirty: true,
+		});
+
+		await act(async () => {
+			newSave.resolve({ success: true, document: snapshots[1] });
+			await newSave.promise;
+		});
+		await waitFor(() =>
+			expect(useProjectStore.getState().document?.assets[0].video).toMatchObject({
+				width: 1920,
+				height: 1080,
+			}),
+		);
+		expect(snapshots[1]).toMatchObject({
+			project: { title: "New mount edit" },
+			assets: [{ video: { width: 1920, height: 1080 } }],
+		});
+	});
+
+	it("does not duplicate an in-flight probe during StrictMode effect replay", async () => {
+		const probe = deferred<{ width: number; height: number } | null>();
+		probeVideoDimensionsMock.mockReturnValue(probe.promise);
+		loadDocument(documentWithoutDimensions);
+		renderStrictTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+		await act(async () => Promise.resolve());
 		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
 
 		await act(async () => {
@@ -404,91 +704,12 @@ describe("useTimeline backfills missing source dimensions on load", () => {
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
 	});
 
-	it("discards an old probe after a project switch and probes the new project independently", async () => {
-		const oldProbe = deferred<{ width: number; height: number } | null>();
-		probeVideoDimensionsMock
-			.mockReturnValueOnce(oldProbe.promise)
-			.mockResolvedValueOnce({ width: 1280, height: 720 });
-		loadDocument(documentWithoutDimensions);
+	it("leaves an asset that already has dimensions untouched", async () => {
+		loadDocument(sampleDoc);
 		renderTimeline();
-		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
-
-		const otherProject: AxcutDocument = {
-			...documentWithoutDimensions,
-			project: {
-				...documentWithoutDimensions.project,
-				id: "proj_other",
-				title: "Other project",
-			},
-		};
-		act(() => loadDocument(otherProject));
-		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
-		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
-		expect((bridgeMocks.save.mock.calls[0]?.[0] as AxcutDocument).project.id).toBe("proj_other");
-
-		await act(async () => {
-			oldProbe.resolve({ width: 2880, height: 1864 });
-			await oldProbe.promise;
-			await Promise.resolve();
-		});
-		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
-		expect(useProjectStore.getState()).toMatchObject({
-			projectId: "proj_other",
-			document: {
-				project: { id: "proj_other" },
-				assets: [{ video: { width: 1280, height: 720 } }],
-			},
-		});
-	});
-
-	it("does not let an old save response replace a newly opened project", async () => {
-		const save = deferred<{ success: true; document: AxcutDocument }>();
-		let pendingDocument: AxcutDocument | null = null;
-		bridgeMocks.save.mockImplementation((document: AxcutDocument) => {
-			pendingDocument = document;
-			return save.promise;
-		});
-		loadDocument(documentWithoutDimensions);
-		renderTimeline();
-		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
-
-		const otherProject: AxcutDocument = {
-			...sampleDoc,
-			project: { ...sampleDoc.project, id: "proj_other", title: "Other project" },
-		};
-		act(() => loadDocument(otherProject));
-		await act(async () => {
-			save.resolve({ success: true, document: pendingDocument! });
-			await save.promise;
-		});
-
-		expect(useProjectStore.getState()).toMatchObject({
-			projectId: "proj_other",
-			document: { project: { id: "proj_other", title: "Other project" } },
-		});
-	});
-
-	it("does not repeat a dimension backfill that already persisted successfully", async () => {
-		loadDocument(documentWithoutDimensions);
-		renderTimeline();
-		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
-		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
-
-		act(() => {
-			const persisted = useProjectStore.getState().document!;
-			useProjectStore.setState({
-				document: {
-					...persisted,
-					assets: persisted.assets.map((asset) => ({ ...asset, video: undefined })),
-				},
-			});
-		});
-		await act(async () => {
-			await new Promise((resolve) => setTimeout(resolve, 0));
-		});
-
-		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
-		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+		expect(probeVideoDimensionsMock).not.toHaveBeenCalled();
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
 	});
 });
 

@@ -1,5 +1,7 @@
 // @vitest-environment jsdom
+import { waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { AxcutDocument } from "../schema";
 import { useProjectStore } from "./projectStore";
 
 const bridgeMocks = vi.hoisted(() => ({
@@ -64,6 +66,25 @@ const sampleDoc = {
 	legacyEditor: null,
 };
 
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((next) => {
+		resolve = next;
+	});
+	return { promise, resolve };
+}
+
+function loadDocument(document: AxcutDocument = sampleDoc) {
+	useProjectStore.setState({
+		projectId: document.project.id,
+		document,
+		revision: 1,
+		status: "ready",
+		error: null,
+		dirty: false,
+	});
+}
+
 describe("useProjectStore", () => {
 	beforeEach(() => {
 		useProjectStore.getState().clear();
@@ -102,6 +123,120 @@ describe("useProjectStore", () => {
 		const state = useProjectStore.getState();
 		expect(state.status).toBe("error");
 		expect(state.error).toBe("not found");
+	});
+
+	it("serializes saves and persists the latest authoritative document", async () => {
+		const firstSave = deferred<{ success: true; document: AxcutDocument }>();
+		const secondSave = deferred<{ success: true; document: AxcutDocument }>();
+		const snapshots: AxcutDocument[] = [];
+		bridgeMocks.save.mockImplementation((document: AxcutDocument) => {
+			snapshots.push(document);
+			return snapshots.length === 1 ? firstSave.promise : secondSave.promise;
+		});
+		loadDocument();
+
+		const firstPromise = useProjectStore.getState().saveDocument({
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "First edit" },
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		const afterFirst = useProjectStore.getState().document!;
+		const secondPromise = useProjectStore.getState().saveDocument({
+			...afterFirst,
+			project: { ...afterFirst.project, title: "Second edit" },
+		});
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Second edit" } },
+			dirty: true,
+		});
+
+		firstSave.resolve({ success: true, document: snapshots[0] });
+		await firstPromise;
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+		expect(snapshots[1].project.title).toBe("Second edit");
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Second edit" } },
+			dirty: true,
+		});
+
+		secondSave.resolve({ success: true, document: snapshots[1] });
+		await secondPromise;
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Second edit" } },
+			dirty: false,
+		});
+	});
+
+	it("does not let an old same-project response replace a newer dirty mutation", async () => {
+		const pending = deferred<{ success: true; document: AxcutDocument }>();
+		let snapshot: AxcutDocument | null = null;
+		bridgeMocks.save.mockImplementation((document: AxcutDocument) => {
+			snapshot = document;
+			return pending.promise;
+		});
+		loadDocument();
+
+		const savePromise = useProjectStore.getState().saveDocument({
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Pending save" },
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		const current = useProjectStore.getState().document!;
+		useProjectStore.getState().setDocument({
+			...current,
+			project: { ...current.project, title: "Newer unsaved edit" },
+		});
+
+		pending.resolve({ success: true, document: snapshot! });
+		await savePromise;
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Newer unsaved edit" } },
+			dirty: true,
+		});
+	});
+
+	it("does not apply an old save response after an A-to-B-to-A reload", async () => {
+		const pending = deferred<{ success: true; document: AxcutDocument }>();
+		let snapshot: AxcutDocument | null = null;
+		bridgeMocks.save.mockImplementation((document: AxcutDocument) => {
+			snapshot = document;
+			return pending.promise;
+		});
+		loadDocument();
+		const firstGeneration = useProjectStore.getState().documentGeneration;
+		const savePromise = useProjectStore.getState().saveDocument({
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Old A save" },
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+
+		const projectB: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, id: "proj_b", title: "Project B" },
+		};
+		const reopenedA: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Reopened A" },
+		};
+		bridgeMocks.get.mockResolvedValueOnce({ success: true, document: projectB });
+		bridgeMocks.get.mockResolvedValueOnce({ success: true, document: reopenedA });
+		await useProjectStore.getState().loadProject("proj_b");
+		await useProjectStore.getState().loadProject("proj_test");
+		useProjectStore.getState().setDocument({
+			...reopenedA,
+			project: { ...reopenedA.project, title: "Reopened A dirty" },
+		});
+
+		pending.resolve({ success: true, document: snapshot! });
+		await savePromise;
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_test",
+			document: { project: { title: "Reopened A dirty" } },
+			dirty: true,
+		});
+		expect(useProjectStore.getState().documentGeneration).toBeGreaterThan(firstGeneration);
 	});
 
 	it("addAsset replaces the document and bumps revision", async () => {

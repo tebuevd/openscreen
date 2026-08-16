@@ -12,6 +12,14 @@ async function makeTempDir(): Promise<string> {
 	return base;
 }
 
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((next) => {
+		resolve = next;
+	});
+	return { promise, resolve };
+}
+
 describe("DocumentService", () => {
 	let tempDir: string;
 	let mediaDir: string;
@@ -456,6 +464,36 @@ describe("DocumentService", () => {
 			]);
 			const onDisk = await service.getProject(doc.project.id);
 			expect(onDisk.annotations).toHaveLength(120);
+		});
+
+		it("waits for an earlier queued save before loading the project", async () => {
+			const doc = await service.createProject("Load ordering");
+			const enteredWrite = deferred<void>();
+			const releaseWrite = deferred<void>();
+			const realOpen = fs.open.bind(fs);
+			const open = vi.spyOn(fs, "open").mockImplementationOnce(async (...args) => {
+				enteredWrite.resolve(undefined);
+				await releaseWrite.promise;
+				return realOpen(...args);
+			});
+
+			const saving = service.saveProject({
+				...doc,
+				project: { ...doc.project, title: "Settled title" },
+			});
+			await enteredWrite.promise;
+			let loadSettled = false;
+			const loading = service.getProject(doc.project.id).then((loaded) => {
+				loadSettled = true;
+				return loaded;
+			});
+			await Promise.resolve();
+			expect(loadSettled).toBe(false);
+
+			releaseWrite.resolve(undefined);
+			await saving;
+			expect((await loading).project.title).toBe("Settled title");
+			open.mockRestore();
 		});
 
 		// 20 real temp-file+rename round trips, serialized through the save queue.

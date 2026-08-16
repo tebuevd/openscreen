@@ -207,6 +207,10 @@ export class DocumentService {
 	}
 
 	async getProject(projectId: string): Promise<AxcutDocument> {
+		// A load or read-modify-write operation (add/remove asset) must observe every
+		// save invoked before it. The write tail settles on failures too, leaving the
+		// previous atomic file as the authoritative fallback.
+		await this.writeQueues.get(projectId);
 		// Prefer the canonical `.openscreen` file, falling back to a not-yet-migrated
 		// legacy `.axcut` so a project opened before its migration pass still loads.
 		let raw: string;
