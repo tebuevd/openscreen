@@ -1143,6 +1143,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		selectedSource: ProcessedDesktopSource,
 		countdownRunToken?: number,
 	) => {
+		let nativeWebcamRecorder: RecorderHandle | null = null;
 		try {
 			const platform = window.electronAPI.getPlatform();
 			if (platform !== "darwin") {
@@ -1171,7 +1172,6 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 			const displayId =
 				Number(selectedSource.display_id) || parseMacDisplayIdFromSourceId(selectedSource.id);
 			const windowId = parseMacWindowIdFromSourceId(selectedSource.id);
-			let nativeWebcamRecorder: RecorderHandle | null = null;
 			// createRecorderHandle() calls MediaRecorder.start() synchronously, so the
 			// webcam clip's first frame is captured right now -- before the native
 			// ScreenCaptureKit helper below has even been spawned. Stamp that instant
@@ -1287,6 +1287,7 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 				),
 			};
 			webcamRecorder.current = nativeWebcamRecorder;
+			nativeWebcamRecorder = null;
 			accumulatedDurationMs.current = 0;
 			segmentStartedAt.current = Date.now();
 			allowAutoFinalize.current = true;
@@ -1297,6 +1298,20 @@ export function useScreenRecorder(): UseScreenRecorderReturn {
 		} catch (error) {
 			console.error("Native macOS capture failed:", error);
 			throw error;
+		} finally {
+			// Until ownership transfers to webcamRecorder, every early exit must drain
+			// and discard the sidecar so its camera recording and disk stream cannot leak.
+			if (nativeWebcamRecorder) {
+				try {
+					if (nativeWebcamRecorder.recorder.state !== "inactive") {
+						nativeWebcamRecorder.recorder.stop();
+					}
+					await nativeWebcamRecorder.recordedBlobPromise;
+				} catch {
+					// Discard still closes any partial stream when stopping or draining fails.
+				}
+				await nativeWebcamRecorder.discard().catch(() => undefined);
+			}
 		}
 	};
 
