@@ -124,6 +124,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		let filter: SCContentFilter
 		let width: Int
 		let height: Int
+		let capturesIndependentWindow: Bool
 		// Global frame (points, top-left origin) of the captured region. Used by the
 		// renderer to normalize cursor positions into the captured window's space.
 		let captureFrame: CGRect
@@ -168,7 +169,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		outputWidth = target.width
 		outputHeight = target.height
 		captureFrame = target.captureFrame
-		let configuration = makeStreamConfiguration()
+		let configuration = makeStreamConfiguration(for: target)
 		let stream = SCStream(filter: target.filter, configuration: configuration, delegate: self)
 
 		try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: sampleQueue)
@@ -399,12 +400,25 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			guard let display = content.displays.first(where: { $0.displayID == displayId }) else {
 				throw HelperError.sourceNotFound("No ScreenCaptureKit display found for id \(displayId).")
 			}
-			let width = Int(CGDisplayPixelsWide(display.displayID))
-			let height = Int(CGDisplayPixelsHigh(display.displayID))
+			let filter = SCContentFilter(display: display, excludingWindows: [])
+			let sourceSize: CGSize
+			if #available(macOS 14.0, *) {
+				sourceSize = CaptureGeometry.pixelSize(
+					for: filter.contentRect.size,
+					pointPixelScale: CGFloat(filter.pointPixelScale)
+				)
+			} else {
+				sourceSize = Self.displayPixelSize(
+					for: display.displayID,
+					fallback: display.frame.size
+				)
+			}
+			let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize)
 			return CaptureTarget(
-				filter: SCContentFilter(display: display, excludingWindows: []),
-				width: clampCaptureDimension(width, fallback: request.video.width),
-				height: clampCaptureDimension(height, fallback: request.video.height),
+				filter: filter,
+				width: dimensions.width,
+				height: dimensions.height,
+				capturesIndependentWindow: false,
 				captureFrame: display.frame
 			)
 		case "window":
@@ -414,16 +428,30 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			guard let window = content.windows.first(where: { $0.windowID == windowId }) else {
 				throw HelperError.sourceNotFound("No ScreenCaptureKit window found for id \(windowId).")
 			}
-			let candidateDisplay = content.displays.first {
-				$0.frame.intersects(window.frame) || $0.frame.contains(CGPoint(x: window.frame.midX, y: window.frame.midY))
+			let filter = SCContentFilter(desktopIndependentWindow: window)
+			let sourceSize: CGSize
+			if #available(macOS 14.0, *) {
+				sourceSize = CaptureGeometry.pixelSize(
+					for: filter.contentRect.size,
+					pointPixelScale: CGFloat(filter.pointPixelScale)
+				)
+			} else {
+				let displayIndex = CaptureGeometry.displayIndex(
+					for: window.frame,
+					displayFrames: content.displays.map(\.frame)
+				)
+				let displayId = displayIndex.map { content.displays[$0].displayID } ?? CGMainDisplayID()
+				sourceSize = CaptureGeometry.pixelSize(
+					for: window.frame.size,
+					pointPixelScale: Self.pointPixelScale(for: displayId)
+				)
 			}
-			let scaleFactor = Self.scaleFactor(for: candidateDisplay?.displayID ?? CGMainDisplayID())
-			let width = Int(window.frame.width) * scaleFactor
-			let height = Int(window.frame.height) * scaleFactor
+			let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize)
 			return CaptureTarget(
-				filter: SCContentFilter(desktopIndependentWindow: window),
-				width: clampCaptureDimension(width, fallback: request.video.width),
-				height: clampCaptureDimension(height, fallback: request.video.height),
+				filter: filter,
+				width: dimensions.width,
+				height: dimensions.height,
+				capturesIndependentWindow: true,
 				captureFrame: window.frame
 			)
 		default:
@@ -431,7 +459,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		}
 	}
 
-	private func makeStreamConfiguration() -> SCStreamConfiguration {
+	private func makeStreamConfiguration(for target: CaptureTarget) -> SCStreamConfiguration {
 		let configuration = SCStreamConfiguration()
 		configuration.width = outputWidth
 		configuration.height = outputHeight
@@ -443,6 +471,11 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		configuration.channelCount = 2
 		configuration.excludesCurrentProcessAudio = true
 		configuration.capturesAudio = request.audio.system.enabled
+		if target.capturesIndependentWindow {
+			if #available(macOS 14.0, *) {
+				configuration.captureResolution = .best
+			}
+		}
 
 		if request.audio.microphone.enabled {
 			guard supportsNativeMicrophoneCapture(streamConfig: configuration) else {
@@ -672,19 +705,24 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		return status == .complete
 	}
 
-	private func clampCaptureDimension(_ value: Int, fallback: Int) -> Int {
-		let requested = max(2, fallback)
-		let candidate = value > 0 ? value : requested
-		let clamped = min(candidate, requested)
-		return max(2, clamped - (clamped % 2))
+	private static func displayPixelSize(for displayId: CGDirectDisplayID, fallback: CGSize) -> CGSize {
+		guard let mode = CGDisplayCopyDisplayMode(displayId) else {
+			return fallback
+		}
+
+		return CaptureGeometry.orientedPixelSize(
+			CGSize(width: mode.pixelWidth, height: mode.pixelHeight),
+			rotationDegrees: CGDisplayRotation(displayId)
+		)
 	}
 
-	private static func scaleFactor(for displayId: CGDirectDisplayID) -> Int {
-		guard let mode = CGDisplayCopyDisplayMode(displayId) else {
+	private static func pointPixelScale(for displayId: CGDirectDisplayID) -> CGFloat {
+		guard let mode = CGDisplayCopyDisplayMode(displayId), mode.width > 0 else {
 			return 1
 		}
 
-		return max(1, mode.pixelWidth / max(1, mode.width))
+		let scale = CGFloat(mode.pixelWidth) / CGFloat(mode.width)
+		return scale.isFinite && scale > 0 ? scale : 1
 	}
 
 	private func supportsNativeMicrophoneCapture(streamConfig: SCStreamConfiguration) -> Bool {
