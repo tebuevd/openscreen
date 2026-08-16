@@ -68,6 +68,33 @@ final class CaptureGeometryTests: XCTestCase {
 		)
 	}
 
+	func testInvalidSourcePixelsAreSanitizedBeforeDiagnostics() {
+		let invalidSizes = [
+			CGSize(width: CGFloat.nan, height: 1080),
+			CGSize(width: CGFloat.infinity, height: 1080),
+			CGSize(width: CaptureGeometry.maximumSafeJSONNumber + 1, height: 1080),
+			CGSize(width: -100, height: 100),
+			CGSize.zero,
+		]
+
+		for sourceSize in invalidSizes {
+			XCTAssertEqual(
+				CaptureGeometry.sanitizedPixelSize(sourceSize),
+				CGSize(width: 2, height: 2)
+			)
+		}
+	}
+
+	func testPointBoundsUseFiniteJSONNumbers() {
+		XCTAssertEqual(CaptureGeometry.jsonSafeNumber(-1440.5), -1440.5)
+		XCTAssertEqual(CaptureGeometry.jsonSafeNumber(CGFloat.nan), 0)
+		XCTAssertEqual(CaptureGeometry.jsonSafeNumber(CGFloat.infinity), 0)
+		XCTAssertEqual(
+			CaptureGeometry.jsonSafeNumber(CaptureGeometry.maximumSafeJSONNumber + 1),
+			0
+		)
+	}
+
 	func testOutputsArePositiveEvenAndWithinLimits() {
 		let sourceSizes = [
 			CGSize.zero,

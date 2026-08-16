@@ -393,10 +393,10 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 
 	private func captureBoundsPayload() -> [String: Double] {
 		return [
-			"x": captureFrame.origin.x,
-			"y": captureFrame.origin.y,
-			"width": captureFrame.size.width,
-			"height": captureFrame.size.height,
+			"x": CaptureGeometry.jsonSafeNumber(captureFrame.origin.x),
+			"y": CaptureGeometry.jsonSafeNumber(captureFrame.origin.y),
+			"width": CaptureGeometry.jsonSafeNumber(captureFrame.size.width),
+			"height": CaptureGeometry.jsonSafeNumber(captureFrame.size.height),
 		]
 	}
 
@@ -410,18 +410,19 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 				throw HelperError.sourceNotFound("No ScreenCaptureKit display found for id \(displayId).")
 			}
 			let filter = SCContentFilter(display: display, excludingWindows: [])
-			let sourceSize: CGSize
+			let rawSourceSize: CGSize
 			if #available(macOS 14.0, *) {
-				sourceSize = CaptureGeometry.pixelSize(
+				rawSourceSize = CaptureGeometry.pixelSize(
 					for: filter.contentRect.size,
 					pointPixelScale: CGFloat(filter.pointPixelScale)
 				)
 			} else {
-				sourceSize = Self.displayPixelSize(
+				rawSourceSize = Self.displayPixelSize(
 					for: display.displayID,
 					fallback: display.frame.size
 				)
 			}
+			let sourceSize = CaptureGeometry.sanitizedPixelSize(rawSourceSize)
 			let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize)
 			return CaptureTarget(
 				filter: filter,
@@ -440,9 +441,9 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 				throw HelperError.sourceNotFound("No ScreenCaptureKit window found for id \(windowId).")
 			}
 			let filter = SCContentFilter(desktopIndependentWindow: window)
-			let sourceSize: CGSize
+			let rawSourceSize: CGSize
 			if #available(macOS 14.0, *) {
-				sourceSize = CaptureGeometry.pixelSize(
+				rawSourceSize = CaptureGeometry.pixelSize(
 					for: filter.contentRect.size,
 					pointPixelScale: CGFloat(filter.pointPixelScale)
 				)
@@ -452,11 +453,12 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 					displayFrames: content.displays.map(\.frame)
 				)
 				let displayId = displayIndex.map { content.displays[$0].displayID } ?? CGMainDisplayID()
-				sourceSize = CaptureGeometry.pixelSize(
+				rawSourceSize = CaptureGeometry.pixelSize(
 					for: window.frame.size,
 					pointPixelScale: Self.pointPixelScale(for: displayId)
 				)
 			}
+			let sourceSize = CaptureGeometry.sanitizedPixelSize(rawSourceSize)
 			let dimensions = CaptureGeometry.fittedDimensions(for: sourceSize)
 			return CaptureTarget(
 				filter: filter,

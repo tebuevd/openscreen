@@ -6,47 +6,88 @@ import {
 } from "./nativeMacRecording";
 
 describe("native macOS recording-started events", () => {
-	it("retains the complete event when capture dimensions are valid", () => {
-		const event = {
+	const validEvent = () => ({
+		event: "recording-started",
+		timestampMs: 1_725_000_000_000,
+		width: 2880,
+		height: 1864,
+		captureBounds: { x: -1440.5, y: 0.25, width: 1440, height: 932 },
+		sourcePixelWidth: 2880,
+		sourcePixelHeight: 1864,
+		scale: 1,
+	});
+
+	it("returns a complete trusted event when all geometry is valid", () => {
+		expect(parseNativeMacHelperRecordingStartedEvent(validEvent())).toEqual({
 			event: "recording-started",
 			timestampMs: 1_725_000_000_000,
 			width: 2880,
 			height: 1864,
-			captureBounds: { x: 0, y: 0, width: 1440, height: 932 },
-			sourcePixelWidth: 2880,
-			sourcePixelHeight: 1864,
-			scale: 1,
-		};
-
-		const parsed = parseNativeMacHelperRecordingStartedEvent(event);
-
-		expect(parsed).toBe(event);
-		expect(parsed).toMatchObject({
-			width: 2880,
-			height: 1864,
+			captureBounds: { x: -1440.5, y: 0.25, width: 1440, height: 932 },
 			sourcePixelWidth: 2880,
 			sourcePixelHeight: 1864,
 			scale: 1,
 		});
 	});
 
+	it("accepts a source uniformly fitted to the capture ceiling", () => {
+		expect(
+			parseNativeMacHelperRecordingStartedEvent({
+				...validEvent(),
+				width: 3840,
+				height: 2160,
+				sourcePixelWidth: 5120,
+				sourcePixelHeight: 2880,
+				scale: 0.75,
+			}),
+		).toMatchObject({ width: 3840, height: 2160, scale: 0.75 });
+	});
+
 	it.each([
-		["missing", undefined, 1080],
-		["non-numeric", "1920", 1080],
-		["non-finite", Number.POSITIVE_INFINITY, 1080],
-		["fractional", 1920.5, 1080],
-		["zero", 0, 1080],
-		["negative", -1920, 1080],
-		["odd", 1920, 1079],
+		["missing", undefined, 1864],
+		["non-numeric", "2880", 1864],
+		["NaN", Number.NaN, 1864],
+		["non-finite", Number.POSITIVE_INFINITY, 1864],
+		["unsafe", 2 ** 53, 1864],
+		["fractional", 2880.5, 1864],
+		["zero", 0, 1864],
+		["negative", -2880, 1864],
+		["odd", 2880, 1863],
+		["oversized width", 3842, 1864],
+		["oversized height", 2880, 2162],
 	])("rejects %s capture dimensions", (_description, width, height) => {
 		expect(() =>
 			parseNativeMacHelperRecordingStartedEvent({
-				event: "recording-started",
-				timestampMs: 1_725_000_000_000,
+				...validEvent(),
 				width,
 				height,
 			}),
-		).toThrow(/invalid dimensions/);
+		).toThrow(/invalid recording-started event/);
+	});
+
+	it.each([
+		["missing diagnostics", { sourcePixelWidth: undefined }],
+		["unsafe timestamp", { timestampMs: 2 ** 53 }],
+		["fractional timestamp", { timestampMs: 1.5 }],
+		["missing bounds", { captureBounds: undefined }],
+		["NaN bounds coordinate", { captureBounds: { x: Number.NaN, y: 0, width: 1, height: 1 } }],
+		["infinite bounds coordinate", { captureBounds: { x: 0, y: Infinity, width: 1, height: 1 } }],
+		[
+			"unsafe bounds extent",
+			{ captureBounds: { x: Number.MAX_SAFE_INTEGER, y: 0, width: 1, height: 1 } },
+		],
+		["non-positive bounds width", { captureBounds: { x: 0, y: 0, width: 0, height: 1 } }],
+		["NaN source width", { sourcePixelWidth: Number.NaN }],
+		["unsafe source height", { sourcePixelHeight: 2 ** 53 }],
+		["NaN scale", { scale: Number.NaN }],
+		["zero scale", { scale: 0 }],
+		["scale above one", { scale: 1.01 }],
+		["scale inconsistent with source", { scale: 0.5 }],
+		["final pixels inconsistent with geometry", { width: 1920, height: 1080 }],
+	])("rejects %s", (_description, overrides) => {
+		expect(() =>
+			parseNativeMacHelperRecordingStartedEvent({ ...validEvent(), ...overrides }),
+		).toThrow(/invalid recording-started event/);
 	});
 });
 

@@ -9,19 +9,34 @@ struct CaptureDimensions: Equatable {
 enum CaptureGeometry {
 	static let maximumWidth = 3840
 	static let maximumHeight = 2160
+	static let maximumSafeJSONNumber = 9_007_199_254_740_991.0
 
 	static func pixelSize(for pointSize: CGSize, pointPixelScale: CGFloat) -> CGSize {
 		let scale = pointPixelScale.isFinite && pointPixelScale > 0 ? pointPixelScale : 1
 		return CGSize(width: pointSize.width * scale, height: pointSize.height * scale)
 	}
 
+	static func sanitizedPixelSize(_ sourceSize: CGSize) -> CGSize {
+		let width = Double(sourceSize.width)
+		let height = Double(sourceSize.height)
+		guard width.isFinite, height.isFinite,
+			width > 0, height > 0,
+			width <= maximumSafeJSONNumber, height <= maximumSafeJSONNumber
+		else {
+			return CGSize(width: 2, height: 2)
+		}
+		return sourceSize
+	}
+
+	static func jsonSafeNumber(_ value: CGFloat) -> Double {
+		let number = Double(value)
+		return number.isFinite && abs(number) <= maximumSafeJSONNumber ? number : 0
+	}
+
 	static func fittedDimensions(for sourceSize: CGSize) -> CaptureDimensions {
+		let sourceSize = sanitizedPixelSize(sourceSize)
 		let sourceWidth = Double(sourceSize.width)
 		let sourceHeight = Double(sourceSize.height)
-
-		guard sourceWidth.isFinite, sourceHeight.isFinite, sourceWidth > 0, sourceHeight > 0 else {
-			return CaptureDimensions(width: 2, height: 2, scale: 1)
-		}
 
 		let scale = min(
 			1,

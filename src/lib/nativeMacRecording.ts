@@ -58,10 +58,10 @@ export type NativeMacHelperRecordingStartedEvent = {
 	timestampMs: number;
 	width: number;
 	height: number;
-	captureBounds?: Rectangle;
-	sourcePixelWidth?: number;
-	sourcePixelHeight?: number;
-	scale?: number;
+	captureBounds: Rectangle;
+	sourcePixelWidth: number;
+	sourcePixelHeight: number;
+	scale: number;
 };
 
 export type NativeMacHelperRecordingStoppedEvent = {
@@ -98,28 +98,129 @@ export type NativeMacRecordingStartResult = {
 	error?: string;
 };
 
-function isValidCaptureDimension(value: unknown): value is number {
+const NATIVE_MAC_MAX_CAPTURE_WIDTH = 3840;
+const NATIVE_MAC_MAX_CAPTURE_HEIGHT = 2160;
+
+function isFiniteSafeNumber(value: unknown): value is number {
 	return (
 		typeof value === "number" &&
 		Number.isFinite(value) &&
-		Number.isInteger(value) &&
-		value > 0 &&
-		value % 2 === 0
+		Math.abs(value) <= Number.MAX_SAFE_INTEGER
 	);
 }
 
-export function parseNativeMacHelperRecordingStartedEvent(event: Record<string, unknown>) {
-	if (event.event !== "recording-started") {
-		return null;
+function isRecord(value: unknown): value is Record<string, unknown> {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isPositiveSafeInteger(value: unknown): value is number {
+	return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+
+function isValidCaptureDimension(value: unknown, maximum: number): value is number {
+	return isPositiveSafeInteger(value) && value % 2 === 0 && value <= maximum;
+}
+
+function invalidRecordingStartedEvent(reason: string): never {
+	throw new Error(`Native macOS capture reported an invalid recording-started event: ${reason}`);
+}
+
+function positiveEvenFloor(value: number) {
+	const floored = Math.floor(value);
+	return Math.max(2, floored - (floored % 2));
+}
+
+function isExpectedScale(actual: number, expected: number) {
+	return Math.abs(actual - expected) <= Number.EPSILON * 8 * Math.max(1, Math.abs(expected));
+}
+
+export function parseNativeMacHelperRecordingStartedEvent(
+	event: Record<string, unknown>,
+): NativeMacHelperRecordingStartedEvent | null {
+	if (event.event !== "recording-started") return null;
+
+	if (!isPositiveSafeInteger(event.timestampMs)) {
+		invalidRecordingStartedEvent("timestampMs must be a positive safe integer");
 	}
 
-	if (!isValidCaptureDimension(event.width) || !isValidCaptureDimension(event.height)) {
-		throw new Error(
-			`Native macOS capture reported invalid dimensions (${String(event.width)}x${String(event.height)}). Expected finite, positive, even integers.`,
+	if (
+		!isValidCaptureDimension(event.width, NATIVE_MAC_MAX_CAPTURE_WIDTH) ||
+		!isValidCaptureDimension(event.height, NATIVE_MAC_MAX_CAPTURE_HEIGHT)
+	) {
+		invalidRecordingStartedEvent(
+			`final dimensions must be positive, even safe integers within ${NATIVE_MAC_MAX_CAPTURE_WIDTH}x${NATIVE_MAC_MAX_CAPTURE_HEIGHT}`,
 		);
 	}
 
-	return event as unknown as NativeMacHelperRecordingStartedEvent;
+	if (!isRecord(event.captureBounds)) {
+		invalidRecordingStartedEvent("captureBounds must be an object");
+	}
+	const bounds = event.captureBounds;
+	if (
+		!isFiniteSafeNumber(bounds.x) ||
+		!isFiniteSafeNumber(bounds.y) ||
+		!isFiniteSafeNumber(bounds.width) ||
+		!isFiniteSafeNumber(bounds.height) ||
+		bounds.width <= 0 ||
+		bounds.height <= 0
+	) {
+		invalidRecordingStartedEvent(
+			"captureBounds components must be finite safe numbers with positive dimensions",
+		);
+	}
+	if (
+		!isFiniteSafeNumber(bounds.x + bounds.width) ||
+		!isFiniteSafeNumber(bounds.y + bounds.height)
+	) {
+		invalidRecordingStartedEvent("captureBounds extents must remain finite safe numbers");
+	}
+
+	if (
+		!isFiniteSafeNumber(event.sourcePixelWidth) ||
+		!isFiniteSafeNumber(event.sourcePixelHeight) ||
+		event.sourcePixelWidth <= 0 ||
+		event.sourcePixelHeight <= 0
+	) {
+		invalidRecordingStartedEvent("source pixel dimensions must be positive finite safe numbers");
+	}
+	if (!isFiniteSafeNumber(event.scale) || event.scale <= 0 || event.scale > 1) {
+		invalidRecordingStartedEvent("scale must be a finite safe number in the range (0, 1]");
+	}
+
+	const expectedScale = Math.min(
+		1,
+		NATIVE_MAC_MAX_CAPTURE_WIDTH / event.sourcePixelWidth,
+		NATIVE_MAC_MAX_CAPTURE_HEIGHT / event.sourcePixelHeight,
+	);
+	if (!isExpectedScale(event.scale, expectedScale)) {
+		invalidRecordingStartedEvent(
+			"scale does not fit the reported source pixels within the capture limit",
+		);
+	}
+	if (
+		event.width !== positiveEvenFloor(event.sourcePixelWidth * event.scale) ||
+		event.height !== positiveEvenFloor(event.sourcePixelHeight * event.scale)
+	) {
+		invalidRecordingStartedEvent(
+			"final dimensions do not match the reported source pixels and scale",
+		);
+	}
+
+	return {
+		event: "recording-started",
+		timestampMs: event.timestampMs,
+		width: event.width,
+		height: event.height,
+		captureBounds: {
+			x: bounds.x,
+			y: bounds.y,
+			width: bounds.width,
+			height: bounds.height,
+		},
+		sourcePixelWidth: event.sourcePixelWidth,
+		sourcePixelHeight: event.sourcePixelHeight,
+		scale: event.scale,
+	};
 }
 
 export function parseMacWindowIdFromSourceId(sourceId?: string | null) {
