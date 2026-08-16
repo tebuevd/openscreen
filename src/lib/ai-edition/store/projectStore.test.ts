@@ -9,6 +9,7 @@ const bridgeMocks = vi.hoisted(() => ({
 	get: vi.fn(),
 	create: vi.fn(),
 	save: vi.fn(),
+	delete: vi.fn(),
 	addAsset: vi.fn(),
 	removeAsset: vi.fn(),
 	listProjects: vi.fn(),
@@ -24,6 +25,7 @@ vi.mock("@/native/client", () => ({
 			get: bridgeMocks.get,
 			create: bridgeMocks.create,
 			save: bridgeMocks.save,
+			delete: bridgeMocks.delete,
 			addAsset: bridgeMocks.addAsset,
 			removeAsset: bridgeMocks.removeAsset,
 			listProjects: bridgeMocks.listProjects,
@@ -159,6 +161,177 @@ describe("useProjectStore", () => {
 		const state = useProjectStore.getState();
 		expect(state.status).toBe("error");
 		expect(state.error).toBe("not found");
+	});
+
+	it("makes a same-id import authoritative over saves queued by the old generation", async () => {
+		const oldSave = deferred<{ success: true; document: AxcutDocument }>();
+		const importSave = deferred<{ success: true; document: AxcutDocument }>();
+		const snapshots: AxcutDocument[] = [];
+		bridgeMocks.save.mockImplementation((document: AxcutDocument) => {
+			snapshots.push(document);
+			return snapshots.length === 1 ? oldSave.promise : importSave.promise;
+		});
+		loadDocument();
+
+		const firstSaving = useProjectStore.getState().saveDocument({
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Old in-flight save" },
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		const oldGeneration = useProjectStore.getState().documentGeneration;
+		const queuedSaving = useProjectStore.getState().saveDocument({
+			...useProjectStore.getState().document!,
+			project: { ...sampleDoc.project, title: "Old queued save" },
+		});
+		const imported: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Imported A" },
+		};
+
+		const importing = useProjectStore.getState().importProject(imported);
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+		expect(snapshots[1].project.title).toBe("Imported A");
+		expect(useProjectStore.getState()).toMatchObject({ status: "loading" });
+		expect(useProjectStore.getState().documentGeneration).toBeGreaterThan(oldGeneration);
+
+		oldSave.resolve({ success: true, document: snapshots[0] });
+		await firstSaving;
+		await queuedSaving;
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(2);
+
+		importSave.resolve({ success: true, document: imported });
+		await expect(importing).resolves.toBe(true);
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_test",
+			document: { project: { title: "Imported A" } },
+			status: "ready",
+			dirty: false,
+		});
+	});
+
+	it("keeps the current project usable when an import fails", async () => {
+		bridgeMocks.save.mockResolvedValue({ success: false, error: "invalid import" });
+		loadDocument();
+		const oldGeneration = useProjectStore.getState().documentGeneration;
+
+		await expect(useProjectStore.getState().importProject(sampleDoc)).rejects.toThrow(
+			"invalid import",
+		);
+
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_test",
+			document: sampleDoc,
+			status: "ready",
+			error: null,
+		});
+		expect(useProjectStore.getState().documentGeneration).toBeGreaterThan(oldGeneration);
+	});
+
+	it("does not apply an import response after another project is opened", async () => {
+		const pendingImport = deferred<{ success: true; document: AxcutDocument }>();
+		bridgeMocks.save.mockReturnValue(pendingImport.promise);
+		loadDocument();
+		const imported: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Imported A" },
+		};
+		const importing = useProjectStore.getState().importProject(imported);
+
+		const projectB: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, id: "proj_b", title: "Project B" },
+		};
+		bridgeMocks.get.mockResolvedValue({ success: true, document: projectB });
+		await useProjectStore.getState().loadProject("proj_b");
+		pendingImport.resolve({ success: true, document: imported });
+
+		await expect(importing).resolves.toBe(false);
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_b",
+			document: { project: { title: "Project B" } },
+			status: "ready",
+		});
+	});
+
+	it("invalidates an active project before deletion can race its queued saves", async () => {
+		const oldSave = deferred<{ success: true; document: AxcutDocument }>();
+		const deleting = deferred<{ success: true }>();
+		let snapshot: AxcutDocument | null = null;
+		bridgeMocks.save.mockImplementation((document: AxcutDocument) => {
+			snapshot = document;
+			return oldSave.promise;
+		});
+		bridgeMocks.delete.mockReturnValue(deleting.promise);
+		loadDocument();
+
+		const firstSaving = useProjectStore.getState().saveDocument({
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Old in-flight save" },
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		const oldGeneration = useProjectStore.getState().documentGeneration;
+		const queuedSaving = useProjectStore.getState().saveDocument({
+			...useProjectStore.getState().document!,
+			project: { ...sampleDoc.project, title: "Must not recreate" },
+		});
+
+		const deletion = useProjectStore.getState().deleteProject("proj_test");
+		expect(bridgeMocks.delete).toHaveBeenCalledWith("proj_test");
+		expect(useProjectStore.getState()).toMatchObject({ status: "loading" });
+		expect(useProjectStore.getState().documentGeneration).toBeGreaterThan(oldGeneration);
+
+		oldSave.resolve({ success: true, document: snapshot! });
+		await firstSaving;
+		await queuedSaving;
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+
+		deleting.resolve({ success: true });
+		await deletion;
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: null,
+			document: null,
+			status: "idle",
+		});
+	});
+
+	it("keeps an active project usable when deletion fails", async () => {
+		bridgeMocks.delete.mockResolvedValue({ success: false, error: "permission denied" });
+		loadDocument();
+		const oldGeneration = useProjectStore.getState().documentGeneration;
+
+		await expect(useProjectStore.getState().deleteProject("proj_test")).rejects.toThrow(
+			"permission denied",
+		);
+
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_test",
+			document: sampleDoc,
+			status: "ready",
+			error: null,
+		});
+		expect(useProjectStore.getState().documentGeneration).toBeGreaterThan(oldGeneration);
+	});
+
+	it("does not clear a project opened while deletion is pending", async () => {
+		const pendingDelete = deferred<{ success: true }>();
+		bridgeMocks.delete.mockReturnValue(pendingDelete.promise);
+		loadDocument();
+		const deleting = useProjectStore.getState().deleteProject("proj_test");
+
+		const projectB: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, id: "proj_b", title: "Project B" },
+		};
+		bridgeMocks.get.mockResolvedValue({ success: true, document: projectB });
+		await useProjectStore.getState().loadProject("proj_b");
+		pendingDelete.resolve({ success: true });
+		await deleting;
+
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_b",
+			document: { project: { title: "Project B" } },
+			status: "ready",
+		});
 	});
 
 	it("serializes saves and persists the latest authoritative document", async () => {

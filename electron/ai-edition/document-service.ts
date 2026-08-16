@@ -179,6 +179,10 @@ export class DocumentService {
 		return path.join(this.projectsRoot, `${safe}${LEGACY_PROJECT_FILE_EXTENSION}`);
 	}
 
+	private projectDataDirFor(projectId: string): string {
+		return path.join(this.projectsRoot, safeProjectId(projectId));
+	}
+
 	async listProjects(): Promise<ProjectSummary[]> {
 		await this.ensureProjectsDir();
 		const entries = await fs.readdir(this.projectsRoot);
@@ -271,8 +275,12 @@ export class DocumentService {
 
 	async deleteProject(projectId: string): Promise<void> {
 		await this.enqueueProjectOperation(projectId, async () => {
-			// Remove the canonical file and any lingering legacy `.axcut` for this id.
-			for (const filePath of [this.fileFor(projectId), this.legacyFileFor(projectId)]) {
+			// Project-owned sidecars may live under projects/<id>. Source recordings live
+			// in mediaRegistryDir and are deliberately not part of project deletion.
+			// Remove auxiliary data first so a cleanup failure leaves the project openable.
+			await fs.rm(this.projectDataDirFor(projectId), { recursive: true, force: true });
+			// The canonical file is the final commit point. If legacy cleanup fails, keep it.
+			for (const filePath of [this.legacyFileFor(projectId), this.fileFor(projectId)]) {
 				try {
 					await fs.unlink(filePath);
 				} catch (error) {

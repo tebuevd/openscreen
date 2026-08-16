@@ -67,6 +67,8 @@ export interface ProjectState {
 
 	loadProject: (projectId: string) => Promise<void>;
 	createProject: (title: string) => Promise<AxcutDocument>;
+	importProject: (document: AxcutDocument) => Promise<boolean>;
+	deleteProject: (projectId: string) => Promise<void>;
 	refresh: () => Promise<void>;
 	addAsset: (path: string, label?: string) => Promise<AxcutAsset | null>;
 	removeAsset: (assetId: string) => Promise<void>;
@@ -182,6 +184,66 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				});
 			}
 			throw error;
+		}
+	},
+
+	async importProject(document) {
+		const imported = parseDocument(document);
+		const before = get();
+		const documentGeneration = allocateDocumentGeneration();
+		set({ documentGeneration, status: "loading", error: null });
+		try {
+			const persisted = await persistDocument(imported);
+			if (get().documentGeneration !== documentGeneration) return false;
+			set({
+				projectId: persisted.project.id,
+				document: persisted,
+				revision: get().revision + 1,
+				status: "ready",
+				error: null,
+				dirty: false,
+				lastSavedAt: new Date(),
+			});
+			void import("./undo").then(({ clearHistory }) => clearHistory());
+			return true;
+		} catch (error) {
+			if (get().documentGeneration === documentGeneration) {
+				set({ status: before.status, error: before.error });
+			}
+			throw error;
+		}
+	},
+
+	async deleteProject(projectId) {
+		const before = get();
+		const deletingActiveProject = before.projectId === projectId;
+		const documentGeneration = deletingActiveProject ? allocateDocumentGeneration() : null;
+		if (documentGeneration !== null) {
+			// Invalidate first so saves waiting in the old generation never dispatch
+			// after the main process has queued this deletion.
+			set({ documentGeneration, status: "loading", error: null });
+		}
+
+		try {
+			const result = await nativeBridgeClient.aiEdition.delete(projectId);
+			if (!result.success) throw new Error(result.error ?? "Failed to delete project");
+		} catch (error) {
+			if (
+				documentGeneration !== null &&
+				get().documentGeneration === documentGeneration &&
+				get().projectId === projectId
+			) {
+				set({ status: before.status, error: before.error });
+			}
+			throw error;
+		}
+
+		if (
+			documentGeneration !== null &&
+			get().documentGeneration === documentGeneration &&
+			get().projectId === projectId
+		) {
+			get().clear();
 		}
 	},
 

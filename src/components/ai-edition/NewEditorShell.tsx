@@ -95,6 +95,8 @@ export function NewEditorShell() {
 	const setCurrentTime = useProjectStore((s) => s.setCurrentTime);
 	const setSourceDuration = useProjectStore((s) => s.setSourceDuration);
 	const loadProject = useProjectStore((s) => s.loadProject);
+	const importProject = useProjectStore((s) => s.importProject);
+	const deleteProject = useProjectStore((s) => s.deleteProject);
 	const saveDocument = useProjectStore((s) => s.saveDocument);
 	// Single source of truth for transport state (was local useState here AND, separately
 	// and unused, in VirtualPreview — two copies independently wired to the same <video>
@@ -517,19 +519,15 @@ export function NewEditorShell() {
 			const doc = isAxcutDocument
 				? documentSchema.parse(migrateRawDocumentToCurrent(raw)) // disk-load: upgrade v3/v4 → v5, then validate
 				: migrateProjectDataToAxcutDocument(raw as EditorProjectData);
-			const saved = await nativeBridgeClient.aiEdition.save(doc);
-			if (saved.success && saved.document) {
-				await loadProject(doc.project.id);
+			if (await importProject(doc)) {
 				toast.success(isAxcutDocument ? "Project opened" : "Legacy project migrated and loaded");
-			} else {
-				toast.error(saved.error ?? "Failed to open project");
 			}
 		} catch (err) {
 			toast.error("Could not load project", {
 				description: err instanceof Error ? err.message : String(err),
 			});
 		}
-	}, [loadProject]);
+	}, [importProject]);
 
 	// ponytail: transcript-pane → timeline skip ranges. The right pane's
 	// contentEditable region converts user Backspace/Delete into a new
@@ -597,23 +595,20 @@ export function NewEditorShell() {
 	// The only way to get rid of a project short of deleting its file by hand.
 	// Media is left alone on purpose: a recording can back several projects, and
 	// the dialog says so before it asks.
-	const handleDeleteProject = useCallback(async (id: string) => {
-		try {
-			const result = await nativeBridgeClient.aiEdition.delete(id);
-			if (!result.success) throw new Error(result.error ?? "Failed to delete project");
-			setProjectSummaries((prev) => prev.filter((p) => p.id !== id));
-			// Deleting the project that is open leaves the editor pointing at a file
-			// that no longer exists — any save from there would recreate it.
-			if (useProjectStore.getState().projectId === id) {
-				useProjectStore.getState().clear();
+	const handleDeleteProject = useCallback(
+		async (id: string) => {
+			try {
+				await deleteProject(id);
+				setProjectSummaries((prev) => prev.filter((p) => p.id !== id));
+				toast.success("Project deleted");
+			} catch (err) {
+				toast.error("Could not delete project", {
+					description: err instanceof Error ? err.message : String(err),
+				});
 			}
-			toast.success("Project deleted");
-		} catch (err) {
-			toast.error("Could not delete project", {
-				description: err instanceof Error ? err.message : String(err),
-			});
-		}
-	}, []);
+		},
+		[deleteProject],
+	);
 
 	const handleSave = useCallback(async () => {
 		const doc = useProjectStore.getState().document;

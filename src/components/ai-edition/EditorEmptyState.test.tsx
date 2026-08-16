@@ -225,6 +225,10 @@ describe("EditorEmptyState (new editor)", () => {
 		await waitFor(() => {
 			expect(bridgeMocks.loadProjectFile).toHaveBeenCalledTimes(1);
 			expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+			expect(useProjectStore.getState()).toMatchObject({
+				projectId: "proj_test",
+				status: "ready",
+			});
 		});
 	});
 

@@ -438,6 +438,68 @@ describe("DocumentService", () => {
 		it("is a no-op when the file doesn't exist", async () => {
 			await expect(service.deleteProject("proj_never-existed")).resolves.toBeUndefined();
 		});
+
+		it("removes project-owned data but keeps source recordings", async () => {
+			const doc = await service.createProject("Project data");
+			const projectDataDir = path.join(tempDir, doc.project.id);
+			const generatedMedia = path.join(projectDataDir, "media", "preview.mp4");
+			const sourceRecording = path.join(mediaDir, "recording.mp4");
+			await fs.mkdir(path.dirname(generatedMedia), { recursive: true });
+			await fs.writeFile(generatedMedia, "generated", "utf8");
+			await fs.writeFile(sourceRecording, "source", "utf8");
+
+			await service.deleteProject(doc.project.id);
+
+			await expect(fs.access(projectDataDir)).rejects.toMatchObject({ code: "ENOENT" });
+			await expect(fs.readFile(sourceRecording, "utf8")).resolves.toBe("source");
+		});
+
+		it("keeps the canonical document when project-data cleanup fails", async () => {
+			const doc = await service.createProject("Cleanup failure");
+			const rm = vi.spyOn(fs, "rm").mockRejectedValueOnce(new Error("cleanup failed"));
+
+			await expect(service.deleteProject(doc.project.id)).rejects.toThrow("cleanup failed");
+			rm.mockRestore();
+
+			await expect(service.getProject(doc.project.id)).resolves.toMatchObject({
+				project: { title: "Cleanup failure" },
+			});
+		});
+
+		it("waits for an earlier save before deleting the project", async () => {
+			const doc = await service.createProject("Delete ordering");
+			const enteredWrite = deferred<void>();
+			const releaseWrite = deferred<void>();
+			const realOpen = fs.open.bind(fs);
+			const open = vi.spyOn(fs, "open").mockImplementationOnce(async (...args) => {
+				enteredWrite.resolve(undefined);
+				await releaseWrite.promise;
+				return realOpen(...args);
+			});
+			const saving = service.saveProject({
+				...doc,
+				project: { ...doc.project, title: "Save before delete" },
+			});
+			await enteredWrite.promise;
+
+			let deletionSettled = false;
+			const deleting = service.deleteProject(doc.project.id).then(() => {
+				deletionSettled = true;
+			});
+			await Promise.resolve();
+			expect(deletionSettled).toBe(false);
+			await expect(
+				fs.access(path.join(tempDir, `${doc.project.id}.openscreen`)),
+			).resolves.toBeUndefined();
+
+			releaseWrite.resolve(undefined);
+			await saving;
+			await deleting;
+			open.mockRestore();
+			await expect(service.getProject(doc.project.id)).rejects.toBeInstanceOf(
+				DocumentNotFoundError,
+			);
+		});
 	});
 
 	// These reproduce a bug that destroyed two real project files: fs.writeFile
