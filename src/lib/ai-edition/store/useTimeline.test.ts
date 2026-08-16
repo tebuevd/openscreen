@@ -131,6 +131,8 @@ describe("useTimeline.insertClipAt background duration probe", () => {
 		useProjectStore.getState().clear();
 		for (const mock of Object.values(bridgeMocks)) mock.mockReset();
 		probeVideoDurationMock.mockReset();
+		probeVideoDimensionsMock.mockReset();
+		probeVideoDimensionsMock.mockResolvedValue({ width: 1920, height: 1080 });
 		bridgeMocks.save.mockImplementation(async (doc: typeof sampleDoc) => ({
 			success: true,
 			document: doc,
@@ -187,6 +189,261 @@ describe("useTimeline.insertClipAt background duration probe", () => {
 			sourceEndSec: 5,
 			timelineStartSec: 10,
 			timelineEndSec: 15,
+		});
+	});
+
+	it("ignores a delayed probe after an A-to-B-to-A same-id reopen", async () => {
+		const duration = deferred<number | null>();
+		probeVideoDurationMock.mockReturnValue(duration.promise);
+		const { result } = renderTimeline();
+
+		await act(async () => result.current.insertClipAt("asset_2", 1));
+		await waitFor(() => expect(probeVideoDurationMock).toHaveBeenCalledTimes(1));
+		const insertedA = structuredClone(useProjectStore.getState().document!);
+		const projectB: AxcutDocument = {
+			...insertedA,
+			project: { ...insertedA.project, id: "proj_b", title: "Project B" },
+		};
+		const reopenedA: AxcutDocument = {
+			...insertedA,
+			project: { ...insertedA.project, title: "Reopened A" },
+		};
+		bridgeMocks.get
+			.mockResolvedValueOnce({ success: true, document: projectB })
+			.mockResolvedValueOnce({ success: true, document: reopenedA });
+
+		await act(async () => {
+			await useProjectStore.getState().loadProject("proj_b");
+			await useProjectStore.getState().loadProject("proj_test");
+		});
+		await act(async () => {
+			duration.resolve(5);
+			await duration.promise;
+			await Promise.resolve();
+		});
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		const afterReopen = useProjectStore.getState().document!;
+		expect(afterReopen.project.title).toBe("Reopened A");
+		expect(afterReopen.assets.find((asset) => asset.id === "asset_2")).toMatchObject({
+			id: "asset_2",
+			durationSec: undefined,
+		});
+	});
+
+	it("does not apply old metadata when the same asset and clip ids now use another path", async () => {
+		const duration = deferred<number | null>();
+		probeVideoDurationMock.mockReturnValue(duration.promise);
+		const { result } = renderTimeline();
+
+		await act(async () => result.current.insertClipAt("asset_2", 1));
+		await waitFor(() => expect(probeVideoDurationMock).toHaveBeenCalledTimes(1));
+		act(() => {
+			const current = useProjectStore.getState().document!;
+			useProjectStore.getState().setDocument({
+				...current,
+				assets: current.assets.map((asset) =>
+					asset.id === "asset_2" ? { ...asset, originalPath: "/tmp/replacement.webm" } : asset,
+				),
+			});
+		});
+		await act(async () => {
+			duration.resolve(5);
+			await duration.promise;
+			await Promise.resolve();
+		});
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(
+			useProjectStore.getState().document?.assets.find((a) => a.id === "asset_2"),
+		).toMatchObject({
+			originalPath: "/tmp/replacement.webm",
+			durationSec: undefined,
+		});
+	});
+
+	it.each([
+		"asset",
+		"clip",
+		"clip-link",
+	] as const)("no-ops when the inserted %s is removed or replaced", async (replacement) => {
+		const duration = deferred<number | null>();
+		probeVideoDurationMock.mockReturnValue(duration.promise);
+		const { result } = renderTimeline();
+
+		await act(async () => result.current.insertClipAt("asset_2", 1));
+		await waitFor(() => expect(probeVideoDurationMock).toHaveBeenCalledTimes(1));
+		act(() => {
+			const current = useProjectStore.getState().document!;
+			const inserted = current.timeline.clips.find((clip) => clip.assetId === "asset_2")!;
+			useProjectStore.getState().setDocument({
+				...current,
+				assets:
+					replacement === "asset"
+						? current.assets.filter((asset) => asset.id !== "asset_2")
+						: current.assets,
+				timeline: {
+					...current.timeline,
+					clips:
+						replacement === "clip"
+							? current.timeline.clips.filter((clip) => clip.id !== inserted.id)
+							: current.timeline.clips.map((clip) =>
+									clip.id === inserted.id && replacement === "clip-link"
+										? { ...clip, assetId: "asset_1" }
+										: clip,
+								),
+				},
+			});
+		});
+		await act(async () => {
+			duration.resolve(5);
+			await duration.promise;
+			await Promise.resolve();
+		});
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+	});
+
+	it("keeps an attempt invalid after the same asset and clip identity is removed and re-added", async () => {
+		const duration = deferred<number | null>();
+		probeVideoDurationMock.mockReturnValue(duration.promise);
+		const { result } = renderTimeline();
+
+		await act(async () => result.current.insertClipAt("asset_2", 1));
+		await waitFor(() => expect(probeVideoDurationMock).toHaveBeenCalledTimes(1));
+		act(() => {
+			const insertedDocument = useProjectStore.getState().document!;
+			useProjectStore.getState().setDocument({
+				...insertedDocument,
+				assets: insertedDocument.assets.filter((asset) => asset.id !== "asset_2"),
+				timeline: {
+					...insertedDocument.timeline,
+					clips: insertedDocument.timeline.clips.filter((clip) => clip.assetId !== "asset_2"),
+				},
+			});
+			useProjectStore.getState().setDocument(insertedDocument);
+		});
+		await act(async () => {
+			duration.resolve(5);
+			await duration.promise;
+			await Promise.resolve();
+		});
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(
+			useProjectStore.getState().document?.assets.find((asset) => asset.id === "asset_2")
+				?.durationSec,
+		).toBeUndefined();
+	});
+
+	it("rebases a successful correction over an unrelated concurrent edit", async () => {
+		const duration = deferred<number | null>();
+		probeVideoDurationMock.mockReturnValue(duration.promise);
+		const { result } = renderTimeline();
+
+		await act(async () => result.current.insertClipAt("asset_2", 1));
+		await waitFor(() => expect(probeVideoDurationMock).toHaveBeenCalledTimes(1));
+		act(() => {
+			const current = useProjectStore.getState().document!;
+			useProjectStore.getState().setDocument({
+				...current,
+				project: { ...current.project, title: "Concurrent title edit" },
+			});
+		});
+		await act(async () => {
+			duration.resolve(5);
+			await duration.promise;
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+
+		const corrected = bridgeMocks.save.mock.calls[1]?.[0] as AxcutDocument;
+		expect(corrected.project.title).toBe("Concurrent title edit");
+		expect(corrected.assets.find((asset) => asset.id === "asset_2")).toMatchObject({
+			id: "asset_2",
+			durationSec: 5,
+		});
+		expect(corrected.timeline.clips.find((clip) => clip.assetId === "asset_2")).toMatchObject({
+			sourceEndSec: 5,
+		});
+	});
+
+	it("uses newer accepted metadata when an older probe completes last", async () => {
+		const oldDuration = deferred<number | null>();
+		const newDuration = deferred<number | null>();
+		const oldDimensions = deferred<{ width: number; height: number } | null>();
+		const newDimensions = deferred<{ width: number; height: number } | null>();
+		probeVideoDurationMock
+			.mockReturnValueOnce(oldDuration.promise)
+			.mockReturnValueOnce(newDuration.promise);
+		probeVideoDimensionsMock
+			.mockReturnValueOnce(oldDimensions.promise)
+			.mockReturnValueOnce(newDimensions.promise);
+		const current = useProjectStore.getState().document!;
+		useProjectStore.setState({
+			document: {
+				...current,
+				assets: current.assets.map((asset) =>
+					asset.id === "asset_2" ? { ...asset, video: undefined } : asset,
+				),
+			},
+		});
+		const { result } = renderTimeline();
+
+		await act(async () => result.current.insertClipAt("asset_2", 1));
+		await waitFor(() => expect(probeVideoDurationMock).toHaveBeenCalledTimes(1));
+		await act(async () => result.current.insertClipAt("asset_2", 2));
+		await waitFor(() => expect(probeVideoDurationMock).toHaveBeenCalledTimes(2));
+		await act(async () => {
+			newDuration.resolve(8);
+			newDimensions.resolve({ width: 1280, height: 720 });
+			await Promise.all([newDuration.promise, newDimensions.promise]);
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(3));
+		await act(async () => {
+			oldDuration.resolve(5);
+			oldDimensions.resolve({ width: 640, height: 360 });
+			await Promise.all([oldDuration.promise, oldDimensions.promise]);
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(4));
+
+		const finalDocument = useProjectStore.getState().document!;
+		expect(finalDocument.assets.find((asset) => asset.id === "asset_2")).toMatchObject({
+			durationSec: 8,
+			video: { width: 1280, height: 720 },
+		});
+		expect(
+			finalDocument.timeline.clips
+				.filter((clip) => clip.assetId === "asset_2")
+				.map((clip) => clip.sourceEndSec),
+		).toEqual([8, 8]);
+	});
+
+	it("normally corrects duration and dimensions in one background persistence", async () => {
+		probeVideoDurationMock.mockResolvedValue(5);
+		probeVideoDimensionsMock.mockResolvedValue({ width: 1280, height: 720 });
+		const current = useProjectStore.getState().document!;
+		useProjectStore.setState({
+			document: {
+				...current,
+				assets: current.assets.map((asset) =>
+					asset.id === "asset_2" ? { ...asset, video: undefined } : asset,
+				),
+			},
+		});
+		const { result } = renderTimeline();
+
+		await act(async () => result.current.insertClipAt("asset_2", 1));
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+
+		expect(probeVideoDurationMock).toHaveBeenCalledTimes(1);
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
+		const correction = bridgeMocks.save.mock.calls[1]?.[0] as AxcutDocument;
+		expect(correction.assets.find((asset) => asset.id === "asset_2")).toMatchObject({
+			durationSec: 5,
+			video: { width: 1280, height: 720 },
+		});
+		expect(correction.timeline.clips.find((clip) => clip.assetId === "asset_2")).toMatchObject({
+			sourceEndSec: 5,
 		});
 	});
 });

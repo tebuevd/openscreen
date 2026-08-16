@@ -73,6 +73,19 @@ interface AssetDimensionProbeSession {
 	assets: Map<string, AssetDimensionProbeAttempt>;
 }
 
+interface InsertClipProbeIdentity {
+	projectId: string;
+	documentGeneration: number;
+	assetId: string;
+	clipId: string;
+	originalPath: string;
+}
+
+interface InsertClipProbeAttempt {
+	identity: InsertClipProbeIdentity;
+	token: symbol;
+}
+
 function needsSourceDimensions(asset: AxcutDocument["assets"][number]): boolean {
 	return !asset.video?.width || !asset.video.height;
 }
@@ -124,6 +137,7 @@ export function useTimeline() {
 	// the Delete key operates on.
 	const [multiSelection, setMultiSelection] = useState<RegionHandle[]>([]);
 	const [clipSelection, setClipSelection] = useState<string | null>(null);
+	const insertClipProbeAttemptsRef = useRef(new Map<string, InsertClipProbeAttempt>());
 
 	const hasDoc = document !== null && projectId !== null;
 
@@ -187,11 +201,25 @@ export function useTimeline() {
 		}
 
 		const usedAssetIds = new Set(document.timeline.clips.map((c) => c.assetId));
+		// An insertion attempt already probes duration and dimensions together. Do not launch the
+		// load-time dimension backfill for the same identity while that combined probe is pending.
+		const insertionProbeAssetPaths = new Set(
+			[...insertClipProbeAttemptsRef.current.values()]
+				.filter(
+					(attempt) =>
+						attempt.identity.projectId === projectId &&
+						attempt.identity.documentGeneration === documentGeneration,
+				)
+				.map((attempt) =>
+					JSON.stringify([attempt.identity.assetId, attempt.identity.originalPath]),
+				),
+		);
 		const missing = document.assets.filter(
 			(a) =>
 				usedAssetIds.has(a.id) &&
 				a.originalPath &&
 				needsSourceDimensions(a) &&
+				!insertionProbeAssetPaths.has(JSON.stringify([a.id, a.originalPath])) &&
 				!session.assets.has(a.id),
 		);
 		if (missing.length === 0) return;
@@ -940,65 +968,134 @@ export function useTimeline() {
 	// on user edits. Also persists the duration back onto the asset so
 	// subsequent inserts use the cached value without re-probing.
 	const probeAndCorrectClip = useCallback(
-		async (assetId: string, clipId: string, originalPath: string) => {
-			const fileUrl = toFileUrl(originalPath);
-			// Dims probed alongside duration — otherwise `asset.video` stays permanently unset for
-			// most recordings (nothing else populates it), silently breaking anything that reads
-			// real source dimensions later (e.g. the export dialog's downscale/upscale badges).
-			const [probedDuration, probedDims] = await Promise.all([
-				probeVideoDuration(fileUrl),
-				probeVideoDimensions(fileUrl),
-			]);
-			const state = useProjectStore.getState();
-			const doc = state.document;
-			if (!doc) return;
-			const asset = doc.assets.find((a) => a.id === assetId);
-			const needsDims = probedDims != null && !asset?.video;
-			if (probedDuration == null && !needsDims) return;
-
-			// Guard: only correct clips still sitting at the 0..60s placeholder.
-			// If the user has since trimmed the clip or moved on, leave it alone.
-			const clip = doc.timeline.clips.find((c) => c.id === clipId);
-			const stillPlaceholder =
-				clip != null &&
-				clip.sourceStartSec === 0 &&
-				Math.abs((clip.sourceEndSec ?? 0) - PLACEHOLDER_DURATION_SEC) < 0.01;
-			const correctDuration = probedDuration != null && stillPlaceholder;
-			if (!correctDuration && !needsDims) return;
-
-			// Only correct the probed clip's own length here — do NOT hand-shift
-			// every sibling by the delta, since that has no notion of which clips
-			// sit before vs. after this one in timeline order (it used to shift
-			// earlier clips too, corrupting their positions). resequenceClips lays
-			// everything back-to-back from t=0 using each clip's own (now correct)
-			// length, so it's the correct + already-shared way to renormalize.
-			const oldClips = doc.timeline.clips;
-			const nextClips = correctDuration
-				? resequenceClips(
-						oldClips.map((c) =>
-							c.id === clipId
-								? {
-										...c,
-										sourceEndSec: probedDuration as number,
-										timelineEndSec: c.timelineStartSec + (probedDuration as number),
-									}
-								: c,
-						),
-					)
-				: oldClips;
-			const nextAssets = doc.assets.map((a) => {
-				if (a.id !== assetId) return a;
-				return {
-					...a,
-					...(correctDuration ? { durationSec: probedDuration as number } : {}),
-					...(needsDims ? { video: { codec: "unknown", fps: 0, ...a.video, ...probedDims } } : {}),
-				};
+		async (identity: InsertClipProbeIdentity, insertionSave: Promise<void>) => {
+			const { projectId, documentGeneration, assetId, clipId, originalPath } = identity;
+			const attemptKey = JSON.stringify([documentGeneration, projectId, assetId, clipId]);
+			const attempt: InsertClipProbeAttempt = {
+				identity,
+				token: Symbol("insert-clip-probe"),
+			};
+			insertClipProbeAttemptsRef.current.set(attemptKey, attempt);
+			const matchesIdentity = (current: ReturnType<typeof useProjectStore.getState>) => {
+				const asset = current.document?.assets.find((candidate) => candidate.id === assetId);
+				const clip = current.document?.timeline.clips.find((candidate) => candidate.id === clipId);
+				return (
+					current.documentGeneration === documentGeneration &&
+					current.projectId === projectId &&
+					current.document?.project.id === projectId &&
+					asset?.originalPath === originalPath &&
+					clip?.assetId === assetId
+				);
+			};
+			let invalidated = !matchesIdentity(useProjectStore.getState());
+			const unsubscribe = useProjectStore.subscribe((current) => {
+				if (!matchesIdentity(current)) invalidated = true;
 			});
-			await state.saveDocument({
-				...doc,
-				assets: nextAssets,
-				timeline: { ...doc.timeline, clips: nextClips },
-			});
+			const isCurrentAttempt = () =>
+				!invalidated &&
+				insertClipProbeAttemptsRef.current.get(attemptKey)?.token === attempt.token &&
+				matchesIdentity(useProjectStore.getState());
+
+			try {
+				try {
+					await insertionSave;
+				} catch {
+					// The insert itself reports this failure. Do not launch detached metadata work for it.
+					return;
+				}
+				if (!isCurrentAttempt()) return;
+
+				const fileUrl = toFileUrl(originalPath);
+				// Dims probed alongside duration — otherwise `asset.video` stays permanently unset for
+				// most recordings (nothing else populates it), silently breaking anything that reads
+				// real source dimensions later (e.g. the export dialog's downscale/upscale badges).
+				const [probedDuration, probedDims] = await Promise.all([
+					probeVideoDuration(fileUrl),
+					probeVideoDimensions(fileUrl),
+				]);
+				if (!isCurrentAttempt()) return;
+
+				await useProjectStore.getState().saveDocumentUpdate(
+					documentGeneration,
+					(current) => {
+						const asset = current.assets.find((candidate) => candidate.id === assetId);
+						const clip = current.timeline.clips.find((candidate) => candidate.id === clipId);
+						if (
+							!asset ||
+							asset.originalPath !== originalPath ||
+							!clip ||
+							clip.assetId !== assetId
+						) {
+							return null;
+						}
+
+						// Metadata already accepted by this generation is newer than this completion.
+						// Use it to correct this clip, but never replace it with an older probe result.
+						const currentDuration =
+							asset.durationSec != null &&
+							Number.isFinite(asset.durationSec) &&
+							asset.durationSec > 0
+								? asset.durationSec
+								: null;
+						const validProbedDuration =
+							probedDuration != null && Number.isFinite(probedDuration) && probedDuration > 0
+								? probedDuration
+								: null;
+						const correctionDuration = currentDuration ?? validProbedDuration;
+						const stillPlaceholder =
+							clip.sourceStartSec === 0 &&
+							Math.abs((clip.sourceEndSec ?? 0) - PLACEHOLDER_DURATION_SEC) < 0.01;
+						const correctDuration = correctionDuration != null && stillPlaceholder;
+						const correctDimensions = probedDims != null && needsSourceDimensions(asset);
+						if (!correctDuration && !correctDimensions) return null;
+
+						// Correct only this inserted clip, then derive every timeline position from clip order.
+						const nextClips = correctDuration
+							? resequenceClips(
+									current.timeline.clips.map((candidate) =>
+										candidate.id === clipId
+											? {
+													...candidate,
+													sourceEndSec: correctionDuration,
+													timelineEndSec: candidate.timelineStartSec + correctionDuration,
+												}
+											: candidate,
+									),
+								)
+							: current.timeline.clips;
+						return {
+							...current,
+							assets: current.assets.map((candidate) =>
+								candidate.id === assetId
+									? {
+											...candidate,
+											...(correctDuration && currentDuration == null
+												? { durationSec: correctionDuration }
+												: {}),
+											...(correctDimensions
+												? {
+														video: {
+															codec: candidate.video?.codec ?? "unknown",
+															fps: candidate.video?.fps ?? 0,
+															width: candidate.video?.width || probedDims.width,
+															height: candidate.video?.height || probedDims.height,
+														},
+													}
+												: {}),
+										}
+									: candidate,
+							),
+							timeline: { ...current.timeline, clips: nextClips },
+						};
+					},
+					isCurrentAttempt,
+				);
+			} finally {
+				unsubscribe();
+				if (insertClipProbeAttemptsRef.current.get(attemptKey)?.token === attempt.token) {
+					insertClipProbeAttemptsRef.current.delete(attemptKey);
+				}
+			}
 		},
 		[],
 	);
@@ -1016,8 +1113,16 @@ export function useTimeline() {
 	// alone (same guard handleLoadedMetadata uses).
 	const insertClipAt = useCallback(
 		async (assetId: string, index: number) => {
-			const currentDoc = useProjectStore.getState().document;
-			if (!currentDoc) return;
+			const currentState = useProjectStore.getState();
+			const currentDoc = currentState.document;
+			if (
+				!currentDoc ||
+				!currentState.projectId ||
+				currentDoc.project.id !== currentState.projectId ||
+				currentState.status !== "ready"
+			) {
+				return;
+			}
 			const asset = currentDoc.assets.find((a) => a.id === assetId);
 			if (!asset) return;
 			// Insert immediately at whatever we know. If the asset has a cached
@@ -1045,22 +1150,32 @@ export function useTimeline() {
 				timeline: { ...currentDoc.timeline, clips: newClips },
 			};
 			const finalDoc = rederiveRegionMs(next, newClips);
-			await saveDocument(finalDoc);
-			setClipSelection(newClip.id);
+			const insertionSave = saveDocument(finalDoc);
 
 			// If we used the placeholder, kick off the probe in the background.
 			// Don't await — the drop is already responsive; the probe will
 			// correct the clip when it lands.
 			if (asset.durationSec == null) {
 				// Detached on purpose (see above), so it needs its own handler: the probe
-				// itself only ever resolves, but it finishes with a `saveDocument`, and
+				// itself only ever resolves, but it finishes with queued persistence, and
 				// that THROWS on a failed write. Losing a background duration correction
 				// is survivable — the clip keeps its placeholder length; an unhandled
 				// rejection is not.
-				void probeAndCorrectClip(assetId, newClip.id, asset.originalPath).catch((err) => {
+				void probeAndCorrectClip(
+					{
+						projectId: currentState.projectId,
+						documentGeneration: currentState.documentGeneration,
+						assetId,
+						clipId: newClip.id,
+						originalPath: asset.originalPath,
+					},
+					insertionSave,
+				).catch((err) => {
 					console.warn("[timeline] background duration probe failed to save:", err);
 				});
 			}
+			await insertionSave;
+			setClipSelection(newClip.id);
 		},
 		[saveDocument, probeAndCorrectClip],
 	);
