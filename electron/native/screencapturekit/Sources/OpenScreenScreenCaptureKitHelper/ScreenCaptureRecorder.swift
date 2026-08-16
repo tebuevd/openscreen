@@ -150,6 +150,8 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	private var didEmitRecordingStarted = false
 	private var didReportWriterFailure = false
 	private var isStopping = false
+	private var didFinishStopping = false
+	private var stopWaiters: [CheckedContinuation<Void, Never>] = []
 	private var isPaused = false
 	private var pauseStartedAt: CMTime?
 	private var totalPausedDuration = CMTime.zero
@@ -219,6 +221,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			return true
 		}
 		if !shouldStop {
+			await waitForStopCompletion()
 			return
 		}
 
@@ -233,6 +236,34 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		}
 
 		await finishWriter()
+		completeStop()
+	}
+
+	private func waitForStopCompletion() async {
+		await withCheckedContinuation { continuation in
+			let shouldResume = stateQueue.sync {
+				if didFinishStopping {
+					return true
+				}
+				stopWaiters.append(continuation)
+				return false
+			}
+			if shouldResume {
+				continuation.resume()
+			}
+		}
+	}
+
+	private func completeStop() {
+		let waiters = stateQueue.sync {
+			didFinishStopping = true
+			let waiters = stopWaiters
+			stopWaiters.removeAll()
+			return waiters
+		}
+		for waiter in waiters {
+			waiter.resume()
+		}
 	}
 
 	func pause() {
@@ -671,7 +702,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	}
 
 	private func finishWriter() async {
-		guard let writer else {
+		guard let writer, didStartWriting else {
 			return
 		}
 
@@ -864,24 +895,17 @@ struct OpenScreenScreenCaptureKitHelper {
 			let decoder = JSONDecoder()
 			let request = try decoder.decode(RecordingRequest.self, from: requestData)
 			let recorder = ScreenCaptureRecorder(request: request)
-			let stopTask = Task.detached {
-				while let line = readLine() {
-					let command = line.trimmingCharacters(in: .whitespacesAndNewlines)
-					switch command {
-					case "pause":
-						recorder.pause()
-					case "resume":
-						recorder.resume()
-					case "stop":
-						await recorder.stop()
-						exit(0)
-					default:
-						break
-					}
-				}
-			}
 
 			try await recorder.start()
+			let stopTask = Task.detached {
+				await CaptureCommandLoop.run(
+					nextLine: { readLine() },
+					pause: { recorder.pause() },
+					resume: { recorder.resume() },
+					stopAndFinalize: { await recorder.stop() }
+				)
+			}
+
 			await stopTask.value
 		} catch let error as HelperError {
 			emitError(code: "helper-error", message: error.description)

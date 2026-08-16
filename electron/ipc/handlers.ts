@@ -2519,7 +2519,7 @@ export function registerIpcHandlers(
 				stdio: ["pipe", "pipe", "pipe"],
 			});
 			startingProc = proc;
-			const processOutput = new NativeMacCaptureOutput(proc);
+			const processOutput = new NativeMacCaptureOutput(proc, outputPath);
 			startingProcessOutput = processOutput;
 			nativeMacCaptureProcess = proc;
 			nativeMacCaptureProcessOutput = processOutput;

@@ -41,6 +41,10 @@ function asProc(helper: FakeMacHelper) {
 	return helper as unknown as ChildProcessWithoutNullStreams;
 }
 
+function captureOutput(helper: FakeMacHelper, targetPath = "/recordings/complete.mp4") {
+	return new NativeMacCaptureOutput(asProc(helper), targetPath);
+}
+
 type WriteCallback = (error?: Error | null) => void;
 
 function mockStdinWrite(
@@ -79,8 +83,8 @@ describe("NativeMacCaptureOutput", () => {
 	it("keeps helper output and events isolated by process", () => {
 		const oldHelper = new FakeMacHelper();
 		const newHelper = new FakeMacHelper();
-		const oldOutput = new NativeMacCaptureOutput(asProc(oldHelper));
-		const newOutput = new NativeMacCaptureOutput(asProc(newHelper));
+		const oldOutput = captureOutput(oldHelper, "/recordings/old.mp4");
+		const newOutput = captureOutput(newHelper, "/recordings/new.mp4");
 		const oldEvents: Array<Record<string, unknown>> = [];
 		const newEvents: Array<Record<string, unknown>> = [];
 		oldOutput.onEvent((event) => oldEvents.push(event));
@@ -99,6 +103,24 @@ describe("NativeMacCaptureOutput", () => {
 		expect(oldOutput.events).toHaveLength(0);
 		expect(oldEvents).toHaveLength(1);
 		expect(newEvents).toEqual([{ event: "ready", schemaVersion: 1 }]);
+	});
+
+	it("retains terminal events only for their owning process and path", () => {
+		const oldHelper = new FakeMacHelper();
+		const newHelper = new FakeMacHelper();
+		const oldOutput = captureOutput(oldHelper, "/recordings/old.mp4");
+		const newOutput = captureOutput(newHelper, "/recordings/new.mp4");
+
+		oldHelper.stdout.write('{"event":"recording-stopped","screenPath":"/recordings/new.mp4"}\n');
+		expect(oldOutput.recordingStoppedEvent).toBeNull();
+		expect(newOutput.recordingStoppedEvent).toBeNull();
+
+		oldHelper.stdout.write('{"event":"recording-stopped","screenPath":"/recordings/old.mp4"}\n');
+		expect(oldOutput.recordingStoppedEvent).toEqual({
+			event: "recording-stopped",
+			screenPath: "/recordings/old.mp4",
+		});
+		expect(newOutput.recordingStoppedEvent).toBeNull();
 	});
 });
 
@@ -128,24 +150,24 @@ describe("terminateNativeMacCapture", () => {
 });
 
 describe("stopNativeMacCapture", () => {
-	it("completes immediately when the helper closed successfully before stop registration", async () => {
+	it("rejects immediately when a clean helper exit has no terminal event", async () => {
 		const helper = new FakeMacHelper();
-		const output = new NativeMacCaptureOutput(asProc(helper));
+		const output = captureOutput(helper);
 		const write = vi.spyOn(helper.stdin, "write");
 		helper.exitCode = 0;
 		const baselineCloseListeners = helper.listenerCount("close");
 		const baselineErrorListeners = helper.listenerCount("error");
 		const baselineStdinErrorListeners = helper.stdin.listenerCount("error");
 
-		await expect(
-			stopNativeMacCapture({
-				proc: asProc(helper),
-				output,
-				targetPath: "/recordings/complete.mp4",
-				timeoutMs: 100,
-			}),
-		).resolves.toEqual({ ok: true, screenVideoPath: "/recordings/complete.mp4" });
+		const result = await stopNativeMacCapture({
+			proc: asProc(helper),
+			output,
+			targetPath: "/recordings/complete.mp4",
+			timeoutMs: 100,
+		});
 
+		expect(result).toMatchObject({ ok: false, exited: true });
+		if (!result.ok) expect(result.error.message).toMatch(/authoritative recording-stopped event/);
 		expect(write).not.toHaveBeenCalled();
 		expect(helper.listenerCount("close")).toBe(baselineCloseListeners);
 		expect(helper.listenerCount("error")).toBe(baselineErrorListeners);
@@ -153,37 +175,118 @@ describe("stopNativeMacCapture", () => {
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	it("handles exit racing the terminal check and listener registration", async () => {
+	it("retains a terminal event received before stop waiter registration", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-mac-stop-"));
+		temporaryDirectories.push(directory);
+		const targetPath = path.join(directory, "complete.mp4");
+		await fs.writeFile(targetPath, "complete capture");
 		const helper = new FakeMacHelper();
-		const output = new NativeMacCaptureOutput(asProc(helper));
+		const output = captureOutput(helper, targetPath);
 		const write = vi.spyOn(helper.stdin, "write");
-		let exitCodeReads = 0;
-		Object.defineProperty(helper, "exitCode", {
-			configurable: true,
-			get() {
-				exitCodeReads += 1;
-				return exitCodeReads >= 2 ? 0 : null;
-			},
-		});
+		helper.stdout.write(
+			`${JSON.stringify({ event: "recording-stopped", screenPath: targetPath })}\n`,
+		);
 
 		await expect(
 			stopNativeMacCapture({
 				proc: asProc(helper),
 				output,
-				targetPath: "/recordings/complete.mp4",
+				targetPath,
 				timeoutMs: 100,
 			}),
-		).resolves.toEqual({ ok: true, screenVideoPath: "/recordings/complete.mp4" });
+		).resolves.toEqual({ ok: true, screenVideoPath: targetPath });
 		expect(write).not.toHaveBeenCalled();
 		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("accepts an authoritative event immediately followed by process close", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-mac-stop-"));
+		temporaryDirectories.push(directory);
+		const targetPath = path.join(directory, "complete.mp4");
+		await fs.writeFile(targetPath, "complete capture");
+		const helper = new FakeMacHelper();
+		const output = captureOutput(helper, targetPath);
+
+		const pending = stopNativeMacCapture({
+			proc: asProc(helper),
+			output,
+			targetPath,
+			timeoutMs: 100,
+		});
+		helper.stdout.write(
+			`${JSON.stringify({ event: "recording-stopped", screenPath: targetPath })}\n`,
+		);
+		helper.exitCode = 0;
+		helper.emit("close", 0, null);
+
+		await expect(pending).resolves.toEqual({ ok: true, screenVideoPath: targetPath });
+		expect(helper.killSignals).toEqual([]);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it.each([
+		["missing", "missing.mp4"],
+		["empty", "empty.mp4"],
+		["non-file", "directory.mp4"],
+	])("rejects a terminal event whose output is %s", async (kind, name) => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-mac-stop-"));
+		temporaryDirectories.push(directory);
+		const targetPath = path.join(directory, name);
+		if (kind === "empty") await fs.writeFile(targetPath, "");
+		if (kind === "non-file") await fs.mkdir(targetPath);
+		const helper = new FakeMacHelper();
+		const output = captureOutput(helper, targetPath);
+
+		const pending = stopNativeMacCapture({
+			proc: asProc(helper),
+			output,
+			targetPath,
+			timeoutMs: 100,
+		});
+		helper.stdout.write(
+			`${JSON.stringify({ event: "recording-stopped", screenPath: targetPath })}\n`,
+		);
+
+		const result = await pending;
+		expect(result).toMatchObject({ ok: false, exited: true });
+		if (!result.ok) expect(result.error.message).toMatch(/missing|unreadable|empty|regular file/);
+		expect(helper.killSignals).toEqual(["SIGTERM"]);
+	});
+
+	it("rejects a terminal event for a path not owned by its helper", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-mac-stop-"));
+		temporaryDirectories.push(directory);
+		const targetPath = path.join(directory, "owned.mp4");
+		const wrongPath = path.join(directory, "wrong.mp4");
+		await Promise.all([
+			fs.writeFile(targetPath, "owned capture"),
+			fs.writeFile(wrongPath, "wrong capture"),
+		]);
+		const helper = new FakeMacHelper();
+		const output = captureOutput(helper, targetPath);
+
+		const pending = stopNativeMacCapture({
+			proc: asProc(helper),
+			output,
+			targetPath,
+			timeoutMs: 100,
+		});
+		helper.stdout.write(
+			`${JSON.stringify({ event: "recording-stopped", screenPath: wrongPath })}\n`,
+		);
+
+		const result = await pending;
+		expect(result).toMatchObject({ ok: false, exited: true });
+		if (!result.ok) expect(result.error.message).toMatch(/unexpected output path/);
+		expect(output.recordingStoppedEvent).toBeNull();
 	});
 
 	it("escalates a stop timeout without affecting a newer helper", async () => {
 		const failedHelper = new FakeMacHelper();
 		failedHelper.diesOnTerm = false;
 		const newerHelper = new FakeMacHelper();
-		const failedOutput = new NativeMacCaptureOutput(asProc(failedHelper));
-		new NativeMacCaptureOutput(asProc(newerHelper));
+		const failedOutput = captureOutput(failedHelper, "/recordings/partial.mp4");
+		captureOutput(newerHelper, "/recordings/new.mp4");
 
 		const pending = stopNativeMacCapture({
 			proc: asProc(failedHelper),
@@ -203,13 +306,17 @@ describe("stopNativeMacCapture", () => {
 		expect(failedHelper.listenerCount("error")).toBe(0);
 		expect(failedHelper.stdin.listenerCount("error")).toBe(0);
 		expect(vi.getTimerCount()).toBe(0);
+		failedHelper.stdout.write(
+			'{"event":"recording-stopped","screenPath":"/recordings/partial.mp4"}\n',
+		);
+		expect(failedOutput.recordingStoppedEvent).toBeNull();
 	});
 
 	it("removes waiter listeners even when the helper survives both stop signals", async () => {
 		const helper = new FakeMacHelper();
 		helper.diesOnTerm = false;
 		helper.diesOnKill = false;
-		const output = new NativeMacCaptureOutput(asProc(helper));
+		const output = captureOutput(helper, "/recordings/partial.mp4");
 		const baselineCloseListeners = helper.listenerCount("close");
 		const baselineErrorListeners = helper.listenerCount("error");
 		const baselineStdinErrorListeners = helper.stdin.listenerCount("error");
@@ -234,7 +341,7 @@ describe("stopNativeMacCapture", () => {
 
 	it("disposes the waiter and terminates after a synchronous write failure", async () => {
 		const helper = new FakeMacHelper();
-		const output = new NativeMacCaptureOutput(asProc(helper));
+		const output = captureOutput(helper, "/recordings/partial.mp4");
 		const writeError = new Error("write threw");
 		mockStdinWrite(helper, () => {
 			throw writeError;
@@ -257,7 +364,7 @@ describe("stopNativeMacCapture", () => {
 
 	it("disposes the waiter and terminates after an asynchronous write failure", async () => {
 		const helper = new FakeMacHelper();
-		const output = new NativeMacCaptureOutput(asProc(helper));
+		const output = captureOutput(helper, "/recordings/partial.mp4");
 		const writeError = new Error("write callback failed");
 		mockStdinWrite(helper, (callback) => {
 			queueMicrotask(() => callback?.(writeError));
@@ -278,7 +385,7 @@ describe("stopNativeMacCapture", () => {
 
 	it("fails immediately when stdin is already closed", async () => {
 		const helper = new FakeMacHelper();
-		const output = new NativeMacCaptureOutput(asProc(helper));
+		const output = captureOutput(helper, "/recordings/partial.mp4");
 		helper.stdin.end();
 
 		const result = await stopNativeMacCapture({
@@ -295,8 +402,12 @@ describe("stopNativeMacCapture", () => {
 	});
 
 	it("accepts backpressure while the queued stop command completes", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-mac-stop-"));
+		temporaryDirectories.push(directory);
+		const targetPath = path.join(directory, "complete.mp4");
+		await fs.writeFile(targetPath, "complete capture");
 		const helper = new FakeMacHelper();
-		const output = new NativeMacCaptureOutput(asProc(helper));
+		const output = captureOutput(helper, targetPath);
 		mockStdinWrite(helper, (callback) => {
 			queueMicrotask(() => callback?.());
 			return false;
@@ -305,14 +416,16 @@ describe("stopNativeMacCapture", () => {
 		const pending = stopNativeMacCapture({
 			proc: asProc(helper),
 			output,
-			targetPath: "/recordings/complete.mp4",
+			targetPath,
 			timeoutMs: 100,
 		});
-		helper.stdout.write('{"event":"recording-stopped","screenPath":"/recordings/complete.mp4"}\n');
+		helper.stdout.write(
+			`${JSON.stringify({ event: "recording-stopped", screenPath: targetPath })}\n`,
+		);
 
 		await expect(pending).resolves.toEqual({
 			ok: true,
-			screenVideoPath: "/recordings/complete.mp4",
+			screenVideoPath: targetPath,
 		});
 		expect(helper.killSignals).toEqual([]);
 		expect(vi.getTimerCount()).toBe(0);
@@ -327,8 +440,8 @@ describe("teardownFailedNativeMacCapture", () => {
 		await fs.writeFile(outputPath, "partial");
 		const failedHelper = new FakeMacHelper();
 		const newerHelper = new FakeMacHelper();
-		const failedOutput = new NativeMacCaptureOutput(asProc(failedHelper));
-		new NativeMacCaptureOutput(asProc(newerHelper));
+		const failedOutput = captureOutput(failedHelper, outputPath);
+		captureOutput(newerHelper, path.join(directory, "new.mp4"));
 
 		await expect(
 			teardownFailedNativeMacCapture({
@@ -351,7 +464,7 @@ describe("teardownFailedNativeMacCapture", () => {
 		await expect(
 			teardownFailedNativeMacCapture({
 				proc: asProc(helper),
-				output: new NativeMacCaptureOutput(asProc(helper)),
+				output: captureOutput(helper, "/recordings/partial.mp4"),
 				outputPath: "/recordings/partial.mp4",
 				removeFile: async () => Promise.reject(cleanupError),
 				warn,
@@ -368,7 +481,7 @@ describe("teardownFailedNativeMacCapture", () => {
 		const helper = new FakeMacHelper();
 		helper.diesOnTerm = false;
 		helper.diesOnKill = false;
-		const output = new NativeMacCaptureOutput(asProc(helper));
+		const output = captureOutput(helper, "/recordings/partial.mp4");
 		helper.stdout.write('{"event":"ready"}\n');
 		const outputBeforeTeardown = output.output;
 		const removeFile = vi.fn(async () => undefined);
@@ -400,7 +513,7 @@ describe("teardownFailedNativeMacCapture", () => {
 		await expect(
 			teardownFailedNativeMacCapture({
 				proc: asProc(helper),
-				output: new NativeMacCaptureOutput(asProc(helper)),
+				output: captureOutput(helper, "/recordings/partial.mp4"),
 				outputPath: "/recordings/partial.mp4",
 				removeFile: async () => Promise.reject(new Error("disk busy")),
 				warn: () => {
