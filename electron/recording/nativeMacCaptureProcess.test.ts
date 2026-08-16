@@ -362,7 +362,7 @@ describe("stopNativeMacCapture", () => {
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	it("disposes the waiter and terminates after an asynchronous write failure", async () => {
+	it("terminates after a write callback failure before any terminal event", async () => {
 		const helper = new FakeMacHelper();
 		const output = captureOutput(helper, "/recordings/partial.mp4");
 		const writeError = new Error("write callback failed");
@@ -380,6 +380,45 @@ describe("stopNativeMacCapture", () => {
 
 		expect(result).toEqual({ ok: false, error: writeError, exited: true });
 		expect(helper.killSignals).toEqual(["SIGTERM"]);
+		expect(vi.getTimerCount()).toBe(0);
+	});
+
+	it("ignores a late write callback error while terminal file validation is pending", async () => {
+		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-mac-stop-"));
+		temporaryDirectories.push(directory);
+		const targetPath = path.join(directory, "complete.mp4");
+		await fs.writeFile(targetPath, "complete capture");
+		const stats = await fs.stat(targetPath);
+		let resolveStat: (_stats: typeof stats) => void = () => undefined;
+		vi.spyOn(fs, "stat").mockReturnValueOnce(
+			new Promise<typeof stats>((resolve) => {
+				resolveStat = resolve;
+			}),
+		);
+		const helper = new FakeMacHelper();
+		const output = captureOutput(helper, targetPath);
+		let completeWrite: WriteCallback = () => {
+			throw new Error("stop command callback was not registered");
+		};
+		mockStdinWrite(helper, (callback) => {
+			if (callback) completeWrite = callback;
+			return true;
+		});
+
+		const pending = stopNativeMacCapture({
+			proc: asProc(helper),
+			output,
+			targetPath,
+			timeoutMs: 100,
+		});
+		helper.stdout.write(
+			`${JSON.stringify({ event: "recording-stopped", screenPath: targetPath })}\n`,
+		);
+		completeWrite(Object.assign(new Error("write EPIPE"), { code: "EPIPE" }));
+		resolveStat(stats);
+
+		await expect(pending).resolves.toEqual({ ok: true, screenVideoPath: targetPath });
+		expect(helper.killSignals).toEqual([]);
 		expect(vi.getTimerCount()).toBe(0);
 	});
 

@@ -333,7 +333,7 @@ function requestNativeMacCaptureStop(options: {
 
 		try {
 			const accepted = proc.stdin.write("stop\n", (error) => {
-				if (error) fail(error);
+				if (error && !validatingTerminalEvent) fail(error);
 			});
 			if (!accepted) {
 				// The command is queued. Its callback or the child close/error event owns completion.
