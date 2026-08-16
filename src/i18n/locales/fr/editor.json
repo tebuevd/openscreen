@@ -193,7 +193,8 @@
 		"exportFailed": "Échec de l'export",
 		"failedToWriteFile": "Échec de l'écriture du fichier",
 		"qualityUpscaleWarning": "Upscaling",
-		"nothingToExport": "Rien à exporter — la timeline est vide."
+		"nothingToExport": "Rien à exporter — la timeline est vide.",
+		"dimensionsUnavailable": "Impossible de déterminer les dimensions d’export. Rouvrez le projet pour relancer l’analyse du média, puis réessayez l’export."
 	},
 	"inspector": {
 		"resetFocusPoint": "Réinitialiser le point de focus",

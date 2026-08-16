@@ -193,7 +193,8 @@
 		"exportFailed": "Export failed",
 		"failedToWriteFile": "Failed to write file",
 		"qualityUpscaleWarning": "Upscale",
-		"nothingToExport": "Nothing to export — the timeline is empty."
+		"nothingToExport": "Nothing to export — the timeline is empty.",
+		"dimensionsUnavailable": "Export dimensions could not be determined. Reopen the project to retry media analysis, then export again."
 	},
 	"inspector": {
 		"resetFocusPoint": "Reset focus point",

@@ -193,7 +193,8 @@
 		"failedToWriteFile": "Không thể ghi tệp",
 		"qualityUpscaleWarning": "Upscale",
 		"exportedVideoOf": "video đã xuất trong",
-		"nothingToExport": "Không có gì để xuất — dòng thời gian trống."
+		"nothingToExport": "Không có gì để xuất — dòng thời gian trống.",
+		"dimensionsUnavailable": "Không thể xác định kích thước xuất. Hãy mở lại dự án để thử phân tích phương tiện, rồi xuất lại."
 	},
 	"inspector": {
 		"resetFocusPoint": "Đặt lại điểm lấy nét",

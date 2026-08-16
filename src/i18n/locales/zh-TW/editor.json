@@ -193,7 +193,8 @@
 		"failedToWriteFile": "寫入檔案失敗",
 		"qualityUpscaleWarning": "放大",
 		"exportedVideoOf": "的影片已匯出，耗時",
-		"nothingToExport": "沒有可匯出的內容 — 時間軸為空。"
+		"nothingToExport": "沒有可匯出的內容 — 時間軸為空。",
+		"dimensionsUnavailable": "無法確定匯出尺寸。請重新開啟專案以重試媒體分析，然後再次匯出。"
 	},
 	"inspector": {
 		"resetFocusPoint": "重設焦點",

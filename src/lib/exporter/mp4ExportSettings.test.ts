@@ -1,9 +1,27 @@
 import { describe, expect, it } from "vitest";
+import { ASPECT_RATIO_PRESETS, type AspectRatio } from "@/utils/aspectRatioUtils";
 import {
 	calculateEffectiveSourceDimensions,
 	calculateMp4ExportSettings,
+	resolveMp4ExportSettings,
 	wouldUpscale,
 } from "./mp4ExportSettings";
+
+function resolvedSettings(
+	quality: "medium" | "good" | "source",
+	aspectRatio: AspectRatio,
+	sourceDimensions: { width: number; height: number } | null,
+	originalDimensions = sourceDimensions,
+) {
+	const result = resolveMp4ExportSettings({
+		quality,
+		aspectRatio,
+		sourceDimensions,
+		originalDimensions,
+	});
+	if (!result.ok) throw new Error(`Expected settings, received ${result.reason}`);
+	return result.settings;
+}
 
 describe("calculateMp4ExportSettings", () => {
 	it("keeps 1080p explicit even when it upscales short native captures", () => {
@@ -178,6 +196,80 @@ describe("calculateMp4ExportSettings", () => {
 			width: 1920,
 			height: 1080,
 			bitrate: 20_000_000,
+		});
+	});
+});
+
+describe("resolveMp4ExportSettings", () => {
+	it("preserves 2880x1864 for Original + Source", () => {
+		expect(resolvedSettings("source", "native", { width: 2880, height: 1864 })).toMatchObject({
+			width: 2880,
+			height: 1864,
+		});
+	});
+
+	it("keeps the default 16:9 + 1080p output at 1920x1080 without source metadata", () => {
+		expect(resolvedSettings("good", "16:9", null)).toMatchObject({
+			width: 1920,
+			height: 1080,
+		});
+	});
+
+	it("resolves both fixed tiers for every predefined aspect ratio without source metadata", () => {
+		for (const aspectRatio of ASPECT_RATIO_PRESETS) {
+			for (const quality of ["medium", "good"] as const) {
+				const settings = resolvedSettings(quality, aspectRatio, null);
+				expect(Number.isInteger(settings.width), `${quality} ${aspectRatio} width`).toBe(true);
+				expect(Number.isInteger(settings.height), `${quality} ${aspectRatio} height`).toBe(true);
+				expect(settings.width, `${quality} ${aspectRatio} width`).toBeGreaterThan(0);
+				expect(settings.height, `${quality} ${aspectRatio} height`).toBeGreaterThan(0);
+				expect(settings.width % 2, `${quality} ${aspectRatio} width`).toBe(0);
+				expect(settings.height % 2, `${quality} ${aspectRatio} height`).toBe(0);
+			}
+		}
+	});
+
+	it("keeps vertical and square fixed outputs concrete", () => {
+		expect(resolvedSettings("medium", "9:16", null)).toMatchObject({
+			width: 720,
+			height: 1280,
+		});
+		expect(resolvedSettings("good", "1:1", null)).toMatchObject({
+			width: 1080,
+			height: 1080,
+		});
+	});
+
+	it.each([
+		["missing", null],
+		["zero", { width: 0, height: 1080 }],
+		["non-integer", { width: 1920.5, height: 1080 }],
+		["non-finite", { width: Number.POSITIVE_INFINITY, height: 1080 }],
+	])("blocks Source when %s source metadata is supplied", (_label, sourceDimensions) => {
+		expect(
+			resolveMp4ExportSettings({
+				quality: "source",
+				aspectRatio: "16:9",
+				sourceDimensions,
+			}),
+		).toEqual({ ok: false, reason: "source-dimensions-unavailable" });
+	});
+
+	it("blocks Original when source metadata cannot resolve its frame shape", () => {
+		expect(
+			resolveMp4ExportSettings({
+				quality: "good",
+				aspectRatio: "native",
+				sourceDimensions: null,
+				originalDimensions: null,
+			}),
+		).toEqual({ ok: false, reason: "original-dimensions-unavailable" });
+	});
+
+	it("resolves a valid Source export without changing its dimensions", () => {
+		expect(resolvedSettings("source", "16:9", { width: 2560, height: 1440 })).toMatchObject({
+			width: 2560,
+			height: 1440,
 		});
 	});
 });

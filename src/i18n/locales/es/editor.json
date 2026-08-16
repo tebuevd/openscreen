@@ -193,7 +193,8 @@
 		"failedToWriteFile": "No se pudo escribir el archivo",
 		"qualityUpscaleWarning": "Upscaling",
 		"exportedVideoOf": "de vídeo exportado en",
-		"nothingToExport": "Nada que exportar: la línea de tiempo está vacía."
+		"nothingToExport": "Nada que exportar: la línea de tiempo está vacía.",
+		"dimensionsUnavailable": "No se pudieron determinar las dimensiones de exportación. Vuelve a abrir el proyecto para repetir el análisis del archivo y exporta de nuevo."
 	},
 	"inspector": {
 		"resetFocusPoint": "Restablecer punto de enfoque",

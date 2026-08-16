@@ -193,7 +193,8 @@
 		"failedToWriteFile": "Impossibile scrivere il file",
 		"qualityUpscaleWarning": "Upscaling",
 		"exportedVideoOf": "di video esportato in",
-		"nothingToExport": "Niente da esportare: la timeline è vuota."
+		"nothingToExport": "Niente da esportare: la timeline è vuota.",
+		"dimensionsUnavailable": "Impossibile determinare le dimensioni di esportazione. Riapri il progetto per ripetere l’analisi del file multimediale, quindi esporta di nuovo."
 	},
 	"inspector": {
 		"resetFocusPoint": "Reimposta punto di messa a fuoco",

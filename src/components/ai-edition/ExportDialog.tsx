@@ -32,7 +32,13 @@ import {
 	type GifFrameRate,
 	type GifSizePreset,
 } from "@/lib/exporter";
-import { calculateMp4ExportSettings, wouldUpscale } from "@/lib/exporter/mp4ExportSettings";
+import {
+	calculateMp4ExportSettings,
+	hasValidExportSourceDimensions,
+	type Mp4ExportSettings,
+	resolveMp4ExportSettings,
+	wouldUpscale,
+} from "@/lib/exporter/mp4ExportSettings";
 import { exportGifNative, exportMultiNative, useIsCpuCompositor } from "@/native";
 import type { CompositorClipInput } from "@/native/contracts";
 import { buildSceneDescription, resolveVisibleClips } from "@/native/sceneDescription";
@@ -144,11 +150,6 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 		() => (document ? collectEffectiveClipDims(document) : []),
 		[document],
 	);
-	// (The "largest clip" pick lived here for the old renderer-side GIF path, which
-	// sized to the best available footage independently of the quality tier. GIF now
-	// goes through the same native exporter as MP4 and shares its sizing, so only the
-	// smallest-clip pick below is still needed.)
-
 	// Smallest clip's true (cropped) footprint on the timeline — a multiclip timeline can mix
 	// crops/resolutions, so this is what "Source" quality actually targets: sizing to the
 	// SMALLEST clip's own resolution means no clip on the timeline is ever upscaled past its
@@ -158,15 +159,36 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 		() => pickExtremeDims(effectiveClipDims, "smallest"),
 		[effectiveClipDims],
 	);
+	const largestSource = useMemo(
+		() => pickExtremeDims(effectiveClipDims, "largest"),
+		[effectiveClipDims],
+	);
+	// Source and legacy Original exports must not infer readiness from a partial list: if any clip
+	// that will reach native export still lacks valid asset metadata, fail closed at submission.
+	const hasCompleteSourceMetadata = useMemo(() => {
+		if (!document) return false;
+		const assetById = new Map(document.assets.map((asset) => [asset.id, asset]));
+		const visibleClips = resolveVisibleClips(document);
+		return (
+			visibleClips.length > 0 &&
+			visibleClips.every((clip) => {
+				const video = assetById.get(clip.assetId)?.video;
+				return hasValidExportSourceDimensions(video ?? null);
+			})
+		);
+	}, [document]);
+	const validatedSmallestSource = hasCompleteSourceMetadata ? smallestSource : null;
+	const validatedLargestSource = hasCompleteSourceMetadata ? largestSource : null;
 
 	// Aspect the export normalizes to: the timeline's selected ratio (mirrors documentExporter),
 	// so the sizes shown match what the export produces. Read through `getEditorSettings` — the
 	// same typed façade the ratio dropdown writes through and `buildSceneDescription` reads — so
-	// this dialog can't drift from the compositor if the storage ever moves. `resolveAspectRatioValue`
-	// owns the legacy "native" case (uncropped reference asset), previously hand-rolled here.
+	// this dialog can't drift from the compositor if the storage ever moves. GIF still consumes the
+	// numeric value; MP4 receives the token so legacy Original cannot silently resolve to 16:9.
+	const exportAspectRatio = useMemo(() => getEditorSettings(document).aspectRatio, [document]);
 	const EXPORT_ASPECT = useMemo(
-		() => resolveAspectRatioValue(document, getEditorSettings(document).aspectRatio),
-		[document],
+		() => resolveAspectRatioValue(document, exportAspectRatio),
+		[document, exportAspectRatio],
 	);
 	// Output dimensions the export will produce for a given tier, from the (crop-aware)
 	// SMALLEST clip on the timeline — see `smallestSource` above for why. Only "Source"
@@ -192,15 +214,17 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 		return { width: even(tierDims.width), height: even(tierDims.height) };
 	};
 
-	const tierOutputDims = (value: ExportQuality) =>
-		smallestSource
-			? calculateMp4ExportSettings({
-					quality: value,
-					sourceWidth: smallestSource.width,
-					sourceHeight: smallestSource.height,
-					aspectRatioValue: EXPORT_ASPECT,
-				})
-			: null;
+	const resolveMp4Tier = (value: ExportQuality) =>
+		resolveMp4ExportSettings({
+			quality: value,
+			aspectRatio: exportAspectRatio,
+			sourceDimensions: validatedSmallestSource,
+			originalDimensions: validatedLargestSource,
+		});
+	const tierOutputDims = (value: ExportQuality) => {
+		const resolution = resolveMp4Tier(value);
+		return resolution.ok ? resolution.settings : null;
+	};
 
 	useEffect(() => {
 		if (!open) {
@@ -224,6 +248,17 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 			setError(t("exportDialog.addVideoBeforeExporting"));
 			setPhase("error");
 			return;
+		}
+		const dimensionsUnavailable = t("exportDialog.dimensionsUnavailable");
+		let mp4Output: Mp4ExportSettings | null = null;
+		if (format === "mp4") {
+			const resolution = resolveMp4Tier(quality);
+			if (!resolution.ok) {
+				setError(dimensionsUnavailable);
+				setPhase("error");
+				return;
+			}
+			mp4Output = resolution.settings;
 		}
 
 		const safeName = (document.project.title || "OpenScreen")
@@ -287,26 +322,40 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 			});
 			try {
 				const sceneJson = JSON.stringify(buildSceneDescription(document));
-				const outDims = tierOutputDims(quality);
+				// Preserve GIF's existing metadata fallback. The MP4 resolver above is intentionally
+				// stricter and must not change another format's sizing behavior.
+				const gifTierDims = smallestSource
+					? calculateMp4ExportSettings({
+							quality,
+							sourceWidth: smallestSource.width,
+							sourceHeight: smallestSource.height,
+							aspectRatioValue: EXPORT_ASPECT,
+						})
+					: null;
 				if (clips.length === 0) {
 					throw new Error(t("exportDialog.nothingToExport"));
 				}
-				const stats =
-					format === "gif"
-						? await exportGifNative(clips, pickedPath, sceneJson, {
-								// GIF is 256-colour and grows fast; cap the long edge at the
-								// chosen preset rather than exporting at source size.
-								...gifOutputDims(gifSize, outDims),
-								fps: gifFrameRate,
-								// 0 = infinite, the historical GIF default; 1 = play once.
-								loopCount: gifLoop ? 0 : 1,
-							})
-						: await exportMultiNative(clips, pickedPath, sceneJson, {
-								width: outDims?.width,
-								height: outDims?.height,
-								fps,
-								codec,
-							});
+				let stats: { videoDurationS: number; wallS: number };
+				if (format === "gif") {
+					stats = await exportGifNative(clips, pickedPath, sceneJson, {
+						// GIF is 256-colour and grows fast; cap the long edge at the
+						// chosen preset rather than exporting at source size.
+						...gifOutputDims(gifSize, gifTierDims),
+						fps: gifFrameRate,
+						// 0 = infinite, the historical GIF default; 1 = play once.
+						loopCount: gifLoop ? 0 : 1,
+					});
+				} else {
+					if (!mp4Output) {
+						throw new Error(dimensionsUnavailable);
+					}
+					stats = await exportMultiNative(clips, pickedPath, sceneJson, {
+						width: mp4Output.width,
+						height: mp4Output.height,
+						fps,
+						codec,
+					});
+				}
 				setSavedPath(pickedPath);
 				setPhase("done");
 				toast.success(t("exportDialog.exportedVideo"), {

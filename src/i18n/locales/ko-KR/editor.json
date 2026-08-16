@@ -193,7 +193,8 @@
 		"failedToWriteFile": "파일 쓰기에 실패했습니다",
 		"qualityUpscaleWarning": "업스케일",
 		"exportedVideoOf": "분량의 영상을 내보냈습니다. 소요 시간:",
-		"nothingToExport": "내보낼 항목이 없습니다 — 타임라인이 비어 있습니다."
+		"nothingToExport": "내보낼 항목이 없습니다 — 타임라인이 비어 있습니다.",
+		"dimensionsUnavailable": "내보내기 크기를 확인할 수 없습니다. 프로젝트를 다시 열어 미디어 분석을 재시도한 후 다시 내보내세요."
 	},
 	"inspector": {
 		"resetFocusPoint": "포커스 지점 재설정",

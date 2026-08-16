@@ -193,7 +193,8 @@
 		"failedToWriteFile": "Dosya yazılamadı",
 		"qualityUpscaleWarning": "Upscale",
 		"exportedVideoOf": "video şu sürede dışa aktarıldı:",
-		"nothingToExport": "Dışa aktarılacak bir şey yok — zaman çizelgesi boş."
+		"nothingToExport": "Dışa aktarılacak bir şey yok — zaman çizelgesi boş.",
+		"dimensionsUnavailable": "Dışa aktarma boyutları belirlenemedi. Medya analizini yeniden denemek için projeyi yeniden açın, ardından tekrar dışa aktarın."
 	},
 	"inspector": {
 		"resetFocusPoint": "Odak noktasını sıfırla",

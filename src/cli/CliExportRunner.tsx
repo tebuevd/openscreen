@@ -29,7 +29,11 @@ import { DEFAULT_ZOOM_DEPTH, ZOOM_DEPTH_SCALES } from "@/lib/ai-edition/timeline
 import { buildAutoZoomSuggestions } from "@/lib/ai-edition/timeline/zoom-suggestions";
 import type { CliDoneResult, CliExportRequest } from "@/lib/cliContracts";
 import { GIF_SIZE_PRESETS, type GifSizePreset } from "@/lib/exporter";
-import { calculateMp4ExportSettings } from "@/lib/exporter/mp4ExportSettings";
+import {
+	calculateMp4ExportSettings,
+	hasValidExportSourceDimensions,
+	resolveMp4ExportSettings,
+} from "@/lib/exporter/mp4ExportSettings";
 import { mixVoiceoverIntoVideo } from "@/lib/exporter/voiceoverMix";
 import { exportGifNative, exportMultiNative, nativeBridgeClient } from "@/native";
 import type { CompositorClipInput } from "@/native/contracts";
@@ -221,19 +225,36 @@ async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
 	const probedAssetDims: Record<string, Dims> = {
 		[primaryAssetId]: { width: probed.width, height: probed.height },
 	};
+	const effectiveClipDims = collectEffectiveClipDims(axcutDocument, probedAssetDims);
 	const smallestSource =
-		pickExtremeDims(collectEffectiveClipDims(axcutDocument, probedAssetDims), "smallest") ??
+		pickExtremeDims(effectiveClipDims, "smallest") ??
 		({ width: probed.width, height: probed.height } as Dims);
-	const aspectRatioValue = resolveAspectRatioValue(
-		axcutDocument,
-		getEditorSettings(axcutDocument).aspectRatio,
-	);
+	const largestSource =
+		pickExtremeDims(effectiveClipDims, "largest") ??
+		({ width: probed.width, height: probed.height } as Dims);
+	const aspectRatio = getEditorSettings(axcutDocument).aspectRatio;
+	const aspectRatioValue = resolveAspectRatioValue(axcutDocument, aspectRatio);
 	const outDims = calculateMp4ExportSettings({
 		quality,
 		sourceWidth: smallestSource.width,
 		sourceHeight: smallestSource.height,
 		aspectRatioValue,
 	});
+	const sourceMetadataValid = hasValidExportSourceDimensions(probed);
+	const dimensionsError =
+		"Export dimensions could not be determined from the source video. Verify the media file and retry.";
+	const mp4Resolution =
+		format === "mp4"
+			? resolveMp4ExportSettings({
+					quality,
+					aspectRatio,
+					sourceDimensions: sourceMetadataValid ? smallestSource : null,
+					originalDimensions: sourceMetadataValid ? largestSource : null,
+				})
+			: null;
+	if (mp4Resolution && !mp4Resolution.ok) {
+		throw new Error(dimensionsError);
+	}
 
 	const clips = buildNativeClipList(axcutDocument);
 	if (clips.length === 0) {
@@ -283,9 +304,12 @@ async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
 		// MP4: native writes outPath directly. When a voiceover is requested, mix
 		// it afterwards (the native pipeline has no extra-audio-track concept) and
 		// overwrite the same file.
+		if (!mp4Resolution?.ok) {
+			throw new Error(dimensionsError);
+		}
 		await exportMultiNative(clips, outPath, sceneJson, {
-			width: outDims.width,
-			height: outDims.height,
+			width: mp4Resolution.settings.width,
+			height: mp4Resolution.settings.height,
 			fps: MP4_EXPORT_FPS,
 			codec: "h264",
 		});
@@ -320,8 +344,8 @@ async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
 			success: true,
 			outputPath: outPath,
 			format,
-			width: outDims.width,
-			height: outDims.height,
+			width: mp4Resolution.settings.width,
+			height: mp4Resolution.settings.height,
 		};
 	} finally {
 		unsubscribeProgress?.();

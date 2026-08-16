@@ -1,3 +1,4 @@
+import { type AspectRatio, parseAspectRatio } from "@/utils/aspectRatioUtils";
 import type { ExportQuality } from "./types";
 
 export interface Mp4ExportSettings {
@@ -11,10 +12,20 @@ interface SourceCropRegion {
 	height: number;
 }
 
-interface Dims {
+export interface ExportDimensions {
 	width: number;
 	height: number;
 }
+
+export type Mp4ExportSettingsResolution =
+	| { ok: true; settings: Mp4ExportSettings }
+	| {
+			ok: false;
+			reason:
+				| "source-dimensions-unavailable"
+				| "original-dimensions-unavailable"
+				| "invalid-output-dimensions";
+	  };
 
 /**
  * Would rendering a `source`-sized clip into an `output`-sized frame stretch it past its own
@@ -26,8 +37,19 @@ interface Dims {
  * wallpaper, at scale 1.0: nothing is upscaled. The short-side test called that frame an
  * upscale under the "1080p" tier while "Source" produced the exact same frame unflagged.
  */
-export function wouldUpscale(output: Dims, source: Dims): boolean {
+export function wouldUpscale(output: ExportDimensions, source: ExportDimensions): boolean {
 	return Math.min(output.width / source.width, output.height / source.height) > 1;
+}
+
+export function hasValidExportSourceDimensions(
+	dimensions: ExportDimensions | null | undefined,
+): dimensions is ExportDimensions {
+	return (
+		Number.isSafeInteger(dimensions?.width) &&
+		Number.isSafeInteger(dimensions?.height) &&
+		(dimensions?.width ?? 0) > 0 &&
+		(dimensions?.height ?? 0) > 0
+	);
 }
 
 const MEDIUM_SHORT_SIDE = 720;
@@ -159,4 +181,63 @@ export function calculateMp4ExportSettings({
 		...sourceDimensions,
 		bitrate: calculateBitrate(sourceDimensions.width, sourceDimensions.height, quality),
 	};
+}
+
+/**
+ * Resolves the complete MP4 output pair before export submission. Fixed tiers only need a
+ * concrete aspect ratio; Source needs source pixels, and the legacy Original token needs source
+ * pixels to avoid its historical silent 16:9 fallback.
+ */
+export function resolveMp4ExportSettings({
+	quality,
+	aspectRatio,
+	sourceDimensions,
+	originalDimensions = sourceDimensions,
+}: {
+	quality: ExportQuality;
+	aspectRatio: AspectRatio;
+	sourceDimensions: ExportDimensions | null;
+	originalDimensions?: ExportDimensions | null;
+}): Mp4ExportSettingsResolution {
+	let aspectRatioValue: number;
+	if (aspectRatio === "native") {
+		if (!hasValidExportSourceDimensions(originalDimensions)) {
+			return { ok: false, reason: "original-dimensions-unavailable" };
+		}
+		aspectRatioValue = originalDimensions.width / originalDimensions.height;
+	} else {
+		const parsed = parseAspectRatio(aspectRatio);
+		if (!parsed) {
+			return { ok: false, reason: "invalid-output-dimensions" };
+		}
+		aspectRatioValue = parsed.width / parsed.height;
+	}
+
+	if (quality === "source" && !hasValidExportSourceDimensions(sourceDimensions)) {
+		return { ok: false, reason: "source-dimensions-unavailable" };
+	}
+
+	// The fixed tiers do not read source dimensions. Supplying a valid sentinel keeps the legacy
+	// calculator's required input shape without making 720p/1080p depend on media probing.
+	const source = hasValidExportSourceDimensions(sourceDimensions)
+		? sourceDimensions
+		: { width: 2, height: 2 };
+	const settings = calculateMp4ExportSettings({
+		quality,
+		sourceWidth: source.width,
+		sourceHeight: source.height,
+		aspectRatioValue,
+	});
+	if (
+		!Number.isSafeInteger(settings.width) ||
+		!Number.isSafeInteger(settings.height) ||
+		settings.width <= 0 ||
+		settings.height <= 0 ||
+		settings.width % 2 !== 0 ||
+		settings.height % 2 !== 0
+	) {
+		return { ok: false, reason: "invalid-output-dimensions" };
+	}
+
+	return { ok: true, settings };
 }

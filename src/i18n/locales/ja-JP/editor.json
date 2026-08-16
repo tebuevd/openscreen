@@ -193,7 +193,8 @@
 		"failedToWriteFile": "ファイルの書き込みに失敗しました",
 		"qualityUpscaleWarning": "アップスケール",
 		"exportedVideoOf": "の動画を書き出しました。所要時間:",
-		"nothingToExport": "書き出す内容がありません — タイムラインが空です。"
+		"nothingToExport": "書き出す内容がありません — タイムラインが空です。",
+		"dimensionsUnavailable": "書き出しサイズを特定できません。プロジェクトを開き直してメディア解析を再試行してから、もう一度書き出してください。"
 	},
 	"inspector": {
 		"resetFocusPoint": "フォーカスポイントをリセット",
