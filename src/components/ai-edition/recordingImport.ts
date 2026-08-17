@@ -32,7 +32,9 @@ export async function importPendingRecording(): Promise<PendingRecordingImportRe
 	if (!api) return "none";
 
 	const result = await api.getCurrentRecordingSession();
-	const screenPath = result.success ? result.session?.screenVideoPath : undefined;
+	// Project-file commits also expose their media as the current session for legacy
+	// preview/export consumers, but only recorder hand-offs are eligible for auto-import.
+	const screenPath = result.success && result.pending ? result.session?.screenVideoPath : undefined;
 	if (!screenPath) return "none";
 
 	const label = screenPath.split(/[\\/]/).pop() || "Recording";

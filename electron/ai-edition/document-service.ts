@@ -120,6 +120,8 @@ export class DocumentService {
 	private legacyMigrationDone = false;
 	/** Tail of every read-modify-write operation per project id. */
 	private readonly operationQueues = new Map<string, Promise<void>>();
+	/** Incremented as soon as deletion is requested so an older read cannot escape afterwards. */
+	private readonly deleteGenerations = new Map<string, number>();
 
 	// `mediaRegistryDir` is where the media-links registry file lives
 	// (RECORDINGS_DIR in production) — see getProject. Injected for the same
@@ -214,7 +216,14 @@ export class DocumentService {
 		// Queue the read itself, rather than awaiting a snapshot of the current tail and
 		// then reading outside the queue. This observes every operation invoked first and
 		// prevents a later write from starting between settlement and authoritative readback.
-		return this.enqueueProjectOperation(projectId, () => this.getProjectNow(projectId));
+		const deleteGeneration = this.deleteGenerations.get(projectId) ?? 0;
+		return this.enqueueProjectOperation(projectId, async () => {
+			const document = await this.getProjectNow(projectId);
+			if ((this.deleteGenerations.get(projectId) ?? 0) !== deleteGeneration) {
+				throw new DocumentNotFoundError(projectId);
+			}
+			return document;
+		});
 	}
 
 	private async getProjectNow(projectId: string): Promise<AxcutDocument> {
@@ -274,6 +283,7 @@ export class DocumentService {
 	}
 
 	async deleteProject(projectId: string): Promise<void> {
+		this.deleteGenerations.set(projectId, (this.deleteGenerations.get(projectId) ?? 0) + 1);
 		await this.enqueueProjectOperation(projectId, async () => {
 			// Project-owned sidecars may live under projects/<id>. Source recordings live
 			// in mediaRegistryDir and are deliberately not part of project deletion.

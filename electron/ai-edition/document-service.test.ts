@@ -500,6 +500,27 @@ describe("DocumentService", () => {
 				DocumentNotFoundError,
 			);
 		});
+
+		it("does not return an older read after deletion is requested", async () => {
+			const doc = await service.createProject("Delete during read");
+			const enteredRead = deferred<void>();
+			const releaseRead = deferred<void>();
+			const realReadFile = fs.readFile.bind(fs);
+			const readFile = vi.spyOn(fs, "readFile").mockImplementationOnce(async (...args) => {
+				enteredRead.resolve(undefined);
+				await releaseRead.promise;
+				return realReadFile(...args);
+			});
+
+			const loading = service.getProject(doc.project.id);
+			await enteredRead.promise;
+			const deleting = service.deleteProject(doc.project.id);
+			releaseRead.resolve(undefined);
+
+			await expect(loading).rejects.toBeInstanceOf(DocumentNotFoundError);
+			await deleting;
+			readFile.mockRestore();
+		});
 	});
 
 	// These reproduce a bug that destroyed two real project files: fs.writeFile

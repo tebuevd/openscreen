@@ -305,11 +305,17 @@ contextBridge.exposeInMainWorld("electronAPI", {
 	saveProjectFile: (projectData: unknown, suggestedName?: string, existingProjectPath?: string) => {
 		return ipcRenderer.invoke("save-project-file", projectData, suggestedName, existingProjectPath);
 	},
-	loadProjectFile: (projectFolder?: string) => {
-		return ipcRenderer.invoke("load-project-file", projectFolder);
+	prepareProjectFile: (projectFolder?: string) => {
+		return ipcRenderer.invoke("prepare-project-file", projectFolder);
 	},
-	loadProjectFileFromPath: (filePath: string) => {
-		return ipcRenderer.invoke("load-project-file-from-path", filePath);
+	prepareProjectFileFromPath: (filePath: string) => {
+		return ipcRenderer.invoke("prepare-project-file-from-path", filePath);
+	},
+	commitProjectFileLoad: (preparationId: string) => {
+		return ipcRenderer.invoke("commit-project-file-load", preparationId);
+	},
+	abortProjectFileLoad: (preparationId: string) => {
+		return ipcRenderer.invoke("abort-project-file-load", preparationId);
 	},
 	getPathForFile: (file: File) => {
 		try {
@@ -396,25 +402,28 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		ipcRenderer.on("countdown-overlay-value", listener);
 		return () => ipcRenderer.removeListener("countdown-overlay-value", listener);
 	},
-	onRequestSaveBeforeClose: (callback: () => Promise<boolean> | boolean) => {
-		const listener = async () => {
+	onRequestSaveBeforeClose: (callback: (operationId: number) => Promise<boolean> | boolean) => {
+		const listener = async (_event: unknown, operationId: number) => {
 			try {
-				const shouldClose = await callback();
-				ipcRenderer.send("save-before-close-done", shouldClose);
+				const shouldClose = await callback(operationId);
+				ipcRenderer.send("save-before-close-done", operationId, shouldClose);
 			} catch {
-				ipcRenderer.send("save-before-close-done", false);
+				ipcRenderer.send("save-before-close-done", operationId, false);
 			}
 		};
 		ipcRenderer.on("request-save-before-close", listener);
 		return () => ipcRenderer.removeListener("request-save-before-close", listener);
 	},
-	onRequestCloseConfirm: (callback: () => void) => {
-		const listener = () => callback();
+	onRequestCloseConfirm: (callback: (operationId: number) => void) => {
+		const listener = (_event: unknown, operationId: number) => callback(operationId);
 		ipcRenderer.on("request-close-confirm", listener);
 		return () => ipcRenderer.removeListener("request-close-confirm", listener);
 	},
-	sendCloseConfirmResponse: (choice: "save" | "discard" | "cancel") => {
-		ipcRenderer.send("close-confirm-response", choice);
+	sendCloseConfirmResponse: (
+		operationId: number,
+		choice: "save" | "discard" | "cancel" | "busy",
+	) => {
+		ipcRenderer.send("close-confirm-response", operationId, choice);
 	},
 	// ponytail: forward renderer console output to main-process stdout so
 	// recorder diagnostics land next to the main-process logs in dev output.

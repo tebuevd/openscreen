@@ -17,8 +17,10 @@ const bridgeMocks = vi.hoisted(() => ({
 	create: vi.fn(),
 	save: vi.fn(),
 	addAsset: vi.fn(),
-	loadProjectFile: vi.fn(),
-	loadProjectFileFromPath: vi.fn(),
+	prepareProjectFile: vi.fn(),
+	prepareProjectFileFromPath: vi.fn(),
+	commitProjectFileLoad: vi.fn(),
+	abortProjectFileLoad: vi.fn(),
 	getPathForFile: vi.fn(),
 	openVideoFilePicker: vi.fn(),
 }));
@@ -62,8 +64,10 @@ function setupElectronApi() {
 	Object.assign(window, {
 		electronAPI: {
 			openVideoFilePicker: bridgeMocks.openVideoFilePicker,
-			loadProjectFile: bridgeMocks.loadProjectFile,
-			loadProjectFileFromPath: bridgeMocks.loadProjectFileFromPath,
+			prepareProjectFile: bridgeMocks.prepareProjectFile,
+			prepareProjectFileFromPath: bridgeMocks.prepareProjectFileFromPath,
+			commitProjectFileLoad: bridgeMocks.commitProjectFileLoad,
+			abortProjectFileLoad: bridgeMocks.abortProjectFileLoad,
 			getPathForFile: bridgeMocks.getPathForFile,
 		},
 	});
@@ -96,6 +100,8 @@ describe("EditorEmptyState (new editor)", () => {
 		for (const mock of Object.values(bridgeMocks)) {
 			mock.mockReset();
 		}
+		bridgeMocks.commitProjectFileLoad.mockResolvedValue({ success: true });
+		bridgeMocks.abortProjectFileLoad.mockResolvedValue({ success: true });
 	});
 
 	afterEach(() => {
@@ -211,9 +217,10 @@ describe("EditorEmptyState (new editor)", () => {
 	});
 
 	it("opens a .openscreen project file via the load button", async () => {
-		bridgeMocks.loadProjectFile.mockResolvedValue({
+		bridgeMocks.prepareProjectFile.mockResolvedValue({
 			success: true,
 			project: { id: "loaded", title: "Loaded" },
+			preparationId: "prepared-load",
 		});
 		bridgeMocks.save.mockResolvedValue({ success: true, document: sampleDoc });
 
@@ -224,8 +231,9 @@ describe("EditorEmptyState (new editor)", () => {
 		});
 
 		await waitFor(() => {
-			expect(bridgeMocks.loadProjectFile).toHaveBeenCalledTimes(1);
+			expect(bridgeMocks.prepareProjectFile).toHaveBeenCalledTimes(1);
 			expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+			expect(bridgeMocks.commitProjectFileLoad).toHaveBeenCalledWith("prepared-load");
 			expect(useProjectStore.getState()).toMatchObject({
 				projectId: "proj_test",
 				status: "ready",
@@ -263,9 +271,10 @@ describe("EditorEmptyState (new editor)", () => {
 			dirty: true,
 		});
 		bridgeMocks.getPathForFile.mockReturnValue("/tmp/replacement.openscreen");
-		bridgeMocks.loadProjectFileFromPath.mockResolvedValue({
+		bridgeMocks.prepareProjectFileFromPath.mockResolvedValue({
 			success: true,
 			project: { id: "replacement", title: "Replacement" },
+			preparationId: "prepared-drop",
 		});
 		const prompt = vi.fn(async () => "cancel" as const);
 		const unregister = registerProjectReplacementPrompt(prompt);
@@ -278,6 +287,7 @@ describe("EditorEmptyState (new editor)", () => {
 			fireEvent.drop(dropZone, { dataTransfer: { files: [file] } });
 
 			await waitFor(() => expect(prompt).toHaveBeenCalledWith("open"));
+			expect(bridgeMocks.prepareProjectFileFromPath).not.toHaveBeenCalled();
 			expect(bridgeMocks.save).not.toHaveBeenCalled();
 			expect(useProjectStore.getState()).toMatchObject({ document: sampleDoc, dirty: true });
 		} finally {

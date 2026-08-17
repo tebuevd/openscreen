@@ -13,7 +13,26 @@ type ProjectReplacementPrompt = (
 ) => Promise<ProjectReplacementChoice>;
 
 let promptReplacement: ProjectReplacementPrompt | null = null;
-let replacementInFlight = false;
+let activeLifecycleOperation: symbol | null = null;
+
+export interface ProjectLifecycleLease {
+	release: () => void;
+}
+
+export function tryBeginProjectLifecycleOperation(): ProjectLifecycleLease | null {
+	if (activeLifecycleOperation) return null;
+
+	const operation = Symbol("project-lifecycle-operation");
+	activeLifecycleOperation = operation;
+	let released = false;
+	return {
+		release: () => {
+			if (released) return;
+			released = true;
+			if (activeLifecycleOperation === operation) activeLifecycleOperation = null;
+		},
+	};
+}
 
 export function registerProjectReplacementPrompt(prompt: ProjectReplacementPrompt): () => void {
 	promptReplacement = prompt;
@@ -51,11 +70,26 @@ export async function replaceCurrentProject<T>(
 	action: ProjectReplacementAction,
 	replacement: () => Promise<T>,
 ): Promise<ProjectReplacementOutcome<T>> {
-	if (replacementInFlight) return { status: "busy" };
-	replacementInFlight = true;
+	return runProjectLifecycleOperation(action, replacement);
+}
+
+export async function deleteProjectThroughLifecycleGate<T>(
+	projectId: string,
+	deletion: () => Promise<T>,
+): Promise<ProjectReplacementOutcome<T>> {
+	const activeProjectId = useProjectStore.getState().projectId;
+	return runProjectLifecycleOperation(activeProjectId === projectId ? "open" : null, deletion);
+}
+
+async function runProjectLifecycleOperation<T>(
+	action: ProjectReplacementAction | null,
+	operation: () => Promise<T>,
+): Promise<ProjectReplacementOutcome<T>> {
+	const lease = tryBeginProjectLifecycleOperation();
+	if (!lease) return { status: "busy" };
 	try {
 		const state = useProjectStore.getState();
-		if (state.document && state.dirty) {
+		if (action && state.document && state.dirty) {
 			if (!promptReplacement) return { status: "cancelled" };
 			const choice = await promptReplacement(action).catch(() => "cancel" as const);
 			if (choice === "cancel") return { status: "cancelled" };
@@ -71,8 +105,8 @@ export async function replaceCurrentProject<T>(
 			}
 		}
 
-		return { status: "completed", value: await replacement() };
+		return { status: "completed", value: await operation() };
 	} finally {
-		replacementInFlight = false;
+		lease.release();
 	}
 }

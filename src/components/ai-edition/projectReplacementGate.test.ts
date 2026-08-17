@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type AxcutDocument, createEmptyDocument } from "@/lib/ai-edition/schema";
 import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
-import { registerProjectReplacementPrompt, replaceCurrentProject } from "./projectReplacementGate";
+import {
+	deleteProjectThroughLifecycleGate,
+	registerProjectReplacementPrompt,
+	replaceCurrentProject,
+	tryBeginProjectLifecycleOperation,
+} from "./projectReplacementGate";
 
 const bridgeMocks = vi.hoisted(() => ({
 	get: vi.fn(),
@@ -218,6 +223,51 @@ describe("project replacement gate", () => {
 
 		expect(prompt).toHaveBeenCalledTimes(1);
 		expect(ignoredReplacement).not.toHaveBeenCalled();
+	});
+
+	it("serializes non-active deletion behind an in-flight project load without prompting", async () => {
+		loadDocument(projectA, { dirty: false });
+		const loading = deferred<void>();
+		const replacement = replaceCurrentProject("open", () => loading.promise);
+		const deletion = vi.fn(async () => undefined);
+
+		await expect(deleteProjectThroughLifecycleGate("proj_b", deletion)).resolves.toEqual({
+			status: "busy",
+		});
+		expect(deletion).not.toHaveBeenCalled();
+
+		loading.resolve(undefined);
+		await replacement;
+	});
+
+	it("prompts only when deleting the active project", async () => {
+		loadDocument(projectA);
+		const prompt = vi.fn(async () => "discard" as const);
+		unregisterPrompt = registerProjectReplacementPrompt(prompt);
+		const deletion = vi.fn(async () => "deleted");
+
+		await expect(deleteProjectThroughLifecycleGate("proj_b", deletion)).resolves.toEqual({
+			status: "completed",
+			value: "deleted",
+		});
+		expect(prompt).not.toHaveBeenCalled();
+		await expect(deleteProjectThroughLifecycleGate(projectA.project.id, deletion)).resolves.toEqual(
+			{
+				status: "completed",
+				value: "deleted",
+			},
+		);
+		expect(prompt).toHaveBeenCalledOnce();
+	});
+
+	it("shares the lifecycle lock with a close operation", async () => {
+		const closeLease = tryBeginProjectLifecycleOperation();
+		expect(closeLease).not.toBeNull();
+		const replacement = vi.fn(async () => undefined);
+
+		await expect(replaceCurrentProject("new", replacement)).resolves.toEqual({ status: "busy" });
+		expect(replacement).not.toHaveBeenCalled();
+		closeLease?.release();
 	});
 
 	it("clears dirty only when the replacement document becomes authoritative", async () => {

@@ -104,6 +104,10 @@ import {
 import { patchWebmDurationOnDisk } from "../recording/webm-duration";
 import { reindexRecordingOnDisk } from "../recording/webm-seek-index";
 import { registerNativeBridgeHandlers } from "./nativeBridge";
+import {
+	type PreparedProjectFileLoad,
+	ProjectFileLoadCoordinator,
+} from "./projectFileLoadCoordinator";
 import { RecordingStreamRegistry, registerRecordingStreamHandlers } from "./recordingStream";
 
 const PROJECT_FILE_EXTENSION = "openscreen";
@@ -274,6 +278,7 @@ async function prepareSupplementalPreviewAudioTrack(videoPath: string) {
 async function approveReadableVideoPath(
 	filePath?: string | null,
 	trustedDirs?: string[],
+	approve = true,
 ): Promise<string | null> {
 	const normalizedPath = normalizeVideoSourcePath(filePath);
 	if (!normalizedPath) {
@@ -307,7 +312,7 @@ async function approveReadableVideoPath(
 		return null;
 	}
 
-	approveFilePath(normalizedPath);
+	if (approve) approveFilePath(normalizedPath);
 	return normalizedPath;
 }
 
@@ -387,6 +392,7 @@ async function repairRecordingContainer(filePath: string, durationMs: number): P
 async function getApprovedProjectSession(
 	project: unknown,
 	projectFilePath?: string,
+	approvePaths = true,
 ): Promise<RecordingSession | null> {
 	if (!project || typeof project !== "object") {
 		return null;
@@ -436,6 +442,7 @@ async function getApprovedProjectSession(
 	const screenVideoPath = await approveReadableVideoPath(
 		await resolveWithSiblingFallback(media.screenVideoPath),
 		trustedDirs,
+		approvePaths,
 	);
 	if (!screenVideoPath) {
 		throw new Error("Project references an invalid or unsupported screen video path");
@@ -445,6 +452,7 @@ async function getApprovedProjectSession(
 		? await approveReadableVideoPath(
 				await resolveWithSiblingFallback(media.webcamVideoPath),
 				trustedDirs,
+				approvePaths,
 			)
 		: undefined;
 	if (media.webcamVideoPath && !webcamVideoPath) {
@@ -483,6 +491,7 @@ let selectedDesktopSource: DesktopCapturerSource | null = null;
 let lastEnumeratedSources = new Map<string, DesktopCapturerSource>();
 let currentProjectPath: string | null = null;
 let currentRecordingSession: RecordingSession | null = null;
+let currentRecordingSessionIsPending = false;
 
 // single source of truth for the mic/camera/system-audio/cursor
 // choices a user makes in the editor's Rec-mode stage, so the HUD window's
@@ -1460,10 +1469,23 @@ function waitForNativeMacCaptureStart(
 	});
 }
 
-function setCurrentRecordingSessionState(session: RecordingSession | null) {
+function setCurrentRecordingSessionState(
+	session: RecordingSession | null,
+	pending = session !== null,
+) {
 	currentRecordingSession = session;
 	currentVideoPath = session?.screenVideoPath ?? null;
+	currentRecordingSessionIsPending = session !== null && pending;
 }
+
+const projectFileLoads = new ProjectFileLoadCoordinator((prepared: PreparedProjectFileLoad) => {
+	currentProjectPath = prepared.path;
+	if (prepared.session) {
+		approveFilePath(prepared.session.screenVideoPath);
+		if (prepared.session.webcamVideoPath) approveFilePath(prepared.session.webcamVideoPath);
+	}
+	setCurrentRecordingSessionState(prepared.session, false);
+});
 
 function getSessionManifestPathForVideo(videoPath: string) {
 	const parsedPath = path.parse(videoPath);
@@ -3680,6 +3702,7 @@ export function registerIpcHandlers(
 					"utf-8",
 				);
 				currentProjectPath = trustedExistingProjectPath;
+				currentRecordingSessionIsPending = false;
 				return {
 					success: true,
 					path: trustedExistingProjectPath,
@@ -3719,6 +3742,7 @@ export function registerIpcHandlers(
 
 			await fs.writeFile(result.filePath, JSON.stringify(projectData, null, 2), "utf-8");
 			currentProjectPath = result.filePath;
+			currentRecordingSessionIsPending = false;
 
 			return {
 				success: true,
@@ -3735,11 +3759,11 @@ export function registerIpcHandlers(
 		}
 	}
 
-	ipcMain.handle("load-project-file", async (_, projectFolder?: string) => {
-		return loadProjectFile(projectFolder);
+	ipcMain.handle("prepare-project-file", async (_, projectFolder?: string) => {
+		return prepareProjectFile(projectFolder);
 	});
 
-	async function loadProjectFile(projectFolder?: string): Promise<ProjectFileResult> {
+	async function prepareProjectFile(projectFolder?: string): Promise<ProjectFileResult> {
 		try {
 			// Default to the projects directory, where the editor actually stores
 			// openable project files (one `.openscreen` per project). Prefer the user's
@@ -3796,25 +3820,19 @@ export function registerIpcHandlers(
 			const filePath = result.filePaths[0];
 			const content = await fs.readFile(filePath, "utf-8");
 			const project = await relinkProjectMedia(JSON.parse(content), RECORDINGS_DIR);
-			currentProjectPath = filePath;
 			let session: RecordingSession | null = null;
 			try {
-				session = await getApprovedProjectSession(project, filePath);
+				session = await getApprovedProjectSession(project, filePath, false);
 			} catch (sessionError) {
 				console.warn(
-					"[loadProjectFile] Could not approve session paths, proceeding without session:",
+					"[prepareProjectFile] Could not validate session paths, proceeding without session:",
 					sessionError,
 				);
 			}
-			setCurrentRecordingSessionState(session);
 
-			return {
-				success: true,
-				path: filePath,
-				project,
-			};
+			return projectFileLoads.prepare({ path: filePath, project, session });
 		} catch (error) {
-			console.error("Failed to load project file:", error);
+			console.error("Failed to prepare project file:", error);
 			return {
 				success: false,
 				message: "Failed to load project file",
@@ -3823,11 +3841,11 @@ export function registerIpcHandlers(
 		}
 	}
 
-	ipcMain.handle("load-project-file-from-path", async (_event, filePath: string) => {
-		return loadProjectFileFromPath(filePath);
+	ipcMain.handle("prepare-project-file-from-path", async (_event, filePath: string) => {
+		return prepareProjectFileFromPath(filePath);
 	});
 
-	async function loadProjectFileFromPath(filePath: string): Promise<ProjectFileResult> {
+	async function prepareProjectFileFromPath(filePath: string): Promise<ProjectFileResult> {
 		try {
 			if (!filePath || typeof filePath !== "string") {
 				return { success: false, message: "Invalid file path" };
@@ -3842,23 +3860,21 @@ export function registerIpcHandlers(
 			}
 			const content = await fs.readFile(filePath, "utf-8");
 			const project = await relinkProjectMedia(JSON.parse(content), RECORDINGS_DIR);
-			currentProjectPath = filePath;
 
-			// Approve session paths but tolerate failures (e.g. video moved outside trusted
+			// Validate session paths but tolerate failures (e.g. video moved outside trusted
 			// dirs) so the project still loads and the renderer can show "video not found".
 			let session: import("../../src/lib/recordingSession").RecordingSession | null = null;
 			try {
-				session = await getApprovedProjectSession(project, filePath);
+				session = await getApprovedProjectSession(project, filePath, false);
 			} catch (sessionError) {
 				console.warn(
-					"[loadProjectFileFromPath] Could not approve session paths, proceeding without session:",
+					"[prepareProjectFileFromPath] Could not validate session paths, proceeding without session:",
 					sessionError,
 				);
 			}
-			setCurrentRecordingSessionState(session);
-			return { success: true, path: filePath, project };
+			return projectFileLoads.prepare({ path: filePath, project, session });
 		} catch (error) {
-			console.error("Failed to load project file from path:", error);
+			console.error("Failed to prepare project file from path:", error);
 			return {
 				success: false,
 				message: "Failed to load project file",
@@ -3866,6 +3882,14 @@ export function registerIpcHandlers(
 			};
 		}
 	}
+
+	ipcMain.handle("commit-project-file-load", (_event, preparationId: string) => {
+		return projectFileLoads.commit(preparationId);
+	});
+
+	ipcMain.handle("abort-project-file-load", (_event, preparationId: string) => {
+		return projectFileLoads.abort(preparationId);
+	});
 
 	ipcMain.handle("load-current-project-file", async () => {
 		return loadCurrentProjectFile();
@@ -3879,7 +3903,10 @@ export function registerIpcHandlers(
 
 			const content = await fs.readFile(currentProjectPath, "utf-8");
 			const project = JSON.parse(content);
-			setCurrentRecordingSessionState(await getApprovedProjectSession(project, currentProjectPath));
+			setCurrentRecordingSessionState(
+				await getApprovedProjectSession(project, currentProjectPath),
+				false,
+			);
 			return {
 				success: true,
 				path: currentProjectPath,
@@ -3902,14 +3929,17 @@ export function registerIpcHandlers(
 	ipcMain.handle("set-current-recording-session", (_, session: RecordingSession | null) => {
 		const normalizedSession = normalizeRecordingSession(session);
 		setCurrentRecordingSessionState(normalizedSession);
-		currentVideoPath = normalizedSession?.screenVideoPath ?? null;
 		currentProjectPath = null;
 		return { success: true, session: currentRecordingSession };
 	});
 
 	ipcMain.handle("get-current-recording-session", () => {
 		return currentRecordingSession
-			? { success: true, session: currentRecordingSession }
+			? {
+					success: true,
+					session: currentRecordingSession,
+					pending: currentRecordingSessionIsPending,
+				}
 			: { success: false };
 	});
 
@@ -4106,9 +4136,11 @@ export function registerIpcHandlers(
 		getCurrentProjectPath: () => currentProjectPath,
 		getCurrentVideoPath: () => currentVideoPath,
 		saveProjectFile,
-		loadProjectFile,
+		prepareProjectFile,
 		loadCurrentProjectFile,
-		loadProjectFileFromPath,
+		prepareProjectFileFromPath,
+		commitProjectFileLoad: (preparationId) => projectFileLoads.commit(preparationId),
+		abortProjectFileLoad: (preparationId) => projectFileLoads.abort(preparationId),
 		setCurrentVideoPath,
 		getCurrentVideoPathResult,
 		clearCurrentVideoPath,

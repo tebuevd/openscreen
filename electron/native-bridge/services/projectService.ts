@@ -14,9 +14,11 @@ interface ProjectServiceOptions {
 		suggestedName?: string,
 		existingProjectPath?: string,
 	) => Promise<ProjectFileResult>;
-	loadProjectFile: (projectFolder?: string) => Promise<ProjectFileResult>;
+	prepareProjectFile: (projectFolder?: string) => Promise<ProjectFileResult>;
 	loadCurrentProjectFile: () => Promise<ProjectFileResult>;
-	loadProjectFileFromPath: (path: string) => Promise<ProjectFileResult>;
+	prepareProjectFileFromPath: (path: string) => Promise<ProjectFileResult>;
+	commitProjectFileLoad: (preparationId: string) => Promise<ProjectFileResult> | ProjectFileResult;
+	abortProjectFileLoad: (preparationId: string) => Promise<ProjectFileResult> | ProjectFileResult;
 	setCurrentVideoPath: (path: string) => ProjectPathResult | Promise<ProjectPathResult>;
 	getCurrentVideoPathResult: () => ProjectPathResult;
 	clearCurrentVideoPath: () => ProjectPathResult;
@@ -49,9 +51,8 @@ export class ProjectService {
 		return result;
 	}
 
-	async loadProjectFile(projectFolder?: string) {
-		const result = await this.options.loadProjectFile(projectFolder);
-		this.getCurrentContext();
+	async prepareProjectFile(projectFolder?: string) {
+		const result = await this.options.prepareProjectFile(projectFolder);
 		return result;
 	}
 
@@ -61,10 +62,19 @@ export class ProjectService {
 		return result;
 	}
 
-	async loadProjectFileFromPath(path: string) {
-		const result = await this.options.loadProjectFileFromPath(path);
+	async prepareProjectFileFromPath(path: string) {
+		const result = await this.options.prepareProjectFileFromPath(path);
+		return result;
+	}
+
+	async commitProjectFileLoad(preparationId: string) {
+		const result = await this.options.commitProjectFileLoad(preparationId);
 		this.getCurrentContext();
 		return result;
+	}
+
+	abortProjectFileLoad(preparationId: string) {
+		return this.options.abortProjectFileLoad(preparationId);
 	}
 
 	async setCurrentVideoPath(path: string) {

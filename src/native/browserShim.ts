@@ -128,7 +128,10 @@ function createShimElectronAPI() {
 		sendCloseConfirmResponse: () => undefined,
 		onRequestCloseConfirm: () => () => undefined,
 		onRequestSaveBeforeClose: () => () => undefined,
-		loadProjectFileFromPath: () => Promise.resolve({ success: false, canceled: true }),
+		prepareProjectFile: () => Promise.resolve({ success: false, canceled: true }),
+		prepareProjectFileFromPath: () => Promise.resolve({ success: false, canceled: true }),
+		commitProjectFileLoad: () => Promise.resolve({ success: true }),
+		abortProjectFileLoad: () => Promise.resolve({ success: true }),
 		getPathForFile: () => "",
 		getSources: () => Promise.resolve(SHIM_SOURCES),
 		selectSource: (source: ShimDesktopSource) => {
@@ -1270,7 +1273,10 @@ function createShimBridgeClient() {
 		project: {
 			getCurrentContext: () =>
 				Promise.resolve({ currentProjectPath: null, currentVideoPath: null }),
-			loadProjectFile: () => Promise.resolve({ success: false, canceled: true }),
+			prepareProjectFile: () => Promise.resolve({ success: false, canceled: true }),
+			prepareProjectFileFromPath: () => Promise.resolve({ success: false, canceled: true }),
+			commitProjectFileLoad: () => Promise.resolve({ success: true }),
+			abortProjectFileLoad: () => Promise.resolve({ success: true }),
 		},
 	};
 }

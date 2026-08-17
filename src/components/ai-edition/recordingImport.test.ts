@@ -17,7 +17,7 @@ function stubElectronApi(screenVideoPath: string | null) {
 	let session = screenVideoPath ? { screenVideoPath, createdAt: 0 } : null;
 	const api = {
 		getCurrentRecordingSession: vi.fn(async () =>
-			session ? { success: true, session } : { success: false },
+			session ? { success: true, session, pending: true } : { success: false },
 		),
 		setCurrentRecordingSession: vi.fn(async (next: typeof session) => {
 			session = next;
@@ -47,6 +47,18 @@ describe("importPendingRecording", () => {
 
 	it("does nothing when no recording is waiting", async () => {
 		stubElectronApi(null);
+		await expect(importPendingRecording()).resolves.toBe("none");
+		expect(createProject).not.toHaveBeenCalled();
+	});
+
+	it("does not re-import a project session on the next editor startup", async () => {
+		const api = stubElectronApi("/projects/opened-project.mp4");
+		api.getCurrentRecordingSession.mockResolvedValue({
+			success: true,
+			session: { screenVideoPath: "/projects/opened-project.mp4", createdAt: 0 },
+			pending: false,
+		});
+
 		await expect(importPendingRecording()).resolves.toBe("none");
 		expect(createProject).not.toHaveBeenCalled();
 	});

@@ -39,9 +39,11 @@ export interface NativeBridgeContext {
 		suggestedName?: string,
 		existingProjectPath?: string,
 	) => Promise<ProjectFileResult>;
-	loadProjectFile: (projectFolder?: string) => Promise<ProjectFileResult>;
+	prepareProjectFile: (projectFolder?: string) => Promise<ProjectFileResult>;
 	loadCurrentProjectFile: () => Promise<ProjectFileResult>;
-	loadProjectFileFromPath: (path: string) => Promise<ProjectFileResult>;
+	prepareProjectFileFromPath: (path: string) => Promise<ProjectFileResult>;
+	commitProjectFileLoad: (preparationId: string) => Promise<ProjectFileResult> | ProjectFileResult;
+	abortProjectFileLoad: (preparationId: string) => Promise<ProjectFileResult> | ProjectFileResult;
 	setCurrentVideoPath: (path: string) => ProjectPathResult | Promise<ProjectPathResult>;
 	getCurrentVideoPathResult: () => ProjectPathResult;
 	clearCurrentVideoPath: () => ProjectPathResult;
@@ -280,9 +282,11 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		getCurrentProjectPath: context.getCurrentProjectPath,
 		getCurrentVideoPath: context.getCurrentVideoPath,
 		saveProjectFile: context.saveProjectFile,
-		loadProjectFile: context.loadProjectFile,
+		prepareProjectFile: context.prepareProjectFile,
 		loadCurrentProjectFile: context.loadCurrentProjectFile,
-		loadProjectFileFromPath: context.loadProjectFileFromPath,
+		prepareProjectFileFromPath: context.prepareProjectFileFromPath,
+		commitProjectFileLoad: context.commitProjectFileLoad,
+		abortProjectFileLoad: context.abortProjectFileLoad,
 		setCurrentVideoPath: context.setCurrentVideoPath,
 		getCurrentVideoPathResult: context.getCurrentVideoPathResult,
 		clearCurrentVideoPath: context.clearCurrentVideoPath,
@@ -400,20 +404,30 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.existingProjectPath,
 								),
 							);
-						case "loadProjectFile":
+						case "prepareProjectFile":
 							return createSuccessResponse(
 								requestId,
-								await projectService.loadProjectFile(request.payload?.projectFolder),
+								await projectService.prepareProjectFile(request.payload?.projectFolder),
 							);
 						case "loadCurrentProjectFile":
 							return createSuccessResponse(
 								requestId,
 								await projectService.loadCurrentProjectFile(),
 							);
-						case "loadProjectFileFromPath":
+						case "prepareProjectFileFromPath":
 							return createSuccessResponse(
 								requestId,
-								await projectService.loadProjectFileFromPath(request.payload.path),
+								await projectService.prepareProjectFileFromPath(request.payload.path),
+							);
+						case "commitProjectFileLoad":
+							return createSuccessResponse(
+								requestId,
+								await projectService.commitProjectFileLoad(request.payload.preparationId),
+							);
+						case "abortProjectFileLoad":
+							return createSuccessResponse(
+								requestId,
+								await projectService.abortProjectFileLoad(request.payload.preparationId),
 							);
 						case "setCurrentVideoPath":
 							return createSuccessResponse(

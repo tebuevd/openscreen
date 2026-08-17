@@ -25,6 +25,12 @@ import { parseCliArgs } from "./cli/args";
 import { runCli } from "./cli/cliMain";
 import { isDiagnosticModeEnabled, mainLogBuffer } from "./diagnostics/main-log-buffer";
 import {
+	type EditorCloseChoice,
+	EditorCloseCoordinator,
+	type EditorMenuChannel,
+	routeEditorMenuAction,
+} from "./editor-window-lifecycle";
+import {
 	loadAndRegisterGlobalShortcut,
 	registerOpenAppShortcut,
 	unregisterAllGlobalShortcuts,
@@ -114,6 +120,7 @@ process.env.VITE_PUBLIC = VITE_DEV_SERVER_URL
 
 // Window references
 let mainWindow: BrowserWindow | null = null;
+let activeEditorWindow: BrowserWindow | null = null;
 let sourceSelectorWindow: BrowserWindow | null = null;
 let countdownOverlayWindow: BrowserWindow | null = null;
 let notesWindow: BrowserWindow | null = null;
@@ -161,28 +168,13 @@ if (cliCommand) {
 	app.quit();
 }
 
-function isEditorWindow(window: BrowserWindow) {
-	return window.webContents.getURL().includes("windowType=editor");
-}
-
-function sendEditorMenuAction(
-	channel: "menu-load-project" | "menu-save-project" | "menu-save-project-as" | "menu-new-project",
-) {
-	let targetWindow = BrowserWindow.getFocusedWindow() ?? mainWindow;
-
-	if (!targetWindow || targetWindow.isDestroyed() || !isEditorWindow(targetWindow)) {
-		createEditorWindowWrapper();
-		targetWindow = mainWindow;
-		if (!targetWindow || targetWindow.isDestroyed()) return;
-
-		targetWindow.webContents.once("did-finish-load", () => {
-			if (!targetWindow || targetWindow.isDestroyed()) return;
-			targetWindow.webContents.send(channel);
-		});
-		return;
-	}
-
-	targetWindow.webContents.send(channel);
+function sendEditorMenuAction(channel: EditorMenuChannel) {
+	routeEditorMenuAction(
+		channel,
+		BrowserWindow.getAllWindows(),
+		createEditorWindowWrapper,
+		activeEditorWindow,
+	);
 }
 
 function setupApplicationMenu() {
@@ -551,8 +543,7 @@ function updateTrayMenu(recording: boolean = false) {
 }
 
 let editorHasUnsavedChanges = false;
-let isForceClosing = false;
-let isCloseConfirmInFlight = false;
+const editorCloseCoordinator = new EditorCloseCoordinator();
 
 ipcMain.on("set-has-unsaved-changes", (_, hasChanges: boolean) => {
 	editorHasUnsavedChanges = hasChanges;
@@ -564,63 +555,40 @@ ipcMain.on("app-quit", () => {
 	app.quit();
 });
 
-function forceCloseEditorWindow(windowToClose: BrowserWindow | null) {
-	if (!windowToClose || windowToClose.isDestroyed()) return;
-
-	isForceClosing = true;
-	setImmediate(() => {
-		try {
-			if (!windowToClose.isDestroyed()) {
-				windowToClose.close();
-			}
-		} finally {
-			isForceClosing = false;
-		}
-	});
-}
-
 function createEditorWindowWrapper() {
-	if (mainWindow) {
-		isForceClosing = true;
-		mainWindow.close();
-		isForceClosing = false;
+	if (activeEditorWindow && !activeEditorWindow.isDestroyed()) {
+		if (activeEditorWindow.isMinimized()) activeEditorWindow.restore();
+		activeEditorWindow.show();
+		activeEditorWindow.focus();
+		return activeEditorWindow;
+	}
+	if (mainWindow && !mainWindow.isDestroyed()) {
+		editorCloseCoordinator.closeImmediately(mainWindow);
 		mainWindow = null;
 	}
 	mainWindow = createEditorWindow();
+	activeEditorWindow = mainWindow;
 	editorHasUnsavedChanges = false;
+	const editorWindow = mainWindow;
 
-	mainWindow.on("close", (event) => {
-		if (isForceClosing || !editorHasUnsavedChanges || isCloseConfirmInFlight) return;
-
-		event.preventDefault();
-		isCloseConfirmInFlight = true;
-
-		const windowToClose = mainWindow;
-		if (!windowToClose || windowToClose.isDestroyed()) return;
-
-		// Ask renderer to show the in-app close dialog.
-		windowToClose.webContents.send("request-close-confirm");
-
-		ipcMain.once("close-confirm-response", (event, choice: "save" | "discard" | "cancel") => {
-			if (event.sender.id !== windowToClose?.webContents.id) return;
-			isCloseConfirmInFlight = false;
-			if (!windowToClose || windowToClose.isDestroyed()) return;
-
-			if (choice === "save") {
-				// Save first, then close when the renderer reports done.
-				windowToClose.webContents.send("request-save-before-close");
-				ipcMain.once("save-before-close-done", (event, shouldClose: boolean) => {
-					if (event.sender.id !== windowToClose?.webContents.id) return;
-					if (!shouldClose) return;
-					forceCloseEditorWindow(windowToClose);
-				});
-			} else if (choice === "discard") {
-				forceCloseEditorWindow(windowToClose);
-			}
-			// "cancel": flag reset, window stays open
-		});
+	editorWindow.on("close", (event) => {
+		editorCloseCoordinator.requestClose(editorWindow, event, editorHasUnsavedChanges);
 	});
+	editorWindow.on("closed", () => {
+		editorCloseCoordinator.cancelWindow(editorWindow);
+		if (mainWindow === editorWindow) mainWindow = null;
+		if (activeEditorWindow === editorWindow) activeEditorWindow = null;
+	});
+	return editorWindow;
 }
+
+ipcMain.on("close-confirm-response", (event, operationId: number, choice: EditorCloseChoice) => {
+	editorCloseCoordinator.respondToConfirm(event.sender.id, operationId, choice);
+});
+
+ipcMain.on("save-before-close-done", (event, operationId: number, shouldClose: boolean) => {
+	editorCloseCoordinator.respondToSave(event.sender.id, operationId, shouldClose);
+});
 
 function createSourceSelectorWindowWrapper() {
 	sourceSelectorWindow = createSourceSelectorWindow();
@@ -815,10 +783,10 @@ appReady?.then(async () => {
 	await ensureRecordingsDir();
 
 	function switchToHudWrapper() {
-		if (mainWindow) {
-			isForceClosing = true;
-			mainWindow.close();
-			isForceClosing = false;
+		if (mainWindow && !mainWindow.isDestroyed()) {
+			const windowToClose = mainWindow;
+			editorCloseCoordinator.closeImmediately(windowToClose);
+			if (activeEditorWindow === windowToClose) activeEditorWindow = null;
 			mainWindow = null;
 		}
 		showMainWindow();

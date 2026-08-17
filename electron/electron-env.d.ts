@@ -286,6 +286,7 @@ interface Window {
 		getCurrentRecordingSession: () => Promise<{
 			success: boolean;
 			session?: RecordingSession | null;
+			pending?: boolean;
 			canceled?: boolean;
 		}>;
 		findRecordingCamera: (videoPath: string) => Promise<{
@@ -342,10 +343,11 @@ interface Window {
 			canceled?: boolean;
 			error?: string;
 		}>;
-		loadProjectFile: (projectFolder?: string) => Promise<{
+		prepareProjectFile: (projectFolder?: string) => Promise<{
 			success: boolean;
 			path?: string;
 			project?: unknown;
+			preparationId?: string;
 			message?: string;
 			canceled?: boolean;
 			error?: string;
@@ -359,14 +361,22 @@ interface Window {
 			error?: string;
 		}>;
 		getPathForFile: (file: File) => string;
-		loadProjectFileFromPath: (filePath: string) => Promise<{
+		prepareProjectFileFromPath: (filePath: string) => Promise<{
 			success: boolean;
 			path?: string;
 			project?: unknown;
+			preparationId?: string;
 			message?: string;
 			canceled?: boolean;
 			error?: string;
 		}>;
+		commitProjectFileLoad: (preparationId: string) => Promise<{
+			success: boolean;
+			path?: string;
+			message?: string;
+			error?: string;
+		}>;
+		abortProjectFileLoad: (preparationId: string) => Promise<{ success: boolean }>;
 		onMenuNewProject: (callback: () => void) => () => void;
 		onMenuImportVideo: (callback: () => void) => () => void;
 		onMenuLoadProject: (callback: () => void) => () => void;
@@ -401,9 +411,14 @@ interface Window {
 		onCountdownOverlayValue: (callback: (value: number | null) => void) => () => void;
 		setMicrophoneExpanded: (expanded: boolean) => void;
 		setHasUnsavedChanges: (hasChanges: boolean) => void;
-		onRequestSaveBeforeClose: (callback: () => Promise<boolean> | boolean) => () => void;
-		onRequestCloseConfirm: (callback: () => void) => () => void;
-		sendCloseConfirmResponse: (choice: "save" | "discard" | "cancel") => void;
+		onRequestSaveBeforeClose: (
+			callback: (operationId: number) => Promise<boolean> | boolean,
+		) => () => void;
+		onRequestCloseConfirm: (callback: (operationId: number) => void) => () => void;
+		sendCloseConfirmResponse: (
+			operationId: number,
+			choice: "save" | "discard" | "cancel" | "busy",
+		) => void;
 		stt: {
 			transcribe: (
 				request: import("./stt/transcriptionContract").SttTranscribeRequest,

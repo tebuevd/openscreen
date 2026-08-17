@@ -31,12 +31,24 @@ function nextNumericIdFrom(regions: { id: string }[]): number {
 }
 
 async function runCaptions(request: CliCaptionsRequest): Promise<CliDoneResult> {
-	const loaded = await nativeBridgeClient.project.loadProjectFileFromPath(request.projectPath);
+	const loaded = await nativeBridgeClient.project.prepareProjectFileFromPath(request.projectPath);
 	if (!loaded.success || loaded.project === undefined) {
 		throw new Error(loaded.error ?? loaded.message ?? "Failed to load project file");
 	}
-	if (!validateProjectData(loaded.project)) {
-		throw new Error("Project file is not a valid .openscreen project");
+	if (!loaded.preparationId) throw new Error("Project load did not create a preparation");
+	try {
+		if (!validateProjectData(loaded.project)) {
+			throw new Error("Project file is not a valid .openscreen project");
+		}
+		const commit = await nativeBridgeClient.project.commitProjectFileLoad(loaded.preparationId);
+		if (!commit.success) {
+			throw new Error(commit.error ?? commit.message ?? "Could not commit project load");
+		}
+	} catch (error) {
+		await nativeBridgeClient.project
+			.abortProjectFileLoad(loaded.preparationId)
+			.catch(() => undefined);
+		throw error;
 	}
 	const project = loaded.project;
 	const media = resolveProjectMedia(project);

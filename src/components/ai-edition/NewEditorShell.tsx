@@ -1,18 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
-import type { EditorProjectData } from "@/components/video-editor/projectPersistence";
 import { toFileUrl } from "@/components/video-editor/projectPersistence";
 import { useScopedT } from "@/contexts/I18nContext";
 import { useShortcuts } from "@/contexts/ShortcutsContext";
 import {
-	migrateProjectDataToAxcutDocument,
-	migrateRawDocumentToCurrent,
-} from "@/lib/ai-edition/document/migrate";
-import {
 	applyProbedDuration,
 	replaceTimeline as replaceTimelineOp,
 } from "@/lib/ai-edition/document/timeline";
-import { type AxcutClip, documentSchema } from "@/lib/ai-edition/schema";
+import type { AxcutClip } from "@/lib/ai-edition/schema";
 import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import {
 	useAssetTranscriptions,
@@ -40,11 +35,15 @@ import {
 	type UnsavedChoice,
 } from "./Modals";
 import { Preview } from "./Preview";
+import { importPreparedProjectFile } from "./projectFileImport";
 import {
+	deleteProjectThroughLifecycleGate,
+	type ProjectLifecycleLease,
 	type ProjectReplacementAction,
 	registerProjectReplacementPrompt,
 	replaceCurrentProject,
 	saveCurrentProjectFromUserIntent,
+	tryBeginProjectLifecycleOperation,
 } from "./projectReplacementGate";
 import type { TrimTarget } from "./RightPanes";
 import { importPendingRecording } from "./recordingImport";
@@ -146,8 +145,8 @@ export function NewEditorShell() {
 	const [editClipTarget, setEditClipTarget] = useState<AxcutClip | null>(null);
 	const [exportOpen, setExportOpen] = useState(false);
 	const [unsavedPrompt, setUnsavedPrompt] = useState<{
+		id: number;
 		action: "close" | ProjectReplacementAction;
-		resolve: (choice: UnsavedChoice) => void;
 	} | null>(null);
 	const { shortcuts, isMac, openConfig: openShortcutsConfig } = useShortcuts();
 	// Transcription is local and every transcript-driven feature (Smart cuts,
@@ -180,6 +179,16 @@ export function NewEditorShell() {
 	const [projectSummaries, setProjectSummaries] = useState<AiEditionProjectSummary[]>([]);
 	const seekSeqRef = useRef(0);
 	const initRef = useRef(false);
+	const nextUnsavedPromptIdRef = useRef(0);
+	const pendingUnsavedPromptRef = useRef<{
+		id: number;
+		resolve: (choice: UnsavedChoice) => void;
+	} | null>(null);
+	const closeOperationRef = useRef<{
+		id: number;
+		phase: "prompt" | "save" | "closing";
+		lease: ProjectLifecycleLease;
+	} | null>(null);
 
 	// Dev-only: expose the project store so the browser preview harness can
 	// seed a populated document for design QA. Tree-shaken out of prod builds.
@@ -199,12 +208,25 @@ export function NewEditorShell() {
 
 	const showUnsavedPrompt = useCallback(
 		(action: "close" | ProjectReplacementAction): Promise<UnsavedChoice> => {
+			if (pendingUnsavedPromptRef.current) return Promise.resolve("cancel");
+
+			const id = ++nextUnsavedPromptIdRef.current;
 			return new Promise<UnsavedChoice>((resolve) => {
-				setUnsavedPrompt({ action, resolve });
+				pendingUnsavedPromptRef.current = { id, resolve };
+				setUnsavedPrompt({ id, action });
 			});
 		},
 		[],
 	);
+	const settleUnsavedPrompt = useCallback((id: number, choice: UnsavedChoice): boolean => {
+		const pending = pendingUnsavedPromptRef.current;
+		if (!pending || pending.id !== id) return false;
+
+		pendingUnsavedPromptRef.current = null;
+		setUnsavedPrompt((current) => (current?.id === id ? null : current));
+		pending.resolve(choice);
+		return true;
+	}, []);
 	const promptUnsaved = useCallback(
 		(action: "close" | ProjectReplacementAction): Promise<UnsavedChoice> => {
 			if (!useProjectStore.getState().dirty) return Promise.resolve("discard");
@@ -217,6 +239,16 @@ export function NewEditorShell() {
 		() => registerProjectReplacementPrompt((action) => showUnsavedPrompt(action)),
 		[showUnsavedPrompt],
 	);
+
+	useEffect(() => {
+		return () => {
+			const pending = pendingUnsavedPromptRef.current;
+			pendingUnsavedPromptRef.current = null;
+			pending?.resolve("cancel");
+			closeOperationRef.current?.lease.release();
+			closeOperationRef.current = null;
+		};
+	}, []);
 
 	const loadExistingProject = useCallback(
 		async (id: string): Promise<void> => {
@@ -309,7 +341,7 @@ export function NewEditorShell() {
 	// Warn on close when dirty
 	useEffect(() => {
 		const onBeforeUnload = (e: BeforeUnloadEvent) => {
-			if (useProjectStore.getState().dirty) {
+			if (useProjectStore.getState().dirty && closeOperationRef.current?.phase !== "closing") {
 				e.preventDefault();
 				e.returnValue = "";
 			}
@@ -330,22 +362,43 @@ export function NewEditorShell() {
 		if (!window.electronAPI) return;
 
 		// 2. Handle request-close-confirm from Electron
-		const unsubCloseConfirm = window.electronAPI.onRequestCloseConfirm(() => {
+		const unsubCloseConfirm = window.electronAPI.onRequestCloseConfirm((operationId) => {
+			const lease = tryBeginProjectLifecycleOperation();
+			if (!lease) {
+				window.electronAPI.sendCloseConfirmResponse(operationId, "busy");
+				return;
+			}
+			closeOperationRef.current = { id: operationId, phase: "prompt", lease };
 			void (async () => {
 				const choice = await promptUnsaved("close");
-				if (choice === "discard") {
-					window.electronAPI.sendCloseConfirmResponse("discard");
-				} else if (choice === "save") {
-					window.electronAPI.sendCloseConfirmResponse("save");
-				} else {
-					window.electronAPI.sendCloseConfirmResponse("cancel");
+				const operation = closeOperationRef.current;
+				if (!operation || operation.id !== operationId || operation.phase !== "prompt") return;
+
+				if (choice === "save") operation.phase = "save";
+				else if (choice === "discard") operation.phase = "closing";
+				else {
+					closeOperationRef.current = null;
+					operation.lease.release();
 				}
+				window.electronAPI.sendCloseConfirmResponse(operationId, choice);
 			})();
 		});
 
 		// 3. Handle request-save-before-close from Electron
 		const unsubSaveBeforeClose = window.electronAPI.onRequestSaveBeforeClose(
-			saveCurrentProjectBeforeClose,
+			async (operationId) => {
+				const operation = closeOperationRef.current;
+				if (!operation || operation.id !== operationId || operation.phase !== "save") return false;
+
+				const shouldClose = await saveCurrentProjectBeforeClose();
+				if (shouldClose) {
+					operation.phase = "closing";
+				} else {
+					closeOperationRef.current = null;
+					operation.lease.release();
+				}
+				return shouldClose;
+			},
 		);
 
 		return () => {
@@ -543,21 +596,9 @@ export function NewEditorShell() {
 	const handleBrowseProject = useCallback(async () => {
 		try {
 			const outcome = await replaceCurrentProject("open", async () => {
-				const result = await window.electronAPI?.loadProjectFile();
-				if (!result?.success || !result.project) return null;
-				const raw = result.project as unknown;
-				// A current project file already carries its own `schemaVersion` (v3/v4
-				// AxcutDocument); an older legacy export is EditorProjectData and must be
-				// migrated. Discriminate on the version field so a current document is
-				// never fed to the legacy migrator (which reads `.media`/`.editor` and
-				// would yield an empty doc).
-				const isAxcutDocument =
-					typeof raw === "object" && raw !== null && "schemaVersion" in raw && "timeline" in raw;
-				const doc = isAxcutDocument
-					? documentSchema.parse(migrateRawDocumentToCurrent(raw)) // disk-load: upgrade v3/v4 → v5, then validate
-					: migrateProjectDataToAxcutDocument(raw as EditorProjectData);
-				if (!(await importProject(doc))) throw new Error("Project import was superseded");
-				return isAxcutDocument;
+				const api = window.electronAPI;
+				if (!api) return null;
+				return importPreparedProjectFile(() => api.prepareProjectFile(), importProject, api);
 			});
 			if (outcome.status === "completed" && outcome.value !== null) {
 				toast.success(outcome.value ? "Project opened" : "Legacy project migrated and loaded");
@@ -640,13 +681,8 @@ export function NewEditorShell() {
 	const handleDeleteProject = useCallback(
 		async (id: string) => {
 			try {
-				const remove = () => deleteProject(id);
-				if (useProjectStore.getState().projectId === id) {
-					const outcome = await replaceCurrentProject("open", remove);
-					if (outcome.status !== "completed") return;
-				} else {
-					await remove();
-				}
+				const outcome = await deleteProjectThroughLifecycleGate(id, () => deleteProject(id));
+				if (outcome.status !== "completed") return;
 				setProjectSummaries((prev) => prev.filter((p) => p.id !== id));
 				toast.success("Project deleted");
 			} catch (err) {
@@ -710,11 +746,9 @@ export function NewEditorShell() {
 	const handleConfirmUnsaved = useCallback(
 		(choice: UnsavedChoice) => {
 			if (!unsavedPrompt) return;
-			const { resolve } = unsavedPrompt;
-			setUnsavedPrompt(null);
-			resolve(choice);
+			settleUnsavedPrompt(unsavedPrompt.id, choice);
 		},
-		[unsavedPrompt],
+		[settleUnsavedPrompt, unsavedPrompt],
 	);
 
 	const handleNewRecording = useCallback(async () => {
@@ -1301,8 +1335,7 @@ export function NewEditorShell() {
 			<UnsavedChangesModal
 				open={unsavedPrompt !== null}
 				onClose={() => {
-					unsavedPrompt?.resolve("cancel");
-					setUnsavedPrompt(null);
+					if (unsavedPrompt) settleUnsavedPrompt(unsavedPrompt.id, "cancel");
 				}}
 				action={unsavedPrompt?.action ?? "new"}
 				onChoose={handleConfirmUnsaved}

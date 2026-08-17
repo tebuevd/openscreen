@@ -17,13 +17,9 @@ import { AlertCircle, Film, FolderOpen, Upload, X } from "lucide-react";
 import { useCallback, useRef, useState } from "react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { useScopedT } from "@/contexts/I18nContext";
-import {
-	migrateProjectDataToAxcutDocument,
-	migrateRawDocumentToCurrent,
-} from "@/lib/ai-edition/document/migrate";
-import { documentSchema } from "@/lib/ai-edition/schema";
 import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import styles from "./NewEditorShell.module.css";
+import { importPreparedProjectFile } from "./projectFileImport";
 import { replaceCurrentProject } from "./projectReplacementGate";
 
 type DropError = "unsupported-format" | "load-failed" | null;
@@ -74,35 +70,17 @@ export function EditorEmptyState({
 		}
 	}, [addAsset, createProject]);
 
-	// A loaded project JSON is either a current AxcutDocument (has its own
-	// `schemaVersion`) or a legacy EditorProjectData that must be migrated.
-	// Discriminate on the version field so a current document is never fed to
-	// the legacy migrator (which reads `.media`/`.editor` and would yield an
-	// empty doc). Returns true once the project is saved and loaded.
-	const openLoadedProject = useCallback(
-		async (raw: unknown): Promise<boolean | null> => {
-			const isAxcutDocument =
-				typeof raw === "object" && raw !== null && "schemaVersion" in raw && "timeline" in raw;
-			const doc = isAxcutDocument
-				? documentSchema.parse(migrateRawDocumentToCurrent(raw)) // disk-load: upgrade v3/v4 → v5, then validate
-				: migrateProjectDataToAxcutDocument(raw as never);
-			const outcome = await replaceCurrentProject("open", () => importProject(doc));
-			return outcome.status === "completed" ? outcome.value : null;
-		},
-		[importProject],
-	);
-
 	const handleLoadProject = useCallback(async () => {
 		try {
-			const result = await window.electronAPI?.loadProjectFile?.();
-			if (!result?.success || !result.project) return;
-			if ((await openLoadedProject(result.project)) === false) {
-				setDropError("load-failed");
-			}
+			const api = window.electronAPI;
+			if (!api) return;
+			await replaceCurrentProject("open", () =>
+				importPreparedProjectFile(() => api.prepareProjectFile(), importProject, api),
+			);
 		} catch {
 			setDropError("load-failed");
 		}
-	}, [openLoadedProject]);
+	}, [importProject]);
 
 	const handleDragOver = useCallback((e: React.DragEvent) => {
 		e.preventDefault();
@@ -139,20 +117,21 @@ export function EditorEmptyState({
 				setDropError("load-failed");
 				return;
 			}
-			const result = await window.electronAPI?.loadProjectFileFromPath?.(filePath);
-			if (!result?.success || !result.project) {
-				setDropError("load-failed");
-				return;
-			}
 			try {
-				if ((await openLoadedProject(result.project)) === false) {
-					setDropError("load-failed");
-				}
+				const api = window.electronAPI;
+				if (!api) throw new Error("Desktop project API is unavailable");
+				await replaceCurrentProject("open", () =>
+					importPreparedProjectFile(
+						() => api.prepareProjectFileFromPath(filePath),
+						importProject,
+						api,
+					),
+				);
 			} catch {
 				setDropError("load-failed");
 			}
 		},
-		[openLoadedProject],
+		[importProject],
 	);
 
 	return (

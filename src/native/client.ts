@@ -106,10 +106,10 @@ export const nativeBridgeClient = {
 					existingProjectPath,
 				},
 			}),
-		loadProjectFile: (projectFolder?: string) =>
+		prepareProjectFile: (projectFolder?: string) =>
 			requireNativeBridgeData<ProjectFileResult>({
 				domain: "project",
-				action: "loadProjectFile",
+				action: "prepareProjectFile",
 				payload: { projectFolder },
 			}),
 		loadCurrentProjectFile: () =>
@@ -117,11 +117,23 @@ export const nativeBridgeClient = {
 				domain: "project",
 				action: "loadCurrentProjectFile",
 			}),
-		loadProjectFileFromPath: (path: string) =>
+		prepareProjectFileFromPath: (path: string) =>
 			requireNativeBridgeData<ProjectFileResult>({
 				domain: "project",
-				action: "loadProjectFileFromPath",
+				action: "prepareProjectFileFromPath",
 				payload: { path },
+			}),
+		commitProjectFileLoad: (preparationId: string) =>
+			requireNativeBridgeData<ProjectFileResult>({
+				domain: "project",
+				action: "commitProjectFileLoad",
+				payload: { preparationId },
+			}),
+		abortProjectFileLoad: (preparationId: string) =>
+			requireNativeBridgeData<ProjectFileResult>({
+				domain: "project",
+				action: "abortProjectFileLoad",
+				payload: { preparationId },
 			}),
 		setCurrentVideoPath: (path: string) =>
 			requireNativeBridgeData<ProjectPathResult>({

@@ -19,6 +19,8 @@ const bridgeMocks = vi.hoisted(() => ({
 const menuCallbacks = vi.hoisted(() => ({
 	newProject: null as (() => void) | null,
 	loadProject: null as (() => void) | null,
+	closeConfirm: null as ((operationId: number) => void) | null,
+	saveBeforeClose: null as ((operationId: number) => Promise<boolean> | boolean) | null,
 }));
 
 vi.mock("@/native/client", () => ({
@@ -259,13 +261,24 @@ describe("NewEditorShell project replacement routes", () => {
 		bridgeMocks.save.mockImplementation(async (document) => ({ success: true, document }));
 		menuCallbacks.newProject = null;
 		menuCallbacks.loadProject = null;
+		menuCallbacks.closeConfirm = null;
+		menuCallbacks.saveBeforeClose = null;
 		loadDirtyProject();
 
 		Object.assign(window, {
 			electronAPI: {
 				setHasUnsavedChanges: vi.fn(),
-				onRequestCloseConfirm: vi.fn(() => vi.fn()),
-				onRequestSaveBeforeClose: vi.fn(() => vi.fn()),
+				onRequestCloseConfirm: vi.fn((callback: (operationId: number) => void) => {
+					menuCallbacks.closeConfirm = callback;
+					return vi.fn();
+				}),
+				onRequestSaveBeforeClose: vi.fn(
+					(callback: (operationId: number) => Promise<boolean> | boolean) => {
+						menuCallbacks.saveBeforeClose = callback;
+						return vi.fn();
+					},
+				),
+				sendCloseConfirmResponse: vi.fn(),
 				onMenuNewProject: vi.fn((callback: () => void) => {
 					menuCallbacks.newProject = callback;
 					return vi.fn();
@@ -276,7 +289,13 @@ describe("NewEditorShell project replacement routes", () => {
 				}),
 				onMenuSaveProject: vi.fn(() => vi.fn()),
 				onMenuSaveProjectAs: vi.fn(() => vi.fn()),
-				loadProjectFile: vi.fn(async () => ({ success: true, project: importedProject })),
+				prepareProjectFile: vi.fn(async () => ({
+					success: true,
+					project: importedProject,
+					preparationId: "prepared-import",
+				})),
+				commitProjectFileLoad: vi.fn(async () => ({ success: true })),
+				abortProjectFileLoad: vi.fn(async () => ({ success: true })),
 			},
 		});
 	});
@@ -411,15 +430,61 @@ describe("NewEditorShell project replacement routes", () => {
 	});
 
 	it("keeps discarded changes when the browse picker is cancelled", async () => {
-		vi.mocked(window.electronAPI.loadProjectFile).mockResolvedValue({ success: false });
+		vi.mocked(window.electronAPI.prepareProjectFile).mockResolvedValue({ success: false });
 		render(<NewEditorShell />);
 		await waitFor(() => expect(bridgeMocks.listProjects).toHaveBeenCalled());
 		await triggerRoute("browse-import");
 
 		fireEvent.click(screen.getByRole("button", { name: "Discard Choice" }));
 
-		await waitFor(() => expect(window.electronAPI.loadProjectFile).toHaveBeenCalledTimes(1));
+		await waitFor(() => expect(window.electronAPI.prepareProjectFile).toHaveBeenCalledTimes(1));
 		expect(useProjectStore.getState()).toMatchObject({ document: projectA, dirty: true });
+	});
+
+	it("replies busy to close while a replacement prompt owns the lifecycle", async () => {
+		render(<NewEditorShell />);
+		await waitFor(() => expect(bridgeMocks.listProjects).toHaveBeenCalled());
+		await triggerRoute("topbar-open");
+		expect(screen.getByLabelText("Unsaved prompt")).toBeInTheDocument();
+
+		act(() => menuCallbacks.closeConfirm?.(41));
+
+		expect(window.electronAPI.sendCloseConfirmResponse).toHaveBeenCalledWith(41, "busy");
+		expect(screen.getAllByLabelText("Unsaved prompt")).toHaveLength(1);
+		fireEvent.click(screen.getByRole("button", { name: "Discard Choice" }));
+		await waitFor(() => expect(useProjectStore.getState().projectId).toBe(projectB.project.id));
+	});
+
+	it("keeps the first close prompt owned and replies busy to a second request", async () => {
+		render(<NewEditorShell />);
+		await waitFor(() => expect(bridgeMocks.listProjects).toHaveBeenCalled());
+
+		act(() => menuCallbacks.closeConfirm?.(51));
+		expect(screen.getAllByLabelText("Unsaved prompt")).toHaveLength(1);
+		act(() => menuCallbacks.closeConfirm?.(52));
+
+		expect(window.electronAPI.sendCloseConfirmResponse).toHaveBeenCalledWith(52, "busy");
+		expect(screen.getAllByLabelText("Unsaved prompt")).toHaveLength(1);
+		fireEvent.click(screen.getByRole("button", { name: "Cancel Choice" }));
+		await waitFor(() =>
+			expect(window.electronAPI.sendCloseConfirmResponse).toHaveBeenCalledWith(51, "cancel"),
+		);
+	});
+
+	it("correlates save-before-close with the close operation", async () => {
+		render(<NewEditorShell />);
+		await waitFor(() => expect(bridgeMocks.listProjects).toHaveBeenCalled());
+
+		act(() => menuCallbacks.closeConfirm?.(61));
+		fireEvent.click(screen.getByRole("button", { name: "Save Choice" }));
+		await waitFor(() =>
+			expect(window.electronAPI.sendCloseConfirmResponse).toHaveBeenCalledWith(61, "save"),
+		);
+
+		await expect(menuCallbacks.saveBeforeClose?.(60)).resolves.toBe(false);
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+		await expect(menuCallbacks.saveBeforeClose?.(61)).resolves.toBe(true);
+		expect(bridgeMocks.save).toHaveBeenCalledWith(projectA);
 	});
 
 	it("replaces a clean project without opening the prompt", async () => {

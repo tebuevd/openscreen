@@ -448,6 +448,45 @@ describe("project lifecycle failure reconciliation", () => {
 		});
 	});
 
+	it("does not install a project deleted while its disk read is pending", async () => {
+		const projectsRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-load-delete-"));
+		const mediaRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-load-delete-media-"));
+		const service = new DocumentService(projectsRoot, mediaRoot);
+
+		try {
+			const projectA = await service.createProject("Project A");
+			const projectB = await service.createProject("Project B");
+			connectDocumentService(service);
+			loadDocument(projectA);
+			const enteredRead = deferred<void>();
+			const releaseRead = deferred<void>();
+			const realReadFile = fs.readFile.bind(fs);
+			vi.spyOn(fs, "readFile").mockImplementationOnce(async (...args) => {
+				enteredRead.resolve(undefined);
+				await releaseRead.promise;
+				return realReadFile(...args);
+			});
+
+			const loading = useProjectStore.getState().loadProject(projectB.project.id);
+			await enteredRead.promise;
+			const deleting = useProjectStore.getState().deleteProject(projectB.project.id);
+			releaseRead.resolve(undefined);
+			await Promise.all([loading, deleting]);
+
+			expect(useProjectStore.getState()).toMatchObject({
+				projectId: projectA.project.id,
+				document: projectA,
+				status: "error",
+			});
+			await expect(service.getProject(projectB.project.id)).rejects.toBeInstanceOf(
+				DocumentNotFoundError,
+			);
+		} finally {
+			await fs.rm(projectsRoot, { recursive: true, force: true });
+			await fs.rm(mediaRoot, { recursive: true, force: true });
+		}
+	});
+
 	it("can retry deletion after a reconciled cleanup failure", async () => {
 		const projectsRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-retry-"));
 		const mediaRoot = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-retry-media-"));

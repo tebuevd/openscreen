@@ -86,6 +86,8 @@ export interface ProjectFileResult {
 	success: boolean;
 	path?: string;
 	project?: unknown;
+	/** Opaque main-process transaction created by a read-only project-file prepare. */
+	preparationId?: string;
 	message?: string;
 	canceled?: boolean;
 	error?: string;
@@ -523,7 +525,7 @@ export type NativeBridgeRequest =
 	  }
 	| {
 			domain: "project";
-			action: "loadProjectFile";
+			action: "prepareProjectFile";
 			payload?: {
 				/** Folder to pre-fill the open dialog with, usually the user's
 				 * last-opened project folder from userPreferences. */
@@ -539,8 +541,14 @@ export type NativeBridgeRequest =
 	  }
 	| {
 			domain: "project";
-			action: "loadProjectFileFromPath";
+			action: "prepareProjectFileFromPath";
 			payload: { path: string };
+			requestId?: string;
+	  }
+	| {
+			domain: "project";
+			action: "commitProjectFileLoad" | "abortProjectFileLoad";
+			payload: { preparationId: string };
 			requestId?: string;
 	  }
 	| {

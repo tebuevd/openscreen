@@ -251,12 +251,20 @@ test.describe("Windows native checklist smoke tests", () => {
 							},
 						});
 
-						if (request.domain === "project" && request.action === "loadProjectFile") {
+						if (request.domain === "project" && request.action === "prepareProjectFile") {
 							return success({
 								success: true,
 								path: payload.projectPath,
 								project: payload.project,
+								preparationId: "checklist-project-load",
 							});
+						}
+						if (
+							request.domain === "project" &&
+							(request.action === "commitProjectFileLoad" ||
+								request.action === "abortProjectFileLoad")
+						) {
+							return success({ success: true });
 						}
 						if (request.domain === "project" && request.action === "loadCurrentProjectFile") {
 							return success({ success: false, canceled: true });

@@ -9,7 +9,9 @@ const nativeMocks = vi.hoisted(() => ({
 	exportGifNative: vi.fn(),
 	exportMultiNative: vi.fn(),
 	exportMultiNativeStaged: vi.fn(),
-	loadProjectFileFromPath: vi.fn(),
+	prepareProjectFileFromPath: vi.fn(),
+	commitProjectFileLoad: vi.fn(),
+	abortProjectFileLoad: vi.fn(),
 	getTelemetry: vi.fn(),
 	readStagedNativeExport: vi.fn(),
 	renewStagedNativeExportLease: vi.fn(),
@@ -24,7 +26,11 @@ vi.mock("@/native", () => ({
 	exportMultiNative: nativeMocks.exportMultiNative,
 	exportMultiNativeStaged: nativeMocks.exportMultiNativeStaged,
 	nativeBridgeClient: {
-		project: { loadProjectFileFromPath: nativeMocks.loadProjectFileFromPath },
+		project: {
+			prepareProjectFileFromPath: nativeMocks.prepareProjectFileFromPath,
+			commitProjectFileLoad: nativeMocks.commitProjectFileLoad,
+			abortProjectFileLoad: nativeMocks.abortProjectFileLoad,
+		},
 		cursor: { getTelemetry: nativeMocks.getTelemetry },
 	},
 	readStagedNativeExport: nativeMocks.readStagedNativeExport,
@@ -91,14 +97,17 @@ function mockVideoMetadata(width: number, height: number): void {
 
 describe("CLI MP4 export submission", () => {
 	beforeEach(() => {
-		nativeMocks.loadProjectFileFromPath.mockResolvedValue({
+		nativeMocks.prepareProjectFileFromPath.mockResolvedValue({
 			success: true,
+			preparationId: "prepared-project",
 			project: {
 				version: 2,
 				media: { screenVideoPath: "/tmp/source.mp4" },
 				editor: {},
 			},
 		});
+		nativeMocks.commitProjectFileLoad.mockResolvedValue({ success: true });
+		nativeMocks.abortProjectFileLoad.mockResolvedValue({ success: true });
 		nativeMocks.exportMultiNative.mockResolvedValue({
 			frames: 60,
 			wallS: 1,
@@ -159,8 +168,9 @@ describe("CLI MP4 export submission", () => {
 	});
 
 	it("blocks a fully trimmed timeline before native export", async () => {
-		nativeMocks.loadProjectFileFromPath.mockResolvedValue({
+		nativeMocks.prepareProjectFileFromPath.mockResolvedValue({
 			success: true,
+			preparationId: "prepared-trimmed-project",
 			project: {
 				version: 2,
 				media: { screenVideoPath: "/tmp/source.mp4" },
