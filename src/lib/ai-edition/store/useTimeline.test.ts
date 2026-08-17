@@ -23,6 +23,7 @@ const StrictTimelineWrapper = ({ children }: PropsWithChildren) =>
 	createElement(StrictMode, null, createElement(I18nProvider, null, children));
 const renderStrictTimeline = () =>
 	renderHook(() => useTimeline(), { wrapper: StrictTimelineWrapper });
+const originalSaveDocumentUpdate = useProjectStore.getState().saveDocumentUpdate;
 
 const probeVideoDurationMock = vi.hoisted(() => vi.fn());
 const probeVideoDimensionsMock = vi.hoisted(() =>
@@ -128,6 +129,7 @@ function deferred<T>() {
 
 describe("useTimeline.insertClipAt background duration probe", () => {
 	beforeEach(() => {
+		useProjectStore.setState({ saveDocumentUpdate: originalSaveDocumentUpdate });
 		useProjectStore.getState().clear();
 		for (const mock of Object.values(bridgeMocks)) mock.mockReset();
 		probeVideoDurationMock.mockReset();
@@ -161,7 +163,8 @@ describe("useTimeline.insertClipAt background duration probe", () => {
 	});
 
 	afterEach(() => {
-		vi.clearAllMocks();
+		vi.restoreAllMocks();
+		useProjectStore.setState({ saveDocumentUpdate: originalSaveDocumentUpdate });
 	});
 
 	it("only resizes the probed clip and leaves earlier clips' positions untouched", async () => {
@@ -306,7 +309,20 @@ describe("useTimeline.insertClipAt background duration probe", () => {
 
 	it("keeps an attempt invalid after the same asset and clip identity is removed and re-added", async () => {
 		const duration = deferred<number | null>();
+		const oldDimensions = deferred<{ width: number; height: number } | null>();
 		probeVideoDurationMock.mockReturnValue(duration.promise);
+		probeVideoDimensionsMock
+			.mockReturnValueOnce(oldDimensions.promise)
+			.mockResolvedValueOnce({ width: 1024, height: 768 });
+		const beforeInsert = useProjectStore.getState().document!;
+		useProjectStore.setState({
+			document: {
+				...beforeInsert,
+				assets: beforeInsert.assets.map((asset) =>
+					asset.id === "asset_2" ? { ...asset, video: undefined } : asset,
+				),
+			},
+		});
 		const { result } = renderTimeline();
 
 		await act(async () => result.current.insertClipAt("asset_2", 1));
@@ -323,17 +339,78 @@ describe("useTimeline.insertClipAt background duration probe", () => {
 			});
 			useProjectStore.getState().setDocument(insertedDocument);
 		});
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
+		await waitFor(() =>
+			expect(
+				useProjectStore.getState().document?.assets.find((asset) => asset.id === "asset_2")?.video,
+			).toMatchObject({ width: 1024, height: 768 }),
+		);
 		await act(async () => {
 			duration.resolve(5);
+			oldDimensions.resolve({ width: 640, height: 360 });
 			await duration.promise;
-			await Promise.resolve();
+			await oldDimensions.promise;
 		});
 
-		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(2);
 		expect(
-			useProjectStore.getState().document?.assets.find((asset) => asset.id === "asset_2")
-				?.durationSec,
-		).toBeUndefined();
+			useProjectStore.getState().document?.assets.find((asset) => asset.id === "asset_2"),
+		).toMatchObject({ durationSec: undefined, video: { width: 1024, height: 768 } });
+	});
+
+	it("hands a pre-persistence invalidation to dimension backfill after the insert saves", async () => {
+		const insertionSave = deferred<{ success: true; document: AxcutDocument }>();
+		let insertionSnapshot: AxcutDocument | null = null;
+		bridgeMocks.save
+			.mockImplementationOnce((document: AxcutDocument) => {
+				insertionSnapshot = document;
+				return insertionSave.promise;
+			})
+			.mockImplementation(async (document: AxcutDocument) => ({
+				success: true,
+				document,
+			}));
+		const beforeInsert = useProjectStore.getState().document!;
+		useProjectStore.setState({
+			document: {
+				...beforeInsert,
+				assets: beforeInsert.assets.map((asset) =>
+					asset.id === "asset_2" ? { ...asset, video: undefined } : asset,
+				),
+			},
+		});
+		const { result } = renderTimeline();
+
+		let inserting!: Promise<void>;
+		act(() => {
+			inserting = result.current.insertClipAt("asset_2", 1);
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		act(() => {
+			const insertedDocument = useProjectStore.getState().document!;
+			useProjectStore.getState().setDocument({
+				...insertedDocument,
+				assets: insertedDocument.assets.filter((asset) => asset.id !== "asset_2"),
+				timeline: {
+					...insertedDocument.timeline,
+					clips: insertedDocument.timeline.clips.filter((clip) => clip.assetId !== "asset_2"),
+				},
+			});
+			useProjectStore.getState().setDocument(insertedDocument);
+		});
+		await act(async () => {
+			insertionSave.resolve({ success: true, document: insertionSnapshot! });
+			await inserting;
+		});
+
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+		await waitFor(() =>
+			expect(
+				useProjectStore.getState().document?.assets.find((asset) => asset.id === "asset_2")?.video,
+			).toMatchObject({ width: 1920, height: 1080 }),
+		);
+		expect(probeVideoDurationMock).not.toHaveBeenCalled();
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(2);
 	});
 
 	it("rebases a successful correction over an unrelated concurrent edit", async () => {
@@ -445,6 +522,209 @@ describe("useTimeline.insertClipAt background duration probe", () => {
 		expect(correction.timeline.clips.find((clip) => clip.assetId === "asset_2")).toMatchObject({
 			sourceEndSec: 5,
 		});
+	});
+
+	it.each([
+		"null",
+		"invalid",
+		"rejected",
+	] as const)("hands a %s insert dimension result to load-time backfill without spinning", async (resultKind) => {
+		vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		probeVideoDurationMock.mockResolvedValue(5);
+		if (resultKind === "rejected") {
+			probeVideoDimensionsMock
+				.mockRejectedValueOnce(new Error("probe failed"))
+				.mockResolvedValueOnce({ width: 1440, height: 900 });
+		} else {
+			probeVideoDimensionsMock
+				.mockResolvedValueOnce(resultKind === "null" ? null : { width: 0, height: 0 })
+				.mockResolvedValueOnce({ width: 1440, height: 900 });
+		}
+		const current = useProjectStore.getState().document!;
+		useProjectStore.setState({
+			document: {
+				...current,
+				assets: current.assets.map((asset) =>
+					asset.id === "asset_2" ? { ...asset, video: undefined } : asset,
+				),
+			},
+		});
+		const { result } = renderTimeline();
+
+		await act(async () => result.current.insertClipAt("asset_2", 1));
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2));
+		await waitFor(() =>
+			expect(
+				useProjectStore.getState().document?.assets.find((asset) => asset.id === "asset_2")?.video,
+			).toMatchObject({ width: 1440, height: 900 }),
+		);
+		await act(async () => new Promise((resolve) => setTimeout(resolve, 0)));
+
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(2);
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(resultKind === "rejected" ? 2 : 3);
+	});
+
+	it("lets an in-flight load-time probe own dimensions when insertion starts later", async () => {
+		const dimensions = deferred<{ width: number; height: number } | null>();
+		probeVideoDurationMock.mockResolvedValue(5);
+		probeVideoDimensionsMock.mockReturnValue(dimensions.promise);
+		const current = useProjectStore.getState().document!;
+		const existingAssetClip: AxcutDocument["timeline"]["clips"][number] = {
+			id: "clip_asset_2_existing",
+			assetId: "asset_2",
+			sourceStartSec: 0,
+			sourceEndSec: 10,
+			timelineStartSec: 10,
+			timelineEndSec: 20,
+			wordRefs: [],
+			origin: "user",
+			reason: "Existing clip",
+		};
+		useProjectStore.setState({
+			document: {
+				...current,
+				assets: current.assets.map((asset) =>
+					asset.id === "asset_2" ? { ...asset, video: undefined } : asset,
+				),
+				timeline: {
+					...current.timeline,
+					clips: [...current.timeline.clips, existingAssetClip],
+				},
+			},
+		});
+		const { result } = renderTimeline();
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+
+		await act(async () => result.current.insertClipAt("asset_2", 2));
+		await act(async () => Promise.resolve());
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			dimensions.resolve({ width: 1600, height: 900 });
+			await dimensions.promise;
+		});
+		await waitFor(() =>
+			expect(
+				useProjectStore.getState().document?.assets.find((asset) => asset.id === "asset_2")?.video,
+			).toMatchObject({ width: 1600, height: 900 }),
+		);
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
+	});
+
+	it("suppresses load-time dimension work while an insert-first probe is in flight", async () => {
+		const dimensions = deferred<{ width: number; height: number } | null>();
+		probeVideoDurationMock.mockResolvedValue(5);
+		probeVideoDimensionsMock.mockReturnValue(dimensions.promise);
+		const current = useProjectStore.getState().document!;
+		useProjectStore.setState({
+			document: {
+				...current,
+				assets: current.assets.map((asset) =>
+					asset.id === "asset_2" ? { ...asset, video: undefined } : asset,
+				),
+			},
+		});
+		const { result } = renderTimeline();
+
+		await act(async () => result.current.insertClipAt("asset_2", 1));
+		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
+		await act(async () => Promise.resolve());
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
+
+		await act(async () => {
+			dimensions.resolve({ width: 1280, height: 720 });
+			await dimensions.promise;
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1);
+	});
+
+	it.each([
+		"insertion-save",
+		"duration",
+		"dimensions",
+	] as const)("disposes a pending insert attempt on unmount before %s settles", async (pendingPhase) => {
+		const insertionSave = deferred<{ success: true; document: AxcutDocument }>();
+		const duration = deferred<number | null>();
+		const dimensions = deferred<{ width: number; height: number } | null>();
+		let insertionSnapshot: AxcutDocument | null = null;
+		if (pendingPhase === "insertion-save") {
+			bridgeMocks.save
+				.mockImplementationOnce((document: AxcutDocument) => {
+					insertionSnapshot = document;
+					return insertionSave.promise;
+				})
+				.mockImplementation(async (document: AxcutDocument) => ({
+					success: true,
+					document,
+				}));
+		} else {
+			probeVideoDurationMock.mockReturnValue(
+				pendingPhase === "duration" ? duration.promise : Promise.resolve(5),
+			);
+			probeVideoDimensionsMock.mockImplementationOnce(() =>
+				pendingPhase === "dimensions"
+					? dimensions.promise
+					: Promise.resolve({ width: 1280, height: 720 }),
+			);
+		}
+		probeVideoDimensionsMock.mockResolvedValue({ width: 1920, height: 1080 });
+		const current = useProjectStore.getState().document!;
+		useProjectStore.setState({
+			document: {
+				...current,
+				assets: current.assets.map((asset) =>
+					asset.id === "asset_2" ? { ...asset, video: undefined } : asset,
+				),
+			},
+		});
+		const saveDocumentUpdate = vi.fn(originalSaveDocumentUpdate);
+		useProjectStore.setState({ saveDocumentUpdate });
+		const rendered = renderTimeline();
+		const originalSubscribe = useProjectStore.subscribe;
+		let activeSubscriptions = 0;
+		vi.spyOn(useProjectStore, "subscribe").mockImplementation((listener) => {
+			activeSubscriptions++;
+			const unsubscribe = originalSubscribe(listener);
+			let active = true;
+			return () => {
+				if (active) activeSubscriptions--;
+				active = false;
+				unsubscribe();
+			};
+		});
+		let inserting!: Promise<void>;
+		act(() => {
+			inserting = rendered.result.current.insertClipAt("asset_2", 1);
+		});
+		await waitFor(() => expect(activeSubscriptions).toBe(1));
+		if (pendingPhase !== "insertion-save") await act(async () => inserting);
+		rendered.unmount();
+		expect(activeSubscriptions).toBe(0);
+
+		await act(async () => {
+			if (pendingPhase === "insertion-save") {
+				insertionSave.resolve({ success: true, document: insertionSnapshot! });
+			} else if (pendingPhase === "duration") {
+				duration.resolve(5);
+			} else {
+				dimensions.resolve({ width: 1280, height: 720 });
+			}
+			await inserting;
+			await Promise.resolve();
+		});
+
+		expect(saveDocumentUpdate).not.toHaveBeenCalled();
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		renderTimeline();
+		await waitFor(() => expect(saveDocumentUpdate).toHaveBeenCalledTimes(1));
+		await waitFor(() =>
+			expect(
+				useProjectStore.getState().document?.assets.find((asset) => asset.id === "asset_2")?.video,
+			).toMatchObject({ width: 1920, height: 1080 }),
+		);
+		const expectedDimensionCalls = pendingPhase === "insertion-save" ? 1 : 2;
+		expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(expectedDimensionCalls);
 	});
 });
 

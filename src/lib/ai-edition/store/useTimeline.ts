@@ -84,10 +84,30 @@ interface InsertClipProbeIdentity {
 interface InsertClipProbeAttempt {
 	identity: InsertClipProbeIdentity;
 	token: symbol;
+	active: boolean;
+	unsubscribe: (() => void) | null;
 }
 
 function needsSourceDimensions(asset: AxcutDocument["assets"][number]): boolean {
 	return !asset.video?.width || !asset.video.height;
+}
+
+function validSourceDimensions(
+	dimensions: { width: number; height: number } | null,
+): { width: number; height: number } | null {
+	return dimensions &&
+		Number.isFinite(dimensions.width) &&
+		dimensions.width > 0 &&
+		Number.isFinite(dimensions.height) &&
+		dimensions.height > 0
+		? dimensions
+		: null;
+}
+
+function disposeInsertClipProbeAttempt(attempt: InsertClipProbeAttempt): void {
+	attempt.active = false;
+	attempt.unsubscribe?.();
+	attempt.unsubscribe = null;
 }
 
 /**
@@ -138,6 +158,33 @@ export function useTimeline() {
 	const [multiSelection, setMultiSelection] = useState<RegionHandle[]>([]);
 	const [clipSelection, setClipSelection] = useState<string | null>(null);
 	const insertClipProbeAttemptsRef = useRef(new Map<string, InsertClipProbeAttempt>());
+	const mountedRef = useRef(false);
+	const [dimensionProbeCoordinatorRevision, setDimensionProbeCoordinatorRevision] = useState(0);
+
+	useEffect(() => {
+		mountedRef.current = true;
+		return () => {
+			mountedRef.current = false;
+			for (const attempt of insertClipProbeAttemptsRef.current.values()) {
+				disposeInsertClipProbeAttempt(attempt);
+			}
+			insertClipProbeAttemptsRef.current.clear();
+		};
+	}, []);
+
+	const requestDimensionBackfill = useCallback((identity: InsertClipProbeIdentity) => {
+		if (!mountedRef.current) return;
+		const current = useProjectStore.getState();
+		if (
+			current.documentGeneration !== identity.documentGeneration ||
+			current.projectId !== identity.projectId
+		) {
+			return;
+		}
+		// Eligibility is deliberately evaluated by the normal effect. Waking it even when this
+		// exact store notification removed the asset lets a same-batch remove/re-add be observed.
+		setDimensionProbeCoordinatorRevision((revision) => revision + 1);
+	}, []);
 
 	const hasDoc = document !== null && projectId !== null;
 
@@ -183,6 +230,7 @@ export function useTimeline() {
 	}, [projectId, documentGeneration]);
 
 	useEffect(() => {
+		void dimensionProbeCoordinatorRevision;
 		if (!document || !projectId || projectStatus !== "ready") return;
 		const session = dimensionProbeSessionRef.current;
 		if (
@@ -207,6 +255,7 @@ export function useTimeline() {
 			[...insertClipProbeAttemptsRef.current.values()]
 				.filter(
 					(attempt) =>
+						attempt.active &&
 						attempt.identity.projectId === projectId &&
 						attempt.identity.documentGeneration === documentGeneration,
 				)
@@ -302,7 +351,7 @@ export function useTimeline() {
 				}
 			}
 		})();
-	}, [document, projectId, documentGeneration, projectStatus]);
+	}, [document, projectId, documentGeneration, projectStatus, dimensionProbeCoordinatorRevision]);
 
 	// Every add* below anchors the new region to the clip(s) it covers before storing it.
 	// A modifier MUST own a clip anchor to survive reorder/trim (see
@@ -971,9 +1020,13 @@ export function useTimeline() {
 		async (identity: InsertClipProbeIdentity, insertionSave: Promise<void>) => {
 			const { projectId, documentGeneration, assetId, clipId, originalPath } = identity;
 			const attemptKey = JSON.stringify([documentGeneration, projectId, assetId, clipId]);
+			const previousAttempt = insertClipProbeAttemptsRef.current.get(attemptKey);
+			if (previousAttempt) disposeInsertClipProbeAttempt(previousAttempt);
 			const attempt: InsertClipProbeAttempt = {
 				identity,
 				token: Symbol("insert-clip-probe"),
+				active: true,
+				unsubscribe: null,
 			};
 			insertClipProbeAttemptsRef.current.set(attemptKey, attempt);
 			const matchesIdentity = (current: ReturnType<typeof useProjectStore.getState>) => {
@@ -987,12 +1040,25 @@ export function useTimeline() {
 					clip?.assetId === assetId
 				);
 			};
-			let invalidated = !matchesIdentity(useProjectStore.getState());
-			const unsubscribe = useProjectStore.subscribe((current) => {
-				if (!matchesIdentity(current)) invalidated = true;
-			});
+			let insertionPersisted = false;
+			const releaseAttempt = (handoffDimensions: boolean) => {
+				const wasActive = attempt.active;
+				disposeInsertClipProbeAttempt(attempt);
+				if (insertClipProbeAttemptsRef.current.get(attemptKey)?.token === attempt.token) {
+					insertClipProbeAttemptsRef.current.delete(attemptKey);
+				}
+				if (wasActive && handoffDimensions) requestDimensionBackfill(identity);
+			};
+			if (matchesIdentity(useProjectStore.getState())) {
+				attempt.unsubscribe = useProjectStore.subscribe((current) => {
+					if (!matchesIdentity(current)) releaseAttempt(insertionPersisted);
+				});
+			} else {
+				releaseAttempt(false);
+			}
 			const isCurrentAttempt = () =>
-				!invalidated &&
+				mountedRef.current &&
+				attempt.active &&
 				insertClipProbeAttemptsRef.current.get(attemptKey)?.token === attempt.token &&
 				matchesIdentity(useProjectStore.getState());
 
@@ -1003,16 +1069,35 @@ export function useTimeline() {
 					// The insert itself reports this failure. Do not launch detached metadata work for it.
 					return;
 				}
-				if (!isCurrentAttempt()) return;
+				insertionPersisted = true;
+				if (!isCurrentAttempt()) {
+					requestDimensionBackfill(identity);
+					return;
+				}
 
 				const fileUrl = toFileUrl(originalPath);
 				// Dims probed alongside duration — otherwise `asset.video` stays permanently unset for
 				// most recordings (nothing else populates it), silently breaking anything that reads
 				// real source dimensions later (e.g. the export dialog's downscale/upscale badges).
-				const [probedDuration, probedDims] = await Promise.all([
+				const session = dimensionProbeSessionRef.current;
+				const loadTimeAttempt =
+					session?.active &&
+					session.projectId === projectId &&
+					session.documentGeneration === documentGeneration
+						? session.assets.get(assetId)
+						: undefined;
+				const loadTimeProbeOwnsDimensions =
+					loadTimeAttempt?.status === "in-flight" && loadTimeAttempt.originalPath === originalPath;
+				const currentAsset = useProjectStore
+					.getState()
+					.document?.assets.find((candidate) => candidate.id === assetId);
+				const shouldProbeDimensions =
+					!!currentAsset && needsSourceDimensions(currentAsset) && !loadTimeProbeOwnsDimensions;
+				const [probedDuration, rawProbedDimensions] = await Promise.all([
 					probeVideoDuration(fileUrl),
-					probeVideoDimensions(fileUrl),
+					shouldProbeDimensions ? probeVideoDimensions(fileUrl) : Promise.resolve(null),
 				]);
+				const probedDims = validSourceDimensions(rawProbedDimensions);
 				if (!isCurrentAttempt()) return;
 
 				await useProjectStore.getState().saveDocumentUpdate(
@@ -1091,13 +1176,10 @@ export function useTimeline() {
 					isCurrentAttempt,
 				);
 			} finally {
-				unsubscribe();
-				if (insertClipProbeAttemptsRef.current.get(attemptKey)?.token === attempt.token) {
-					insertClipProbeAttemptsRef.current.delete(attemptKey);
-				}
+				releaseAttempt(insertionPersisted);
 			}
 		},
-		[],
+		[requestDimensionBackfill],
 	);
 
 	// Insert a new full-duration clip for `assetId` at position `index`
@@ -1175,7 +1257,7 @@ export function useTimeline() {
 				});
 			}
 			await insertionSave;
-			setClipSelection(newClip.id);
+			if (mountedRef.current) setClipSelection(newClip.id);
 		},
 		[saveDocument, probeAndCorrectClip],
 	);
