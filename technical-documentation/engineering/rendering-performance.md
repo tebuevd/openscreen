@@ -96,10 +96,13 @@ decode ([`cpu_frames.rs`](../../crates/compositor/src/cpu_frames_windows.rs)), f
 usable D3D11 GPU. Rendering and decoding are two independent axes — WARP covers the
 first and *nothing* of the second, on any platform — so the fallback needed both halves.
 
-Measured with a preview-shaped workload, because the CPU backend cannot reach the export
-path at all: `h264_amf` requires the real GPU, and encode is a **third** axis with no
-software fallback wired today. So the harness grew `--preview` (decode → compose →
-readback, no encoder) and `--backend`, which is what makes the two comparable:
+This first CPU-backend measurement used a preview-shaped workload because export was not
+wired to WARP at that point: `h264_amf` required the real GPU, and encode was a **third**
+axis with no software fallback in that revision. That limitation is historical. The
+current Windows path reads WARP's composed frames directly and can use system-frame or
+software encoders, as documented in [CPU export — the third axis](#cpu-export--the-third-axis).
+For the original comparison, the harness added `--preview` (decode → compose → readback,
+no encoder) and `--backend`:
 
 ```bash
 x.bat run --release -- --cfg C1..C8 --backend cpu --preview --frames 300 --repeat 3

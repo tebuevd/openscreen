@@ -67,9 +67,9 @@ FFmpeg and compositor, and packages only that target with
 `electron-builder --mac --<arch> --dir`. Cross-compiling the FFmpeg/compositor half
 is not wired into the local scripts.
 
-For a local package of the machine's current architecture, run under matching
-Node/Rust toolchains in a clean checkout (`ARCH=arm64` on Apple Silicon or `ARCH=x64`
-on Intel):
+For a local unpacked app of the machine's current architecture, run under matching
+Node/Rust toolchains in a clean checkout. The example is Apple Silicon; on an Intel
+Mac, substitute `x64` for both `ARCH=arm64` and electron-builder's `--arm64` flag:
 
 ```bash
 ARCH=arm64
@@ -78,8 +78,13 @@ OPENSCREEN_MAC_HELPER_ARCHS="$ARCH" npm run build:native:mac
 npm run fetch:ffmpeg:mac
 npm run build:native:compositor:mac
 npm run build-vite
-npx electron-builder --mac "--${ARCH}" --publish never
+npx electron-builder --mac --arm64 --dir --publish never
 ```
+
+Keep the explicit `--arm64` or `--x64` and `--dir`. The architecture flag restricts
+electron-builder to the native payload just built; without it, `--mac` expands the
+configured `x64` + `arm64` DMG targets. `--dir` produces only the unpacked `.app`, not
+either configured DMG.
 
 Use a separate clean checkout on the matching native host for the other architecture.
 The FFmpeg SDK directory is not architecture-qualified, and every staged native
