@@ -40,6 +40,7 @@ import {
 	exportMultiNativeStaged,
 	nativeBridgeClient,
 	readStagedNativeExport,
+	renewStagedNativeExportLease,
 	replaceStagedNativeExport,
 } from "@/native";
 import { buildSceneDescription } from "@/native/sceneDescription";
@@ -47,6 +48,7 @@ import { CLI_EXPORT_DIMENSIONS_ERROR, prepareCliExportDocument } from "./prepare
 import { clampZoomFocus } from "./vendor/zoomHelpers";
 
 const MP4_EXPORT_FPS = 60;
+const STAGED_EXPORT_LEASE_HEARTBEAT_MS = 60_000;
 
 function probeVideoMetadata(
 	url: string,
@@ -126,7 +128,10 @@ function appendAutoZoomRanges(
 	return suggestions.length;
 }
 
-export async function runExport(request: CliExportRequest): Promise<CliDoneResult> {
+export async function runExport(
+	request: CliExportRequest,
+	abortSignal?: AbortSignal,
+): Promise<CliDoneResult> {
 	const loaded = await nativeBridgeClient.project.loadProjectFileFromPath(request.projectPath);
 	if (!loaded.success || loaded.project === undefined) {
 		throw new Error(loaded.error ?? loaded.message ?? "Failed to load project file");
@@ -256,6 +261,7 @@ export async function runExport(request: CliExportRequest): Promise<CliDoneResul
 	const scene = buildSceneDescription(axcutDocument, null, { visibleClips, outputDims });
 	const clips = scene.clips;
 	const sceneJson = JSON.stringify(scene);
+	const warnings: string[] = [];
 
 	// Progress: native pushes raw encoded-frame counts; totals and pacing are
 	// computed here, mirroring the ExportDialog.
@@ -282,13 +288,15 @@ export async function runExport(request: CliExportRequest): Promise<CliDoneResul
 	try {
 		if (format === "gif") {
 			const dims = gifDims ?? {};
-			await exportGifNative(clips, outPath, sceneJson, {
+			const result = await exportGifNative(clips, outPath, sceneJson, {
 				...dims,
 				fps: gifFrameRate,
 				loopCount: editor.gifLoop ? 0 : 1,
 			});
+			if (result.cleanupWarning) warnings.push(result.cleanupWarning.message);
 			return {
 				success: true,
+				...(warnings.length > 0 ? { warnings } : {}),
 				outputPath: outPath,
 				format,
 				width: dims.width,
@@ -308,14 +316,35 @@ export async function runExport(request: CliExportRequest): Promise<CliDoneResul
 		};
 
 		if (!request.audioPath) {
-			await exportMultiNative(clips, outPath, sceneJson, mp4Params);
+			const result = await exportMultiNative(clips, outPath, sceneJson, mp4Params);
+			if (result.cleanupWarning) warnings.push(result.cleanupWarning.message);
 		} else {
 			let transactionId: string | null = null;
+			let leaseTimer: number | null = null;
+			let renewalInFlight = false;
+			const stopLeaseRenewal = () => {
+				if (leaseTimer !== null) window.clearInterval(leaseTimer);
+				leaseTimer = null;
+			};
 			try {
 				const staged = await exportMultiNativeStaged(clips, outPath, sceneJson, mp4Params, [
 					request.audioPath,
 				]);
 				transactionId = staged.transactionId;
+				if (!abortSignal?.aborted) {
+					leaseTimer = window.setInterval(() => {
+						if (renewalInFlight) return;
+						renewalInFlight = true;
+						void renewStagedNativeExportLease(staged.transactionId)
+							.catch((error) => {
+								console.warn("[cli-export] failed to renew staged export lease:", error);
+							})
+							.finally(() => {
+								renewalInFlight = false;
+							});
+					}, STAGED_EXPORT_LEASE_HEARTBEAT_MS);
+					abortSignal?.addEventListener("abort", stopLeaseRenewal, { once: true });
+				}
 				window.electronAPI.cliProgress({ percentage: 100, phase: "mixing-voiceover" });
 				const [videoData, audioResponse] = await Promise.all([
 					readStagedNativeExport(transactionId),
@@ -330,9 +359,12 @@ export async function runExport(request: CliExportRequest): Promise<CliDoneResul
 					offsetSec: request.audioOffsetSec,
 				});
 				await replaceStagedNativeExport(transactionId, await mixed.arrayBuffer());
-				await commitStagedNativeExport(transactionId);
+				const commit = await commitStagedNativeExport(transactionId);
+				if (commit.cleanupWarning) warnings.push(commit.cleanupWarning.message);
 				transactionId = null;
 			} finally {
+				stopLeaseRenewal();
+				abortSignal?.removeEventListener("abort", stopLeaseRenewal);
 				if (transactionId) {
 					await abortStagedNativeExport(transactionId).catch((error) => {
 						console.warn("[cli-export] failed to abort staged export:", error);
@@ -343,6 +375,7 @@ export async function runExport(request: CliExportRequest): Promise<CliDoneResul
 
 		return {
 			success: true,
+			...(warnings.length > 0 ? { warnings } : {}),
 			outputPath: outPath,
 			format,
 			width: mp4Resolution.settings.width,
@@ -355,26 +388,38 @@ export async function runExport(request: CliExportRequest): Promise<CliDoneResul
 
 export function CliExportRunner() {
 	const startedRef = useRef(false);
+	const abortControllerRef = useRef<AbortController | null>(null);
+	const abortTimerRef = useRef<number | null>(null);
 	const [status, setStatus] = useState("Starting export…");
 
 	useEffect(() => {
-		if (startedRef.current) return;
-		startedRef.current = true;
+		if (abortTimerRef.current !== null) window.clearTimeout(abortTimerRef.current);
+		abortTimerRef.current = null;
+		if (!startedRef.current) {
+			startedRef.current = true;
+			const abortController = new AbortController();
+			abortControllerRef.current = abortController;
 
-		void (async () => {
-			try {
-				const request = (await window.electronAPI.cliGetRequest()) as CliExportRequest;
-				if (request.kind !== "export") {
-					throw new Error(`cli-export window received a ${request.kind} request`);
+			void (async () => {
+				try {
+					const request = (await window.electronAPI.cliGetRequest()) as CliExportRequest;
+					if (request.kind !== "export") {
+						throw new Error(`cli-export window received a ${request.kind} request`);
+					}
+					setStatus(`Exporting ${request.projectPath}…`);
+					const result = await runExport(request, abortController.signal);
+					await window.electronAPI.cliDone(result);
+				} catch (error) {
+					const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
+					await window.electronAPI.cliDone({ success: false, error: message });
 				}
-				setStatus(`Exporting ${request.projectPath}…`);
-				const result = await runExport(request);
-				await window.electronAPI.cliDone(result);
-			} catch (error) {
-				const message = error instanceof Error ? (error.stack ?? error.message) : String(error);
-				await window.electronAPI.cliDone({ success: false, error: message });
-			}
-		})();
+			})();
+		}
+		return () => {
+			// StrictMode immediately remounts this effect in development; defer abort so that
+			// synthetic cleanup can be cancelled while a real unmount still stops renewal.
+			abortTimerRef.current = window.setTimeout(() => abortControllerRef.current?.abort(), 0);
+		};
 	}, []);
 
 	return (

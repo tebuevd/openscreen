@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { cleanup, render } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CliExportRequest } from "@/lib/cliContracts";
 
@@ -11,6 +12,7 @@ const nativeMocks = vi.hoisted(() => ({
 	loadProjectFileFromPath: vi.fn(),
 	getTelemetry: vi.fn(),
 	readStagedNativeExport: vi.fn(),
+	renewStagedNativeExportLease: vi.fn(),
 	replaceStagedNativeExport: vi.fn(),
 }));
 const voiceoverMocks = vi.hoisted(() => ({ mixVoiceoverIntoVideo: vi.fn() }));
@@ -26,6 +28,7 @@ vi.mock("@/native", () => ({
 		cursor: { getTelemetry: nativeMocks.getTelemetry },
 	},
 	readStagedNativeExport: nativeMocks.readStagedNativeExport,
+	renewStagedNativeExportLease: nativeMocks.renewStagedNativeExportLease,
 	replaceStagedNativeExport: nativeMocks.replaceStagedNativeExport,
 }));
 
@@ -33,7 +36,17 @@ vi.mock("@/lib/exporter/voiceoverMix", () => ({
 	mixVoiceoverIntoVideo: voiceoverMocks.mixVoiceoverIntoVideo,
 }));
 
-import { runExport } from "./CliExportRunner";
+import { CliExportRunner, runExport } from "./CliExportRunner";
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((next, fail) => {
+		resolve = next;
+		reject = fail;
+	});
+	return { promise, reject, resolve };
+}
 
 function request(quality: "good" | "source"): CliExportRequest {
 	return {
@@ -102,6 +115,7 @@ describe("CLI MP4 export submission", () => {
 		nativeMocks.replaceStagedNativeExport.mockResolvedValue({ ok: true });
 		nativeMocks.commitStagedNativeExport.mockResolvedValue({ outputPath: "/tmp/export.mp4" });
 		nativeMocks.abortStagedNativeExport.mockResolvedValue({ ok: true });
+		nativeMocks.renewStagedNativeExportLease.mockResolvedValue({ ok: true });
 		voiceoverMocks.mixVoiceoverIntoVideo.mockResolvedValue(
 			new Blob(["mixed output"], { type: "video/mp4" }),
 		);
@@ -114,6 +128,8 @@ describe("CLI MP4 export submission", () => {
 	});
 
 	afterEach(() => {
+		vi.useRealTimers();
+		cleanup();
 		vi.restoreAllMocks();
 		vi.clearAllMocks();
 		vi.unstubAllGlobals();
@@ -201,7 +217,13 @@ describe("CLI MP4 export submission", () => {
 		);
 		nativeMocks.commitStagedNativeExport.mockImplementation(async () => {
 			destinationBytes = stagedBytes;
-			return { outputPath: "/tmp/export.mp4" };
+			return {
+				outputPath: "/tmp/export.mp4",
+				cleanupWarning: {
+					code: "EXPORT_CLEANUP_PENDING",
+					message: "Export saved, but temporary cleanup is still pending.",
+				},
+			};
 		});
 
 		const result = await runExport(withVoiceover);
@@ -214,5 +236,99 @@ describe("CLI MP4 export submission", () => {
 		expect(nativeMocks.abortStagedNativeExport).not.toHaveBeenCalled();
 		expect(destinationBytes).toBe("mixed output");
 		expect(result.outputPath).toBe("/tmp/export.mp4");
+		expect(result.warnings).toEqual(["Export saved, but temporary cleanup is still pending."]);
+	});
+
+	it("renews a long voiceover lease and stops renewal when its owner signal aborts", async () => {
+		vi.useFakeTimers({ toFake: ["setInterval", "clearInterval"] });
+		const withVoiceover = { ...request("good"), audioPath: "/tmp/voiceover.wav" };
+		const mix = deferred<Blob>();
+		let mixingStarted!: () => void;
+		const didStartMixing = new Promise<void>((resolve) => {
+			mixingStarted = resolve;
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }) as Response),
+		);
+		voiceoverMocks.mixVoiceoverIntoVideo.mockImplementationOnce(() => {
+			mixingStarted();
+			return mix.promise;
+		});
+		const abortController = new AbortController();
+		const exportPromise = runExport(withVoiceover, abortController.signal);
+		await didStartMixing;
+
+		await vi.advanceTimersByTimeAsync(6 * 60_000);
+		expect(nativeMocks.renewStagedNativeExportLease).toHaveBeenCalledTimes(6);
+		expect(nativeMocks.renewStagedNativeExportLease).toHaveBeenLastCalledWith("transaction-1");
+
+		abortController.abort();
+		const renewalsAtAbort = nativeMocks.renewStagedNativeExportLease.mock.calls.length;
+		await vi.advanceTimersByTimeAsync(2 * 60_000);
+		expect(nativeMocks.renewStagedNativeExportLease).toHaveBeenCalledTimes(renewalsAtAbort);
+
+		mix.resolve(new Blob(["mixed output"], { type: "video/mp4" }));
+		await expect(exportPromise).resolves.toEqual(
+			expect.objectContaining({ success: true, outputPath: "/tmp/export.mp4" }),
+		);
+	});
+
+	it("stops voiceover lease renewal when the CLI runner unmounts", async () => {
+		vi.useFakeTimers({
+			toFake: ["setInterval", "clearInterval", "setTimeout", "clearTimeout"],
+		});
+		const withVoiceover = { ...request("good"), audioPath: "/tmp/voiceover.wav" };
+		const mix = deferred<Blob>();
+		let mixingStarted!: () => void;
+		const didStartMixing = new Promise<void>((resolve) => {
+			mixingStarted = resolve;
+		});
+		let cliFinished!: () => void;
+		const didFinishCli = new Promise<void>((resolve) => {
+			cliFinished = resolve;
+		});
+		vi.stubGlobal(
+			"fetch",
+			vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }) as Response),
+		);
+		voiceoverMocks.mixVoiceoverIntoVideo.mockImplementationOnce(() => {
+			mixingStarted();
+			return mix.promise;
+		});
+		Object.assign(window.electronAPI, {
+			cliGetRequest: vi.fn(async () => withVoiceover),
+			cliDone: vi.fn(async () => cliFinished()),
+		});
+		const view = render(<CliExportRunner />);
+		await didStartMixing;
+		await vi.advanceTimersByTimeAsync(60_000);
+		expect(nativeMocks.renewStagedNativeExportLease).toHaveBeenCalledOnce();
+
+		view.unmount();
+		await vi.advanceTimersByTimeAsync(0);
+		await vi.advanceTimersByTimeAsync(2 * 60_000);
+		expect(nativeMocks.renewStagedNativeExportLease).toHaveBeenCalledOnce();
+
+		mix.resolve(new Blob(["mixed output"], { type: "video/mp4" }));
+		await didFinishCli;
+	});
+
+	it("returns cleanup warnings for an installed direct export", async () => {
+		nativeMocks.exportMultiNative.mockResolvedValueOnce({
+			frames: 60,
+			wallS: 1,
+			fps: 60,
+			videoDurationS: 1,
+			cleanupWarning: {
+				code: "EXPORT_CLEANUP_PENDING",
+				message: "Export saved, but temporary cleanup is still pending.",
+			},
+		});
+
+		const result = await runExport(request("good"));
+
+		expect(result.success).toBe(true);
+		expect(result.warnings).toEqual(["Export saved, but temporary cleanup is still pending."]);
 	});
 });

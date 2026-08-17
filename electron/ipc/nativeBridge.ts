@@ -1,4 +1,4 @@
-import { ipcMain } from "electron";
+import { app, ipcMain, webContents } from "electron";
 import type { AiEditionChatEvent } from "../../src/native/contracts";
 import {
 	NATIVE_BRIDGE_CHANNEL,
@@ -225,6 +225,12 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 	const exportTransactionOwners = new ExportTransactionOwnerRegistry({
 		abortOwner: (owner) => compositorViewService.abortOwnerExports(owner),
 	});
+	for (const contents of webContents.getAllWebContents()) {
+		exportTransactionOwners.observe(contents);
+	}
+	app.on("web-contents-created", (_event, contents) => {
+		exportTransactionOwners.observe(contents);
+	});
 	const aiEditionService = new AiEditionService({
 		documents: context.getAiEditionDocuments(),
 		// Passed uncalled on purpose — invoking it here would build the store (and
@@ -251,6 +257,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		const domain = request.domain as string;
 
 		try {
+			exportTransactionOwners.observe(event.sender);
 			switch (request.domain) {
 				case "system": {
 					const action = request.action as string;
@@ -404,7 +411,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 							return createSuccessResponse(requestId, { ok: true });
 						case "exportMulti": {
 							const sender = event.sender;
-							const owner = exportTransactionOwners.ownerFor(sender);
+							const owner = exportTransactionOwners.ownerFor(event);
 							const stats = await compositorViewService.exportMulti(
 								request.payload.clips,
 								request.payload.outPath,
@@ -428,7 +435,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 						}
 						case "exportMultiStaged": {
 							const sender = event.sender;
-							const owner = exportTransactionOwners.ownerFor(sender);
+							const owner = exportTransactionOwners.ownerFor(event);
 							const result = await compositorViewService.exportMultiStaged(
 								request.payload.clips,
 								request.payload.outPath,
@@ -453,34 +460,41 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 						}
 						case "readStagedExport": {
 							const data = await compositorViewService.readStagedExport(
-								exportTransactionOwners.ownerFor(event.sender),
+								exportTransactionOwners.ownerFor(event),
 								request.payload.transactionId,
 							);
 							return createSuccessResponse(requestId, { data });
 						}
+						case "renewStagedExportLease":
+							compositorViewService.renewStagedExportLease(
+								exportTransactionOwners.ownerFor(event),
+								request.payload.transactionId,
+							);
+							return createSuccessResponse(requestId, { ok: true as const });
 						case "replaceStagedExport":
 							await compositorViewService.replaceStagedExport(
-								exportTransactionOwners.ownerFor(event.sender),
+								exportTransactionOwners.ownerFor(event),
 								request.payload.transactionId,
 								request.payload.data,
 							);
 							return createSuccessResponse(requestId, { ok: true as const });
 						case "commitStagedExport":
-							return createSuccessResponse(requestId, {
-								outputPath: await compositorViewService.commitStagedExport(
-									exportTransactionOwners.ownerFor(event.sender),
+							return createSuccessResponse(
+								requestId,
+								await compositorViewService.commitStagedExport(
+									exportTransactionOwners.ownerFor(event),
 									request.payload.transactionId,
 								),
-							});
+							);
 						case "abortStagedExport":
 							await compositorViewService.abortStagedExport(
-								exportTransactionOwners.ownerFor(event.sender),
+								exportTransactionOwners.ownerFor(event),
 								request.payload.transactionId,
 							);
 							return createSuccessResponse(requestId, { ok: true as const });
 						case "exportGif": {
 							const sender = event.sender;
-							const owner = exportTransactionOwners.ownerFor(sender);
+							const owner = exportTransactionOwners.ownerFor(event);
 							const stats = await compositorViewService.exportGif(
 								request.payload.clips,
 								request.payload.outPath,

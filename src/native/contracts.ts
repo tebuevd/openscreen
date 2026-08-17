@@ -156,12 +156,18 @@ export interface CompositorClipInput {
 }
 
 /** Bilan d'un export natif (mesure enveloppante §10 : frames, durée, fps). */
+export interface CompositorExportCleanupWarning {
+	code: "EXPORT_CLEANUP_PENDING";
+	message: string;
+}
+
 export interface CompositorExportResult {
 	frames: number;
 	wallS: number;
 	fps: number;
 	/** Durée de la vidéo exportée (secondes) — distincte de `wallS` (temps de rendu réel). */
 	videoDurationS: number;
+	cleanupWarning?: CompositorExportCleanupWarning;
 }
 
 /** Native render kept in a main-process transaction for a later post-processing commit. */
@@ -176,6 +182,7 @@ export interface CompositorStagedExportData {
 
 export interface CompositorExportCommitResult {
 	outputPath: string;
+	cleanupWarning?: CompositorExportCleanupWarning;
 }
 
 /** Taille/cadence/codec de sortie voulus. La taille est toujours une paire explicite. */
@@ -219,6 +226,7 @@ export interface CompositorExportGifResult {
 	/** Taille du fichier `.gif` final sur disque (octets), mesurée après
 	 *  le drop de l'encodeur (donc après le flush du trailer GIF89a). */
 	fileBytes: number;
+	cleanupWarning?: CompositorExportCleanupWarning;
 }
 
 // ---- AI Edition domain (Phase 1+) -----------------------------------------
@@ -754,6 +762,12 @@ export type NativeBridgeRequest =
 	| {
 			domain: "compositor";
 			action: "readStagedExport";
+			payload: { transactionId: string };
+			requestId?: string;
+	  }
+	| {
+			domain: "compositor";
+			action: "renewStagedExportLease";
 			payload: { transactionId: string };
 			requestId?: string;
 	  }

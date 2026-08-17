@@ -201,6 +201,14 @@ export function readStagedNativeExport(transactionId: string): Promise<ArrayBuff
 	}).then((result) => result.data);
 }
 
+export function renewStagedNativeExportLease(transactionId: string): Promise<{ ok: true }> {
+	return requireNativeBridgeData<{ ok: true }>({
+		domain: "compositor",
+		action: "renewStagedExportLease",
+		payload: { transactionId },
+	});
+}
+
 export function commitStagedNativeExport(
 	transactionId: string,
 ): Promise<CompositorExportCommitResult> {

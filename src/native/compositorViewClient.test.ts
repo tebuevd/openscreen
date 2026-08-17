@@ -13,6 +13,7 @@ import {
 	exportMultiNative,
 	exportMultiNativeStaged,
 	readStagedNativeExport,
+	renewStagedNativeExportLease,
 	replaceStagedNativeExport,
 } from "./compositorViewClient";
 
@@ -71,12 +72,13 @@ describe("exportMultiNative params", () => {
 		expect(requireNativeBridgeDataMock).not.toHaveBeenCalled();
 	});
 
-	it("wires staged render, replacement, commit, and abort through typed bridge actions", async () => {
+	it("wires staged render, lease, replacement, commit, and abort through typed bridge actions", async () => {
 		const params = { width: 1920, height: 1080, bitrate: 20_000_000 };
 		const data = new ArrayBuffer(4);
 
 		await exportMultiNativeStaged([], "/tmp/selected.mp4", "{}", params, ["/tmp/voiceover.wav"]);
 		await readStagedNativeExport("transaction-1");
+		await renewStagedNativeExportLease("transaction-1");
 		await replaceStagedNativeExport("transaction-1", data);
 		await commitStagedNativeExport("transaction-1");
 		await abortStagedNativeExport("transaction-2");
@@ -99,15 +101,20 @@ describe("exportMultiNative params", () => {
 		});
 		expect(requireNativeBridgeDataMock).toHaveBeenNthCalledWith(3, {
 			domain: "compositor",
+			action: "renewStagedExportLease",
+			payload: { transactionId: "transaction-1" },
+		});
+		expect(requireNativeBridgeDataMock).toHaveBeenNthCalledWith(4, {
+			domain: "compositor",
 			action: "replaceStagedExport",
 			payload: { transactionId: "transaction-1", data },
 		});
-		expect(requireNativeBridgeDataMock).toHaveBeenNthCalledWith(4, {
+		expect(requireNativeBridgeDataMock).toHaveBeenNthCalledWith(5, {
 			domain: "compositor",
 			action: "commitStagedExport",
 			payload: { transactionId: "transaction-1" },
 		});
-		expect(requireNativeBridgeDataMock).toHaveBeenNthCalledWith(5, {
+		expect(requireNativeBridgeDataMock).toHaveBeenNthCalledWith(6, {
 			domain: "compositor",
 			action: "abortStagedExport",
 			payload: { transactionId: "transaction-2" },

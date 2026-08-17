@@ -337,7 +337,11 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 				});
 			});
 			try {
-				let stats: { videoDurationS: number; wallS: number };
+				let stats: {
+					videoDurationS: number;
+					wallS: number;
+					cleanupWarning?: { message: string };
+				};
 				if (format === "gif") {
 					if (!gifOutput) throw new Error(dimensionsUnavailable);
 					stats = await exportGifNative(clips, pickedPath, sceneJson, {
@@ -361,7 +365,7 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 				if (!isCurrentSubmission()) return;
 				setSavedPath(pickedPath);
 				setPhase("done");
-				toast.success(t("exportDialog.exportedVideo"), {
+				const toastOptions = {
 					description: `${pickedPath} · ${formatHms(stats.videoDurationS)} ${t("exportDialog.exportedVideoOf")} ${formatHms(stats.wallS)}`,
 					action: {
 						label: t("exportDialog.showInFolder"),
@@ -374,7 +378,12 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 							});
 						},
 					},
-				});
+				};
+				if (stats.cleanupWarning) {
+					toast.warning(stats.cleanupWarning.message, toastOptions);
+				} else {
+					toast.success(t("exportDialog.exportedVideo"), toastOptions);
+				}
 			} catch (err) {
 				if (!isCurrentSubmission()) return;
 				setError(err instanceof Error ? err.message : String(err));

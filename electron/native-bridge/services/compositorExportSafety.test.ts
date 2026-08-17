@@ -46,7 +46,7 @@ describe("compositor export destination safety", () => {
 		vi.restoreAllMocks();
 	});
 
-	function makeService() {
+	function makeService(exportDestinationTransactions = new ExportDestinationTransactionManager()) {
 		const exportMulti = vi.fn(async (_clips: ClipInput[], outputPath: string) => {
 			await fs.writeFile(outputPath, "native mp4");
 			return MP4_STATS;
@@ -61,7 +61,7 @@ describe("compositor export destination safety", () => {
 			exportGif,
 			service: new CompositorViewService({
 				addon,
-				exportDestinationTransactions: new ExportDestinationTransactionManager(),
+				exportDestinationTransactions,
 			}),
 		};
 	}
@@ -175,6 +175,52 @@ describe("compositor export destination safety", () => {
 		expect(await fs.readFile(destination, "utf8")).toBe("native gif");
 	});
 
+	it("returns a structured warning when output installs but lock cleanup remains pending", async () => {
+		const sourcePath = path.join(directory, "recording.mp4");
+		const destination = path.join(directory, "output.mp4");
+		await fs.writeFile(sourcePath, "recording bytes");
+		await fs.writeFile(destination, "old export");
+		const processLocks = new Set<string>();
+		const manager = new ExportDestinationTransactionManager({
+			cleanupRetryDelaysMs: [],
+			processLocks,
+			rmdir: async (directoryPath) => {
+				if (path.basename(directoryPath).startsWith(".openscreen-export-lock-")) {
+					throw new Error("lock cleanup failed");
+				}
+				await fs.rmdir(directoryPath);
+			},
+			onCleanupIssue: vi.fn(),
+		});
+		const clips = [clip(sourcePath)];
+		const { service } = makeService(manager);
+
+		const result = await service.exportMulti(clips, destination, sceneJson(clips), {
+			width: 1920,
+			height: 1080,
+		});
+
+		expect(result?.cleanupWarning).toEqual({
+			code: "EXPORT_CLEANUP_PENDING",
+			message: expect.stringMatching(/cleanup is still pending/),
+		});
+		expect(await fs.readFile(destination, "utf8")).toBe("native mp4");
+
+		const recovery = new ExportDestinationTransactionManager({ processLocks });
+		const recoveryOwner = {};
+		const transaction = await recovery.begin({
+			owner: recoveryOwner,
+			requestedPath: destination,
+			extension: ".mp4",
+			sourcePaths: [],
+			requiresPostprocess: false,
+		});
+		await recovery.abort(recoveryOwner, transaction.id);
+		expect(
+			(await fs.readdir(directory)).filter((name) => name.startsWith(".openscreen-export")),
+		).toEqual([]);
+	});
+
 	it("holds a staged MP4 off-destination until post-processing is committed", async () => {
 		const sourcePath = path.join(directory, "recording.mp4");
 		const voiceoverPath = path.join(directory, "voiceover.wav");
@@ -198,6 +244,7 @@ describe("compositor export destination safety", () => {
 		if (!staged) throw new Error("Expected staged export");
 		expect(staged).toEqual({ transactionId: expect.any(String), stats: MP4_STATS });
 		expect(await fs.readFile(destination, "utf8")).toBe("old export");
+		expect(() => service.renewStagedExportLease(owner, staged.transactionId)).not.toThrow();
 		expect(
 			new TextDecoder().decode(await service.readStagedExport(owner, staged.transactionId)),
 		).toBe("native mp4");
@@ -207,9 +254,9 @@ describe("compositor export destination safety", () => {
 			staged.transactionId,
 			new TextEncoder().encode("mixed mp4").buffer,
 		);
-		await expect(service.commitStagedExport(owner, staged.transactionId)).resolves.toBe(
-			destination,
-		);
+		await expect(service.commitStagedExport(owner, staged.transactionId)).resolves.toEqual({
+			outputPath: destination,
+		});
 
 		expect(await fs.readFile(destination, "utf8")).toBe("mixed mp4");
 		expect((await fs.readdir(directory)).some((name) => name.includes(".openscreen-export-"))).toBe(

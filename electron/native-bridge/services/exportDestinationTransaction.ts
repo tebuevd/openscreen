@@ -7,6 +7,20 @@ import { fileURLToPath } from "node:url";
 export type ExportContainerExtension = ".mp4" | ".gif";
 export type ExportTransactionOwner = object;
 
+export interface ExportCleanupWarning {
+	code: "EXPORT_CLEANUP_PENDING";
+	message: string;
+}
+
+export interface ExportDestinationCommitResult {
+	outputPath: string;
+	cleanupWarning?: ExportCleanupWarning;
+}
+
+export interface ExportDestinationRunResult<T> extends ExportDestinationCommitResult {
+	value: T;
+}
+
 type RenameFile = (oldPath: string, newPath: string) => Promise<void>;
 type RemoveFile = (filePath: string) => Promise<void>;
 type RemoveDirectory = (directoryPath: string) => Promise<void>;
@@ -36,6 +50,7 @@ export class ExportCleanupAggregateError extends Error {
 export interface ExportDestinationTransactionOptions {
 	platform?: NodeJS.Platform;
 	expiryMs?: number;
+	cleanupRetryDelaysMs?: number[];
 	rename?: RenameFile;
 	unlink?: RemoveFile;
 	rmdir?: RemoveDirectory;
@@ -71,6 +86,17 @@ interface OwnedDirectory {
 	identity: NodeIdentity;
 }
 
+interface OwnedLock extends OwnedDirectory {
+	key: string;
+}
+
+interface ProcessLockRecord {
+	keys: string[];
+	locks: OwnedLock[];
+	cleanupPending: boolean;
+	recoveryPromise: Promise<boolean> | null;
+}
+
 interface ExportDestinationTransaction {
 	id: string;
 	owner: ExportTransactionOwner;
@@ -83,7 +109,7 @@ interface ExportDestinationTransaction {
 	stagePath: string;
 	stageIdentity: NodeIdentity;
 	stageHandle: FileHandle | null;
-	locks: OwnedDirectory[];
+	locks: OwnedLock[];
 	state: TransactionState;
 	busy: boolean;
 	abortRequested: boolean;
@@ -98,9 +124,25 @@ interface PathIdentity {
 }
 
 const PROCESS_DESTINATION_LOCKS = new Set<string>();
+const PROCESS_LOCK_RECORDS = new WeakMap<Set<string>, Map<string, ProcessLockRecord>>();
 const URI_SCHEME = /^[a-zA-Z][a-zA-Z0-9+.-]*:/;
 const WINDOWS_DRIVE_PATH = /^[a-zA-Z]:[\\/]/;
-const DEFAULT_EXPIRY_MS = 5 * 60_000;
+/** Abandoned renderer post-processing is reaped unless this lease is renewed. */
+export const DEFAULT_EXPORT_POSTPROCESS_LEASE_MS = 5 * 60_000;
+const DEFAULT_CLEANUP_RETRY_DELAYS_MS = [25, 100, 250];
+const CLEANUP_PENDING_WARNING: ExportCleanupWarning = {
+	code: "EXPORT_CLEANUP_PENDING",
+	message: "Export saved, but temporary cleanup is still pending.",
+};
+
+function lockRecordsFor(processLocks: Set<string>): Map<string, ProcessLockRecord> {
+	let records = PROCESS_LOCK_RECORDS.get(processLocks);
+	if (!records) {
+		records = new Map();
+		PROCESS_LOCK_RECORDS.set(processLocks, records);
+	}
+	return records;
+}
 
 function errorCode(error: unknown): string | undefined {
 	return typeof error === "object" && error !== null && "code" in error
@@ -233,6 +275,7 @@ function attachCleanupIssues(error: unknown, issues: ExportCleanupIssue[]): Erro
 export class ExportDestinationTransactionManager {
 	private readonly platform: NodeJS.Platform;
 	private readonly expiryMs: number;
+	private readonly cleanupRetryDelaysMs: number[];
 	private readonly rename: RenameFile;
 	private readonly unlink: RemoveFile;
 	private readonly rmdir: RemoveDirectory;
@@ -241,13 +284,20 @@ export class ExportDestinationTransactionManager {
 	private readonly randomId: () => string;
 	private readonly onCleanupIssue: (issue: ExportCleanupIssue) => void;
 	private readonly processLocks: Set<string>;
+	private readonly processLockRecords: Map<string, ProcessLockRecord>;
 	private readonly transactions = new Map<string, ExportDestinationTransaction>();
 	private readonly transactionsByOwner = new Map<ExportTransactionOwner, Set<string>>();
 	private readonly revokedOwners = new WeakSet<ExportTransactionOwner>();
 
 	constructor(options: ExportDestinationTransactionOptions = {}) {
 		this.platform = options.platform ?? process.platform;
-		this.expiryMs = options.expiryMs ?? DEFAULT_EXPIRY_MS;
+		this.expiryMs = options.expiryMs ?? DEFAULT_EXPORT_POSTPROCESS_LEASE_MS;
+		this.cleanupRetryDelaysMs = [
+			...(options.cleanupRetryDelaysMs ?? DEFAULT_CLEANUP_RETRY_DELAYS_MS),
+		];
+		if (this.cleanupRetryDelaysMs.some((delay) => !Number.isFinite(delay) || delay < 0)) {
+			throw new TypeError("Export cleanup retry delays must be finite non-negative values.");
+		}
 		this.rename = options.rename ?? fs.rename;
 		this.unlink = options.unlink ?? fs.unlink;
 		this.rmdir = options.rmdir ?? fs.rmdir;
@@ -263,6 +313,7 @@ export class ExportDestinationTransactionManager {
 				);
 			});
 		this.processLocks = options.processLocks ?? PROCESS_DESTINATION_LOCKS;
+		this.processLockRecords = lockRecordsFor(this.processLocks);
 	}
 
 	async begin(options: BeginExportTransactionOptions): Promise<ExportDestinationTransactionHandle> {
@@ -462,7 +513,7 @@ export class ExportDestinationTransactionManager {
 		}
 	}
 
-	async commit(owner: ExportTransactionOwner, id: string): Promise<string> {
+	async commit(owner: ExportTransactionOwner, id: string): Promise<ExportDestinationCommitResult> {
 		const transaction = this.requireOwned(id, owner);
 		const expectedState: TransactionState = transaction.requiresPostprocess ? "ready" : "rendered";
 		this.enter(transaction, [expectedState], "commit");
@@ -488,8 +539,11 @@ export class ExportDestinationTransactionManager {
 			// without ever moving or unlinking the old destination.
 			await this.rename(transaction.stagePath, transaction.destinationPath);
 			transaction.state = "closed";
-			await this.closeTransaction(transaction);
-			return transaction.requestedPath;
+			const cleanupIssues = await this.closeTransaction(transaction, true);
+			return {
+				outputPath: transaction.requestedPath,
+				...(cleanupIssues.length > 0 ? { cleanupWarning: { ...CLEANUP_PENDING_WARNING } } : {}),
+			};
 		} catch (error) {
 			const issues = await this.closeTransaction(transaction);
 			throw attachCleanupIssues(error, issues);
@@ -504,7 +558,7 @@ export class ExportDestinationTransactionManager {
 		extension: ExportContainerExtension,
 		sourcePaths: string[],
 		writer: (internalPath: string) => Promise<T>,
-	): Promise<T> {
+	): Promise<ExportDestinationRunResult<T>> {
 		const transaction = await this.begin({
 			owner,
 			requestedPath,
@@ -513,8 +567,24 @@ export class ExportDestinationTransactionManager {
 			requiresPostprocess: false,
 		});
 		const result = await this.render(owner, transaction.id, writer);
-		await this.commit(owner, transaction.id);
-		return result;
+		const commit = await this.commit(owner, transaction.id);
+		return { value: result, ...commit };
+	}
+
+	renewLease(owner: ExportTransactionOwner, id: string): void {
+		const transaction = this.requireOwned(id, owner);
+		if (!transaction.requiresPostprocess) {
+			throw new Error("Export transaction does not have a renewable post-processing lease.");
+		}
+		if (
+			transaction.abortRequested ||
+			!(["rendered", "awaiting-postprocess", "ready"] as TransactionState[]).includes(
+				transaction.state,
+			)
+		) {
+			throw new Error(`Cannot renew an export transaction in state ${transaction.state}.`);
+		}
+		this.scheduleExpiry(transaction);
 	}
 
 	async abort(owner: ExportTransactionOwner, id: string): Promise<void> {
@@ -588,6 +658,8 @@ export class ExportDestinationTransactionManager {
 	}
 
 	private scheduleExpiry(transaction: ExportDestinationTransaction): void {
+		if (transaction.expiryTimer) clearTimeout(transaction.expiryTimer);
+		transaction.expiryTimer = null;
 		if (!transaction.requiresPostprocess || this.expiryMs <= 0) return;
 		transaction.expiryTimer = setTimeout(() => {
 			void this.abort(transaction.owner, transaction.id).catch((error) => {
@@ -671,13 +743,24 @@ export class ExportDestinationTransactionManager {
 		}
 	}
 
-	private async acquireLocks(directory: string, keys: string[]): Promise<OwnedDirectory[]> {
-		if (keys.some((key) => this.processLocks.has(key))) {
-			throw new Error("An export to this destination is already in progress.");
+	private async acquireLocks(directory: string, keys: string[]): Promise<OwnedLock[]> {
+		for (const key of keys) {
+			const record = this.processLockRecords.get(key);
+			if (record?.cleanupPending) await this.recoverPendingLock(record);
+		}
+		if (keys.some((key) => this.processLocks.has(key) || this.processLockRecords.has(key))) {
+			throw new Error("An export to this destination is already in progress or awaiting cleanup.");
 		}
 		for (const key of keys) this.processLocks.add(key);
 
-		const locks: OwnedDirectory[] = [];
+		const locks: OwnedLock[] = [];
+		const record: ProcessLockRecord = {
+			keys: [...keys],
+			locks,
+			cleanupPending: false,
+			recoveryPromise: null,
+		};
+		for (const key of keys) this.processLockRecords.set(key, record);
 		try {
 			for (const key of [...keys].sort()) {
 				const lockPath = path.join(directory, lockName(key));
@@ -695,7 +778,8 @@ export class ExportDestinationTransactionManager {
 				if (!stat.isDirectory() || stat.isSymbolicLink()) {
 					throw new Error("Export destination lock is not a directory.");
 				}
-				locks.push({ path: lockPath, identity: identityOf(stat) });
+				const lock = { key, path: lockPath, identity: identityOf(stat) };
+				locks.push(lock);
 			}
 			return locks;
 		} catch (error) {
@@ -708,17 +792,69 @@ export class ExportDestinationTransactionManager {
 
 	private async releaseLocks(
 		keys: string[],
-		locks: OwnedDirectory[],
+		locks: OwnedLock[],
 		issues: ExportCleanupIssue[],
 	): Promise<void> {
-		for (const lock of [...locks].reverse()) {
-			await this.removeExpectedDirectory(lock, issues);
+		const record = keys
+			.map((key) => this.processLockRecords.get(key))
+			.find((candidate) => candidate?.locks === locks);
+		let allRemoved = true;
+		// Locks were acquired in key order: inode first, stable path last. Stop on failure
+		// so the path lock remains visible to other processes until the group is fully clean.
+		for (const lock of locks) {
+			const removed = await this.removeExpectedDirectory(lock, issues);
+			if (!removed) {
+				allRemoved = false;
+				break;
+			}
 		}
-		for (const key of keys) this.processLocks.delete(key);
+		if (allRemoved) {
+			for (const key of keys) {
+				if (this.processLockRecords.get(key) === record) this.processLockRecords.delete(key);
+				this.processLocks.delete(key);
+			}
+		} else if (record) {
+			record.cleanupPending = true;
+		}
+	}
+
+	private async recoverPendingLock(record: ProcessLockRecord): Promise<boolean> {
+		if (!record.cleanupPending) return false;
+		if (record.recoveryPromise) return record.recoveryPromise;
+
+		const recovery = (async () => {
+			const issues: ExportCleanupIssue[] = [];
+			let allRemoved = true;
+			for (const lock of record.locks) {
+				const removed = await this.removeExpectedDirectory(lock, issues);
+				if (!removed) {
+					allRemoved = false;
+					break;
+				}
+			}
+			if (allRemoved) {
+				for (const key of record.keys) {
+					if (this.processLockRecords.get(key) === record) this.processLockRecords.delete(key);
+					this.processLocks.delete(key);
+				}
+			} else {
+				this.reportCleanupIssues(issues);
+			}
+			return allRemoved;
+		})();
+		record.recoveryPromise = recovery;
+		try {
+			return await recovery;
+		} finally {
+			if (record.keys.some((key) => this.processLockRecords.get(key) === record)) {
+				record.recoveryPromise = null;
+			}
+		}
 	}
 
 	private async closeTransaction(
 		transaction: ExportDestinationTransaction,
+		retryAfterInstall = false,
 	): Promise<ExportCleanupIssue[]> {
 		if (transaction.state === "closed" && !this.transactions.has(transaction.id)) return [];
 		transaction.state = "closed";
@@ -729,17 +865,38 @@ export class ExportDestinationTransactionManager {
 		ownerTransactions?.delete(transaction.id);
 		if (ownerTransactions?.size === 0) this.transactionsByOwner.delete(transaction.owner);
 
+		let issues = await this.cleanupOwnedResources(transaction);
+		if (retryAfterInstall) {
+			for (const delayMs of this.cleanupRetryDelaysMs) {
+				if (issues.length === 0) break;
+				await new Promise<void>((resolve) => {
+					const timer = setTimeout(resolve, delayMs);
+					timer.unref?.();
+				});
+				issues = await this.cleanupOwnedResources(transaction);
+			}
+		}
+		this.reportCleanupIssues(issues);
+		return issues;
+	}
+
+	private async cleanupOwnedResources(
+		transaction: ExportDestinationTransaction,
+	): Promise<ExportCleanupIssue[]> {
 		const issues: ExportCleanupIssue[] = [];
 		if (transaction.stageHandle) {
-			await transaction.stageHandle.close().catch((error) => {
-				issues.push({ path: transaction.stagePath, reason: "failed to close stage file", error });
-			});
-			transaction.stageHandle = null;
+			await transaction.stageHandle.close().then(
+				() => {
+					transaction.stageHandle = null;
+				},
+				(error) => {
+					issues.push({ path: transaction.stagePath, reason: "failed to close stage file", error });
+				},
+			);
 		}
 		await this.removeExpectedFile(transaction.stagePath, transaction.stageIdentity, issues);
 		await this.removeExpectedDirectory(transaction.workspace, issues);
 		await this.releaseLocks(transaction.destinationKeys, transaction.locks, issues);
-		this.reportCleanupIssues(issues);
 		return issues;
 	}
 
@@ -763,6 +920,7 @@ export class ExportDestinationTransactionManager {
 		try {
 			await this.unlink(filePath);
 		} catch (error) {
+			if (errorCode(error) === "ENOENT") return;
 			issues.push({ path: filePath, reason: "failed to remove owned stage file", error });
 		}
 	}
@@ -770,27 +928,30 @@ export class ExportDestinationTransactionManager {
 	private async removeExpectedDirectory(
 		directory: OwnedDirectory,
 		issues: ExportCleanupIssue[],
-	): Promise<void> {
+	): Promise<boolean> {
 		let stat: BigIntStats | null;
 		try {
 			stat = await lstatIfExists(directory.path);
 		} catch (error) {
 			issues.push({ path: directory.path, reason: "failed to inspect owned directory", error });
-			return;
+			return false;
 		}
-		if (!stat) return;
+		if (!stat) return true;
 		if (!stat.isDirectory() || !sameIdentity(stat, directory.identity)) {
 			issues.push({ path: directory.path, reason: "refused to remove an unowned directory" });
-			return;
+			return false;
 		}
 		try {
 			await this.rmdir(directory.path);
+			return true;
 		} catch (error) {
+			if (errorCode(error) === "ENOENT") return true;
 			issues.push({
 				path: directory.path,
 				reason: "failed to remove owned empty directory",
 				error,
 			});
+			return false;
 		}
 	}
 

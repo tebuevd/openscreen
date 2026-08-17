@@ -20,6 +20,7 @@ describe("ExportDestinationTransactionManager", () => {
 	});
 
 	afterEach(async () => {
+		vi.useRealTimers();
 		await fs.rm(directory, { recursive: true, force: true });
 		vi.restoreAllMocks();
 	});
@@ -353,17 +354,164 @@ describe("ExportDestinationTransactionManager", () => {
 		await manager.commit(OWNER_A, transaction.id);
 	});
 
-	it("expires abandoned staged transactions and releases resources", async () => {
-		const manager = new ExportDestinationTransactionManager({ expiryMs: 20 });
+	it("keeps a renewed post-processing lease alive beyond five minutes", async () => {
+		vi.useFakeTimers();
+		const destination = path.join(directory, "output.mp4");
+		const manager = new ExportDestinationTransactionManager({ expiryMs: 5 * 60_000 });
+		const transaction = await beginPostprocess(manager, destination);
+		await manager.render(OWNER_A, transaction.id, async (stagePath) => {
+			await fs.writeFile(stagePath, "native output");
+		});
+
+		await vi.advanceTimersByTimeAsync(4 * 60_000);
+		manager.renewLease(OWNER_A, transaction.id);
+		await vi.advanceTimersByTimeAsync(4 * 60_000);
+		manager.renewLease(OWNER_A, transaction.id);
+
+		await manager.readRenderedOutput(OWNER_A, transaction.id);
+		await manager.replaceWithPostprocessedOutput(
+			OWNER_A,
+			transaction.id,
+			Buffer.from("mixed output"),
+		);
+		await expect(manager.commit(OWNER_A, transaction.id)).resolves.toEqual({
+			outputPath: destination,
+		});
+		expect(await fs.readFile(destination, "utf8")).toBe("mixed output");
+	});
+
+	it("expires a staged transaction after one missed lease period and cleans resources", async () => {
+		vi.useFakeTimers();
+		const manager = new ExportDestinationTransactionManager({ expiryMs: 5 * 60_000 });
 		const transaction = await beginPostprocess(manager);
 		await manager.render(OWNER_A, transaction.id, async (stagePath) => {
 			await fs.writeFile(stagePath, "native output");
 		});
 		expect(await artifacts()).not.toEqual([]);
 
-		await new Promise((resolve) => setTimeout(resolve, 60));
+		await vi.advanceTimersByTimeAsync(5 * 60_000 + 1);
 
 		await expect(manager.readRenderedOutput(OWNER_A, transaction.id)).rejects.toThrow(/not active/);
+		await vi.waitFor(async () => expect(await artifacts()).toEqual([]));
+	});
+
+	it("rejects foreign, invalid-state, and closed lease renewals", async () => {
+		const manager = new ExportDestinationTransactionManager();
+		const transaction = await beginPostprocess(manager);
+
+		expect(() => manager.renewLease(OWNER_A, transaction.id)).toThrow(/state created/);
+		await manager.render(OWNER_A, transaction.id, async (stagePath) => {
+			await fs.writeFile(stagePath, "native output");
+		});
+		expect(() => manager.renewLease(OWNER_B, transaction.id)).toThrow(/another sender/);
+		expect(() => manager.renewLease(OWNER_A, transaction.id)).not.toThrow();
+
+		await manager.abort(OWNER_A, transaction.id);
+		expect(() => manager.renewLease(OWNER_A, transaction.id)).toThrow(/not active/);
+		expect(await artifacts()).toEqual([]);
+	});
+
+	it("retries a transient post-install lock cleanup before reporting clean success", async () => {
+		const destination = path.join(directory, "output.mp4");
+		let lockRemovalAttempts = 0;
+		const manager = new ExportDestinationTransactionManager({
+			cleanupRetryDelaysMs: [0],
+			rmdir: async (directoryPath) => {
+				if (path.basename(directoryPath).startsWith(".openscreen-export-lock-")) {
+					lockRemovalAttempts += 1;
+					if (lockRemovalAttempts === 1) throw new Error("transient lock cleanup failure");
+				}
+				await fs.rmdir(directoryPath);
+			},
+		});
+
+		const result = await manager.run(OWNER_A, destination, ".mp4", [], async (stagePath) => {
+			await fs.writeFile(stagePath, "new export");
+			return "native stats";
+		});
+
+		expect(result).toEqual({ value: "native stats", outputPath: destination });
+		expect(lockRemovalAttempts).toBe(2);
+		expect(await fs.readFile(destination, "utf8")).toBe("new export");
+		expect(await artifacts()).toEqual([]);
+	});
+
+	it("retains a persistent failed lock until a fresh same-process manager recovers it", async () => {
+		const destination = path.join(directory, "output.mp4");
+		await fs.writeFile(destination, "old export");
+		const processLocks = new Set<string>();
+		let persistentLockPath: string | null = null;
+		let initialLockRemovalCount = 0;
+		const failLockRemoval = async (directoryPath: string) => {
+			if (path.basename(directoryPath).startsWith(".openscreen-export-lock-")) {
+				if (persistentLockPath === directoryPath) {
+					throw new Error("persistent lock cleanup failure");
+				}
+				initialLockRemovalCount += 1;
+				if (persistentLockPath === null && initialLockRemovalCount === 2) {
+					persistentLockPath = directoryPath;
+					throw new Error("persistent lock cleanup failure");
+				}
+			}
+			await fs.rmdir(directoryPath);
+		};
+		const first = new ExportDestinationTransactionManager({
+			cleanupRetryDelaysMs: [],
+			processLocks,
+			rmdir: failLockRemoval,
+			onCleanupIssue: vi.fn(),
+		});
+
+		const result = await first.run(OWNER_A, destination, ".mp4", [], async (stagePath) => {
+			await fs.writeFile(stagePath, "installed output");
+		});
+
+		expect(result.cleanupWarning).toEqual({
+			code: "EXPORT_CLEANUP_PENDING",
+			message: expect.stringMatching(/cleanup is still pending/),
+		});
+		expect(await fs.readFile(destination, "utf8")).toBe("installed output");
+		expect((await artifacts()).filter((name) => name.includes("lock"))).toHaveLength(1);
+
+		const blockedCrossProcess = new ExportDestinationTransactionManager({
+			processLocks: new Set(),
+		});
+		await expect(
+			blockedCrossProcess.begin({
+				owner: OWNER_B,
+				requestedPath: destination,
+				extension: ".mp4",
+				sourcePaths: [],
+				requiresPostprocess: false,
+			}),
+		).rejects.toThrow(/locked by another process/);
+
+		const blocked = new ExportDestinationTransactionManager({
+			processLocks,
+			rmdir: failLockRemoval,
+			onCleanupIssue: vi.fn(),
+		});
+		await expect(
+			blocked.begin({
+				owner: OWNER_B,
+				requestedPath: destination,
+				extension: ".mp4",
+				sourcePaths: [],
+				requiresPostprocess: false,
+			}),
+		).rejects.toThrow(/awaiting cleanup/);
+		expect(await fs.readFile(destination, "utf8")).toBe("installed output");
+
+		const recovered = new ExportDestinationTransactionManager({ processLocks });
+		const next = await recovered.begin({
+			owner: OWNER_B,
+			requestedPath: destination,
+			extension: ".mp4",
+			sourcePaths: [],
+			requiresPostprocess: false,
+		});
+		await recovered.abort(OWNER_B, next.id);
+		expect(await fs.readFile(destination, "utf8")).toBe("installed output");
 		expect(await artifacts()).toEqual([]);
 	});
 

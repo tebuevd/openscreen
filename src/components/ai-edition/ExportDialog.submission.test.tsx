@@ -12,6 +12,7 @@ const nativeMocks = vi.hoisted(() => ({
 	exportMultiNative: vi.fn(),
 }));
 const probeVideoDimensionsMock = vi.hoisted(() => vi.fn());
+const toastMocks = vi.hoisted(() => ({ error: vi.fn(), success: vi.fn(), warning: vi.fn() }));
 
 vi.mock("@/native", () => ({
 	exportGifNative: nativeMocks.exportGifNative,
@@ -20,7 +21,7 @@ vi.mock("@/native", () => ({
 }));
 
 vi.mock("sonner", () => ({
-	toast: { error: vi.fn(), success: vi.fn() },
+	toast: toastMocks,
 }));
 
 vi.mock("@/lib/ai-edition/timeline/duration", async (importOriginal) => ({
@@ -193,6 +194,30 @@ describe("ExportDialog submission", () => {
 			codec: "h264",
 		});
 		expect(submittedScene(call).output).toEqual({ width: 2880, height: 1864, fps: null });
+	});
+
+	it("reports installed output with pending cleanup as a warning rather than clean success", async () => {
+		nativeMocks.exportMultiNative.mockResolvedValueOnce({
+			frames: 60,
+			wallS: 1,
+			fps: 60,
+			videoDurationS: 1,
+			cleanupWarning: {
+				code: "EXPORT_CLEANUP_PENDING",
+				message: "Export saved, but temporary cleanup is still pending.",
+			},
+		});
+		renderDialog(makeDocument(video(1920, 1080)));
+
+		await submitMp4();
+
+		expect(await screen.findByText("/tmp/export.mp4")).toBeInTheDocument();
+		expect(toastMocks.warning).toHaveBeenCalledWith(
+			"Export saved, but temporary cleanup is still pending.",
+			expect.objectContaining({ description: expect.stringContaining("/tmp/export.mp4") }),
+		);
+		expect(toastMocks.success).not.toHaveBeenCalled();
+		expect(toastMocks.error).not.toHaveBeenCalled();
 	});
 
 	it("blocks before save/native export when the on-demand probe fails", async () => {

@@ -23,7 +23,11 @@ import type {
 	NativeFramePacket,
 	RemuxStats,
 } from "../../native/compositor-view/addon";
-import type { ExportTransactionOwner } from "./exportDestinationTransaction";
+import type {
+	ExportCleanupWarning,
+	ExportDestinationCommitResult,
+	ExportTransactionOwner,
+} from "./exportDestinationTransaction";
 import {
 	ExportDestinationTransactionManager,
 	normalizeLocalFilePath,
@@ -317,6 +321,8 @@ export interface StagedCompositorExport<TStats> {
 	transactionId: string;
 	stats: TStats;
 }
+
+type ExportResultWithCleanup<TStats> = TStats & { cleanupWarning?: ExportCleanupWarning };
 
 export interface CompositorViewServiceOptions {
 	/**
@@ -721,7 +727,7 @@ export class CompositorViewService {
 		params: ExportParamsInput,
 		onProgress?: (frames: number) => void,
 		owner: ExportTransactionOwner = this.internalExportOwner,
-	): Promise<ExportStats | null> {
+	): Promise<ExportResultWithCleanup<ExportStats> | null> {
 		const validatedParams = validateExportParamsInput(params);
 		const target = outPath ?? path.join(app.getPath("temp"), "openscreen-native-export.mp4");
 		const resolvedSceneJson = sceneJson ? resolveSceneAssetPaths(sceneJson) : undefined;
@@ -730,7 +736,7 @@ export class CompositorViewService {
 		if (!addon) {
 			return null;
 		}
-		return this.exportDestinationTransactions.run(
+		const result = await this.exportDestinationTransactions.run(
 			owner,
 			target,
 			".mp4",
@@ -744,6 +750,10 @@ export class CompositorViewService {
 					onProgress,
 				),
 		);
+		return {
+			...result.value,
+			...(result.cleanupWarning ? { cleanupWarning: result.cleanupWarning } : {}),
+		};
 	}
 
 	/** Native MP4 render held for renderer-side post-processing before one final commit. */
@@ -807,8 +817,15 @@ export class CompositorViewService {
 		);
 	}
 
-	commitStagedExport(owner: ExportTransactionOwner, transactionId: string): Promise<string> {
+	commitStagedExport(
+		owner: ExportTransactionOwner,
+		transactionId: string,
+	): Promise<ExportDestinationCommitResult> {
 		return this.exportDestinationTransactions.commit(owner, transactionId);
+	}
+
+	renewStagedExportLease(owner: ExportTransactionOwner, transactionId: string): void {
+		this.exportDestinationTransactions.renewLease(owner, transactionId);
 	}
 
 	abortStagedExport(owner: ExportTransactionOwner, transactionId: string): Promise<void> {
@@ -833,7 +850,7 @@ export class CompositorViewService {
 		params?: GifParamsInput,
 		onProgress?: (frames: number) => void,
 		owner: ExportTransactionOwner = this.internalExportOwner,
-	): Promise<GifExportStats | null> {
+	): Promise<ExportResultWithCleanup<GifExportStats> | null> {
 		const target = outPath ?? path.join(app.getPath("temp"), "openscreen-native-export.gif");
 		const resolvedSceneJson = sceneJson ? resolveSceneAssetPaths(sceneJson) : undefined;
 		const inputs = normalizeNativeExportInputs(clips, resolvedSceneJson);
@@ -841,7 +858,7 @@ export class CompositorViewService {
 		if (!addon) {
 			return null;
 		}
-		return this.exportDestinationTransactions.run(
+		const result = await this.exportDestinationTransactions.run(
 			owner,
 			target,
 			".gif",
@@ -849,6 +866,10 @@ export class CompositorViewService {
 			(temporaryPath) =>
 				addon.exportGif(inputs.clips, temporaryPath, inputs.sceneJson, params, onProgress),
 		);
+		return {
+			...result.value,
+			...(result.cleanupWarning ? { cleanupWarning: result.cleanupWarning } : {}),
+		};
 	}
 
 	/** Stream-copy `inputPath` to `outputPath` through libavformat's matroska muxer.
