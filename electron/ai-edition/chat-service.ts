@@ -19,13 +19,16 @@ import {
 } from "../../src/lib/ai-edition/schema";
 import type {
 	AiEditionChatCommitResult,
+	AiEditionChatCompactResult,
 	AiEditionChatComposerRestoration,
-	AiEditionChatComposerRestorationAckResult,
+	AiEditionChatComposerRestorationClaimResult,
 	AiEditionChatMessage,
 	AiEditionChatOperationStatus,
 	AiEditionChatPersistenceResolution,
 	AiEditionChatResult,
 	AiEditionChatRewindCommitResult,
+	AiEditionChatRewindPrepareResult,
+	AiEditionChatSession,
 	AiEditionChatSessionUpdatedEvent,
 	AiEditionToolCallSummary,
 } from "../../src/native/contracts";
@@ -289,9 +292,9 @@ function cloneRewindCommitResult(
 ): Extract<AiEditionChatRewindCommitResult, { success: true }> {
 	return {
 		success: true,
-		prompt: result.prompt,
 		messages: result.messages.map(cloneMessage),
 		sessionRevision: result.sessionRevision,
+		pendingComposerRestoration: { ...result.pendingComposerRestoration },
 	};
 }
 
@@ -645,7 +648,7 @@ export interface ChatSession {
 	messages: AiEditionChatMessage[];
 	/** Monotonic identity for destructive message/checkpoint mutations. */
 	revision: number;
-	pendingComposerRestoration?: AiEditionChatComposerRestoration;
+	pendingComposerRestoration?: AiEditionChatComposerRestoration & { prompt: string };
 	/** Main-process bookkeeping: the compaction boundary, not part of the
 	 *  transcript. See `modelMessages`. */
 	compaction?: SessionCompaction;
@@ -736,7 +739,7 @@ export function createSession(projectId: string, title?: string): ChatSessionSum
 	return toSummary(session);
 }
 
-export function selectSession(projectId: string, sessionId: string): ChatSession | null {
+export function selectSession(projectId: string, sessionId: string): AiEditionChatSession | null {
 	const m = sessionsByProject.get(projectId);
 	const s = m?.get(sessionId);
 	if (!s) return null;
@@ -751,25 +754,22 @@ export function selectSession(projectId: string, sessionId: string): ChatSession
 		messages: [...s.messages],
 		revision: s.revision,
 		...(s.pendingComposerRestoration
-			? { pendingComposerRestoration: { ...s.pendingComposerRestoration } }
+			? { pendingComposerRestoration: { revision: s.pendingComposerRestoration.revision } }
 			: {}),
 	};
 }
 
-export function acknowledgeComposerRestoration(
+export function claimComposerRestoration(
 	projectId: string,
 	sessionId: string,
 	revision: number,
-): AiEditionChatComposerRestorationAckResult {
+): AiEditionChatComposerRestorationClaimResult {
 	const session = sessionsByProject.get(projectId)?.get(sessionId);
-	if (!session) return { success: false, error: "Chat session not found." };
+	if (!session) return { claimed: false };
 	const pending = session.pendingComposerRestoration;
-	if (!pending) return { success: true, acknowledged: false };
-	if (pending.revision !== revision) {
-		return { success: false, error: "Composer restoration revision is no longer current." };
-	}
+	if (!pending || pending.revision !== revision) return { claimed: false };
 	delete session.pendingComposerRestoration;
-	return { success: true, acknowledged: true };
+	return { claimed: true, prompt: pending.prompt };
 }
 
 export function renameSession(
@@ -1163,19 +1163,7 @@ export function prepareRewindToMessage(
 	sessionId: string,
 	messageId: string,
 	owner: ChatOperationOwner | null = null,
-):
-	| {
-			success: true;
-			operationId: string;
-			sessionRevision: number;
-			prompt: string;
-			document: AxcutDocument;
-			messages: AiEditionChatMessage[];
-	  }
-	| {
-			success: false;
-			error: string;
-	  } {
+): AiEditionChatRewindPrepareResult {
 	pruneExpiredOperations();
 	const session = sessionsByProject.get(projectId)?.get(sessionId);
 	if (!session) return { success: false, error: "Chat session not found." };
@@ -1227,7 +1215,6 @@ export function prepareRewindToMessage(
 		success: true,
 		operationId,
 		sessionRevision: session.revision,
-		prompt: prepared.prompt,
 		document: structuredClone(prepared.document),
 		messages: prepared.messages.map(cloneMessage),
 	};
@@ -1293,9 +1280,9 @@ export function commitRewindToMessage(
 	};
 	const result: Extract<AiEditionChatRewindCommitResult, { success: true }> = {
 		success: true,
-		prompt: prepared.prompt,
 		messages: session.messages.map(cloneMessage),
 		sessionRevision: session.revision,
+		pendingComposerRestoration: { revision: session.revision },
 	};
 	rememberCompletedOperation({
 		operationId,
@@ -1315,7 +1302,7 @@ export function commitRewindToMessage(
 		operationId,
 		kind: "rewind",
 		messages: result.messages.map(cloneMessage),
-		prompt: result.prompt,
+		pendingComposerRestoration: { ...result.pendingComposerRestoration },
 	});
 	return cloneRewindCommitResult(result);
 }
@@ -1378,7 +1365,7 @@ export async function runTimelineOperation(
 	const created = !session;
 	if (created) {
 		const summary = createSession(projectId);
-		session = selectSession(projectId, summary.id) ?? undefined;
+		session = sessionsByProject.get(projectId)?.get(summary.id);
 		if (!session) return { success: false, error: "Could not create session." };
 	}
 	if (sessionHasPendingOperation(projectId, sessionId)) {
@@ -1435,7 +1422,7 @@ export async function compactSessionNow(
 	projectId: string,
 	sessionId: string,
 	llmConfig: LlmConfigStore,
-): Promise<{ summaryMessageId: string | null; summary: string; session: ChatSession } | null> {
+): Promise<AiEditionChatCompactResult | null> {
 	const session = sessionsByProject.get(projectId)?.get(sessionId);
 	if (!session) return null;
 	if (sessionHasPendingOperation(projectId, sessionId)) return null;
@@ -1465,7 +1452,7 @@ export async function compactSessionNow(
 	return {
 		summaryMessageId: ok.summaryMessageId,
 		summary: ok.summary,
-		session: selectSession(projectId, sessionId) as ChatSession,
+		session: selectSession(projectId, sessionId)!,
 	};
 }
 

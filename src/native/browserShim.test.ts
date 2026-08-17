@@ -67,7 +67,7 @@ describe("browser chat operation shim", () => {
 		).toHaveLength(2);
 	});
 
-	it("replays and exactly acknowledges a persisted composer restoration", async () => {
+	it("atomically claims a persisted composer restoration once", async () => {
 		localStorage.setItem(
 			"browser-shim-chat-v1",
 			JSON.stringify({
@@ -88,32 +88,16 @@ describe("browser chat operation shim", () => {
 		delete (window as any).electronAPI;
 		installBrowserShims();
 
+		const selected = await nativeBridgeClient.aiEdition.chatSelectSession("project", "session");
+		expect(selected?.pendingComposerRestoration).toEqual({ revision: 7 });
 		expect(
-			await nativeBridgeClient.aiEdition.chatSelectSession("project", "session"),
-		).toMatchObject({
-			pendingComposerRestoration: { prompt: "restore me", revision: 7 },
-		});
-		expect(
-			await nativeBridgeClient.aiEdition.chatAcknowledgeComposerRestoration(
-				"project",
-				"session",
-				6,
-			),
-		).toMatchObject({ success: false });
-		expect(
-			await nativeBridgeClient.aiEdition.chatAcknowledgeComposerRestoration(
-				"project",
-				"session",
-				7,
-			),
-		).toEqual({ success: true, acknowledged: true });
-		expect(
-			await nativeBridgeClient.aiEdition.chatAcknowledgeComposerRestoration(
-				"project",
-				"session",
-				7,
-			),
-		).toEqual({ success: true, acknowledged: false });
+			await nativeBridgeClient.aiEdition.chatClaimComposerRestoration("project", "session", 6),
+		).toEqual({ claimed: false });
+		const claims = await Promise.all([
+			nativeBridgeClient.aiEdition.chatClaimComposerRestoration("project", "session", 7),
+			nativeBridgeClient.aiEdition.chatClaimComposerRestoration("project", "session", 7),
+		]);
+		expect(claims).toEqual([{ claimed: true, prompt: "restore me" }, { claimed: false }]);
 		expect(
 			(await nativeBridgeClient.aiEdition.chatSelectSession("project", "session"))
 				?.pendingComposerRestoration,

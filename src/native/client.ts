@@ -4,7 +4,7 @@ import {
 	type AiEditionChatBudget,
 	type AiEditionChatCommitResult,
 	type AiEditionChatCompactResult,
-	type AiEditionChatComposerRestorationAckResult,
+	type AiEditionChatComposerRestorationClaimResult,
 	type AiEditionChatOperationResult,
 	type AiEditionChatOperationStatus,
 	type AiEditionChatPersistenceResolution,
@@ -305,10 +305,10 @@ export const nativeBridgeClient = {
 				action: "chat.selectSession",
 				payload: { projectId, sessionId },
 			}),
-		chatAcknowledgeComposerRestoration: (projectId: string, sessionId: string, revision: number) =>
-			requireNativeBridgeData<AiEditionChatComposerRestorationAckResult>({
+		chatClaimComposerRestoration: (projectId: string, sessionId: string, revision: number) =>
+			requireNativeBridgeData<AiEditionChatComposerRestorationClaimResult>({
 				domain: "aiEdition",
-				action: "chat.composerRestoration.acknowledge",
+				action: "chat.composerRestoration.claim",
 				payload: { projectId, sessionId, revision },
 			}),
 		chatRenameSession: (projectId: string, sessionId: string, title: string) =>

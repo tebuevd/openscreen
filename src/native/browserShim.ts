@@ -8,6 +8,7 @@ import { axcutSchemaVersion, migrateRawDocumentToCurrent } from "../lib/ai-editi
 import { nativeBridgeClient as realClient } from "./client";
 import type {
 	AiEditionChatPersistenceResolution,
+	AiEditionChatSession,
 	AiEditionChatSessionUpdatedEvent,
 } from "./contracts";
 
@@ -515,6 +516,17 @@ function createShimBridgeClient() {
 		createdAt: s.createdAt,
 		messageCount: s.messages.length,
 	});
+	const publicSession = (s: ShimSession): AiEditionChatSession => ({
+		id: s.id,
+		projectId: s.projectId,
+		title: s.title,
+		createdAt: s.createdAt,
+		messages: [...s.messages],
+		revision: s.revision,
+		...(s.pendingComposerRestoration
+			? { pendingComposerRestoration: { revision: s.pendingComposerRestoration.revision } }
+			: {}),
+	});
 	const handleDocumentOwnerTeardown = () => {
 		// Browser document writes update the in-memory map and localStorage synchronously
 		// before their resolved Promise is returned, so no write can still land after
@@ -977,38 +989,18 @@ function createShimBridgeClient() {
 			},
 			chatSelectSession: (projectId: string, sessionId: string) => {
 				const s = sessionsByProject.get(projectId)?.get(sessionId);
-				return Promise.resolve(
-					s
-						? {
-								...s,
-								messages: [...s.messages],
-								...(s.pendingComposerRestoration
-									? { pendingComposerRestoration: { ...s.pendingComposerRestoration } }
-									: {}),
-							}
-						: null,
-				);
+				return Promise.resolve(s ? publicSession(s) : null);
 			},
-			chatAcknowledgeComposerRestoration: (
-				projectId: string,
-				sessionId: string,
-				revision: number,
-			) => {
+			chatClaimComposerRestoration: (projectId: string, sessionId: string, revision: number) => {
 				const session = sessionsByProject.get(projectId)?.get(sessionId);
-				if (!session) {
-					return Promise.resolve({ success: false as const, error: "Chat session not found." });
-				}
+				if (!session) return Promise.resolve({ claimed: false as const });
 				const pending = session.pendingComposerRestoration;
-				if (!pending) return Promise.resolve({ success: true as const, acknowledged: false });
-				if (pending.revision !== revision) {
-					return Promise.resolve({
-						success: false as const,
-						error: "Composer restoration revision is no longer current.",
-					});
+				if (!pending || pending.revision !== revision) {
+					return Promise.resolve({ claimed: false as const });
 				}
 				delete session.pendingComposerRestoration;
 				persistChat();
-				return Promise.resolve({ success: true as const, acknowledged: true });
+				return Promise.resolve({ claimed: true as const, prompt: pending.prompt });
 			},
 			chatRenameSession: (projectId: string, sessionId: string, title: string) => {
 				const s = sessionsByProject.get(projectId)?.get(sessionId);
@@ -1047,7 +1039,7 @@ function createShimBridgeClient() {
 				const s = sessionsByProject.get(projectId)?.get(sessionId);
 				if (!s) return Promise.resolve(null);
 				return Promise.resolve({
-					session: s,
+					session: publicSession(s),
 					summaryMessageId: null,
 					summary: "(browser shim compaction is a no-op)",
 				});

@@ -156,11 +156,11 @@ export interface NativeBridgeContext {
 		projectId: string,
 		sessionId: string,
 	) => import("../../src/native/contracts").AiEditionChatSession | null;
-	acknowledgeAiEditionComposerRestoration: (
+	claimAiEditionComposerRestoration: (
 		projectId: string,
 		sessionId: string,
 		revision: number,
-	) => import("../../src/native/contracts").AiEditionChatComposerRestorationAckResult;
+	) => import("../../src/native/contracts").AiEditionChatComposerRestorationClaimResult;
 	renameAiEditionChatSession: (
 		projectId: string,
 		sessionId: string,
@@ -316,7 +316,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		listSessions: context.listAiEditionChatSessions,
 		createSession: context.createAiEditionChatSession,
 		selectSession: context.selectAiEditionChatSession,
-		acknowledgeComposerRestoration: context.acknowledgeAiEditionComposerRestoration,
+		claimComposerRestoration: context.claimAiEditionComposerRestoration,
 		renameSession: context.renameAiEditionChatSession,
 		deleteSession: context.deleteAiEditionChatSession,
 	});
@@ -792,11 +792,13 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 								),
 							);
 						case "chat.listSessions":
+							documentOwners.bindProject(event, request.payload.projectId);
 							return createSuccessResponse(
 								requestId,
 								await aiEditionService.chatListSessions(request.payload.projectId),
 							);
 						case "chat.createSession":
+							documentOwners.bindProject(event, request.payload.projectId);
 							return createSuccessResponse(
 								requestId,
 								aiEditionService.chatCreateSession(
@@ -805,6 +807,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 								),
 							);
 						case "chat.selectSession":
+							documentOwners.bindProject(event, request.payload.projectId);
 							return createSuccessResponse(
 								requestId,
 								await aiEditionService.chatSelectSession(
@@ -812,10 +815,11 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.sessionId,
 								),
 							);
-						case "chat.composerRestoration.acknowledge":
+						case "chat.composerRestoration.claim":
+							documentOwners.ownerForProject(event, request.payload.projectId);
 							return createSuccessResponse(
 								requestId,
-								aiEditionService.chatAcknowledgeComposerRestoration(
+								aiEditionService.chatClaimComposerRestoration(
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.revision,

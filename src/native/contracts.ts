@@ -339,8 +339,6 @@ export type AiEditionChatRewindPrepareResult =
 			sessionRevision: number;
 			document: unknown;
 			messages: AiEditionChatMessage[];
-			/** The user message content of the rewound turn, prefilled back into the composer. */
-			prompt: string;
 	  }
 	| { success: false; error: string };
 
@@ -348,19 +346,18 @@ export type AiEditionChatRewindCommitResult =
 	| {
 			success: true;
 			messages: AiEditionChatMessage[];
-			prompt: string;
 			sessionRevision: number;
+			pendingComposerRestoration: AiEditionChatComposerRestoration;
 	  }
 	| { success: false; error: string };
 
 export interface AiEditionChatComposerRestoration {
-	prompt: string;
 	revision: number;
 }
 
-export type AiEditionChatComposerRestorationAckResult =
-	| { success: true; acknowledged: boolean }
-	| { success: false; error: string };
+export type AiEditionChatComposerRestorationClaimResult =
+	| { claimed: true; prompt: string }
+	| { claimed: false };
 
 export type AiEditionChatOperationStatus =
 	| {
@@ -394,7 +391,7 @@ export interface AiEditionChatSessionUpdatedEvent {
 	operationId: string;
 	kind: "chat" | "rewind";
 	messages: AiEditionChatMessage[];
-	prompt?: string;
+	pendingComposerRestoration?: AiEditionChatComposerRestoration;
 }
 
 export interface AiEditionChatSessionSummary {
@@ -720,7 +717,7 @@ export type NativeBridgeRequest =
 	  }
 	| {
 			domain: "aiEdition";
-			action: "chat.composerRestoration.acknowledge";
+			action: "chat.composerRestoration.claim";
 			payload: { projectId: string; sessionId: string; revision: number };
 			requestId?: string;
 	  }

@@ -111,12 +111,40 @@ describe("RendererDocumentOwnerRegistry", () => {
 		);
 	});
 
+	it("dispatches a claim only for the matching committed replacement owner", () => {
+		const registry = new RendererDocumentOwnerRegistry({ releaseOwner: async () => undefined });
+		const sender = new FakeSender(70);
+		const outgoingFrame = sender.mainFrame;
+		const outgoingOwner = registry.bindProject(request(sender) as never, "project-a");
+		const foreignSender = new FakeSender(71);
+		registry.bindProject(request(foreignSender) as never, "project-b");
+		const claim = vi.fn(() => ({ claimed: true, prompt: "restore" }));
+		const dispatchClaim = (ownerRequest: ReturnType<typeof request>) => {
+			registry.ownerForProject(ownerRequest as never, "project-a");
+			return claim();
+		};
+
+		expect(() => dispatchClaim(request(foreignSender))).toThrow(
+			/does not own the requested project/,
+		);
+		startMainNavigation(sender);
+		expect(() => dispatchClaim(request(sender, outgoingFrame))).toThrow(/navigation is pending/);
+
+		const replacementFrame = new FakeFrame(270, 2, "document-70-2");
+		commitMainNavigation(sender, replacementFrame);
+		expect(() => dispatchClaim(request(sender))).toThrow(/does not own the requested project/);
+		const replacementOwner = registry.bindProject(request(sender) as never, "project-a");
+		expect(replacementOwner).not.toBe(outgoingOwner);
+		expect(dispatchClaim(request(sender))).toEqual({ claimed: true, prompt: "restore" });
+		expect(claim).toHaveBeenCalledTimes(1);
+	});
+
 	it("recovers a failed main-frame navigation with a fresh owner for the surviving document", () => {
 		const releaseOwner = vi.fn(async () => undefined);
 		const registry = new RendererDocumentOwnerRegistry({ releaseOwner });
 		const sender = new FakeSender(8);
 		const survivingFrame = sender.mainFrame;
-		const outgoingOwner = registry.ownerFor(request(sender) as never);
+		const outgoingOwner = registry.bindProject(request(sender) as never, "surviving-project");
 
 		startMainNavigation(sender, "https://failed.test");
 		sender.loadingMainFrame = false;
@@ -131,7 +159,7 @@ describe("RendererDocumentOwnerRegistry", () => {
 			survivingFrame.routingId,
 		);
 
-		const recoveredOwner = registry.ownerFor(request(sender) as never);
+		const recoveredOwner = registry.ownerForProject(request(sender) as never, "surviving-project");
 		expect(recoveredOwner).not.toBe(outgoingOwner);
 		expect(releaseOwner).toHaveBeenCalledTimes(1);
 	});

@@ -20,6 +20,7 @@ interface FrameIdentity {
 
 interface SenderSession {
 	owner: RendererDocumentOwner | null;
+	projectId: string | null;
 	committedFrame: FrameIdentity | null;
 	pendingUrls: Map<string, number> | null;
 	onDestroyed: () => void;
@@ -96,6 +97,24 @@ export class RendererDocumentOwnerRegistry {
 		return session.owner;
 	}
 
+	/** Marks the project currently loaded by this committed renderer document. */
+	bindProject(event: OwnerRequest, projectId: string): RendererDocumentOwner {
+		const owner = this.ownerFor(event);
+		const session = this.sessions.get(event.sender);
+		if (!session) throw new Error("Renderer document owner is unavailable.");
+		session.projectId = projectId;
+		return owner;
+	}
+
+	/** Returns the committed owner only when its current project matches exactly. */
+	ownerForProject(event: OwnerRequest, projectId: string): RendererDocumentOwner {
+		const owner = this.ownerFor(event);
+		if (this.sessions.get(event.sender)?.projectId !== projectId) {
+			throw new Error("Renderer document owner does not own the requested project.");
+		}
+		return owner;
+	}
+
 	private ensureSession(sender: Sender): SenderSession {
 		const existing = this.sessions.get(sender);
 		if (existing) return existing;
@@ -103,6 +122,7 @@ export class RendererDocumentOwnerRegistry {
 		const isLoadingMainFrame = sender.isLoadingMainFrame();
 		const session = {} as SenderSession;
 		session.owner = null;
+		session.projectId = null;
 		session.committedFrame = isLoadingMainFrame ? null : this.currentMainFrame(sender);
 		session.pendingUrls = isLoadingMainFrame ? new Map([["<unobserved-navigation>", 1]]) : null;
 		session.onDestroyed = () => this.destroy(sender);
@@ -156,7 +176,7 @@ export class RendererDocumentOwnerRegistry {
 		if (!session) return;
 		if (!session.pendingUrls) {
 			session.pendingUrls = new Map();
-			this.revokeOwner(session, sender.id);
+			this.revokeOwner(session, sender.id, false);
 		}
 		session.pendingUrls.set(url, (session.pendingUrls.get(url) ?? 0) + 1);
 	}
@@ -176,7 +196,7 @@ export class RendererDocumentOwnerRegistry {
 		if (!session) return;
 		const identity = this.currentMainFrame(sender);
 		if (!identity) return;
-		this.revokeOwner(session, sender.id);
+		this.revokeOwner(session, sender.id, false);
 		session.committedFrame = identity;
 		session.pendingUrls = null;
 	}
@@ -235,9 +255,10 @@ export class RendererDocumentOwnerRegistry {
 		}
 	}
 
-	private revokeOwner(session: SenderSession, senderId: number): void {
+	private revokeOwner(session: SenderSession, senderId: number, clearProject = true): void {
 		const owner = session.owner;
 		session.owner = null;
+		if (clearProject) session.projectId = null;
 		if (owner) this.release(owner, senderId);
 	}
 

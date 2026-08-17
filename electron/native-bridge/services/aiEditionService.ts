@@ -5,7 +5,7 @@ import type {
 	AiEditionChatBudget,
 	AiEditionChatCommitResult,
 	AiEditionChatCompactResult,
-	AiEditionChatComposerRestorationAckResult,
+	AiEditionChatComposerRestorationClaimResult,
 	AiEditionChatMessage,
 	AiEditionChatOperationResult,
 	AiEditionChatOperationStatus,
@@ -127,11 +127,11 @@ export interface AiEditionServiceOptions {
 	listSessions: (projectId: string) => AiEditionChatSessionSummary[];
 	createSession: (projectId: string, title?: string) => AiEditionChatSessionSummary;
 	selectSession: (projectId: string, sessionId: string) => AiEditionChatSession | null;
-	acknowledgeComposerRestoration: (
+	claimComposerRestoration: (
 		projectId: string,
 		sessionId: string,
 		revision: number,
-	) => AiEditionChatComposerRestorationAckResult;
+	) => AiEditionChatComposerRestorationClaimResult;
 	renameSession: (
 		projectId: string,
 		sessionId: string,
@@ -463,12 +463,12 @@ export class AiEditionService {
 		return this.options.selectSession(projectId, sessionId);
 	}
 
-	chatAcknowledgeComposerRestoration(
+	chatClaimComposerRestoration(
 		projectId: string,
 		sessionId: string,
 		revision: number,
-	): AiEditionChatComposerRestorationAckResult {
-		return this.options.acknowledgeComposerRestoration(projectId, sessionId, revision);
+	): AiEditionChatComposerRestorationClaimResult {
+		return this.options.claimComposerRestoration(projectId, sessionId, revision);
 	}
 
 	chatRenameSession(

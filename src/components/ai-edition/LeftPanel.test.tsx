@@ -15,7 +15,7 @@ const bridgeMocks = vi.hoisted(() => ({
 	llmGetSnapshot: vi.fn(),
 	chatListSessions: vi.fn(),
 	chatSelectSession: vi.fn(),
-	chatAcknowledgeComposerRestoration: vi.fn(),
+	chatClaimComposerRestoration: vi.fn(),
 	chatCreateSession: vi.fn(),
 	chatDeleteSession: vi.fn(),
 	chatRun: vi.fn(),
@@ -164,7 +164,6 @@ function preparedRewind(operationId = "rewind_1") {
 		sessionRevision: 4,
 		document: withTitle(sampleDoc, "Rewound document"),
 		messages: [rewindMessages[0]],
-		prompt: "Try this edit",
 	};
 }
 
@@ -254,9 +253,9 @@ describe("LeftPanel async document results", () => {
 			messages: [],
 			revision: 0,
 		});
-		bridgeMocks.chatAcknowledgeComposerRestoration.mockResolvedValue({
-			success: true,
-			acknowledged: true,
+		bridgeMocks.chatClaimComposerRestoration.mockResolvedValue({
+			claimed: true,
+			prompt: "Try this edit",
 		});
 		Object.assign(window, {
 			electronAPI: {
@@ -714,7 +713,11 @@ describe("LeftPanel async document results", () => {
 		expect(bridgeMocks.chatSelectSession).toHaveBeenCalledWith("proj_a", "session_1");
 	});
 
-	it("applies and acknowledges a live rewind prompt exactly once", async () => {
+	it("claims and applies a live rewind prompt exactly once", async () => {
+		bridgeMocks.chatClaimComposerRestoration.mockResolvedValue({
+			claimed: true,
+			prompt: "Restore this prompt",
+		});
 		renderPanel();
 		await waitFor(() => expect(bridgeMocks.chatSelectSession).toHaveBeenCalled());
 		const update: AiEditionChatSessionUpdatedEvent = {
@@ -724,26 +727,55 @@ describe("LeftPanel async document results", () => {
 			operationId: "live-rewind",
 			kind: "rewind",
 			messages: [rewindMessages[0]],
-			prompt: "Restore this prompt",
+			pendingComposerRestoration: { revision: 1 },
 		};
 
 		act(() => chatSessionUpdateListener?.(update));
 
-		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue(
-			"Restore this prompt",
-		);
 		await waitFor(() =>
-			expect(bridgeMocks.chatAcknowledgeComposerRestoration).toHaveBeenCalledWith(
-				"proj_a",
-				"session_1",
-				1,
+			expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue(
+				"Restore this prompt",
 			),
 		);
+		expect(bridgeMocks.chatClaimComposerRestoration).toHaveBeenCalledWith("proj_a", "session_1", 1);
 		act(() => chatSessionUpdateListener?.(update));
-		expect(bridgeMocks.chatAcknowledgeComposerRestoration).toHaveBeenCalledTimes(1);
+		expect(bridgeMocks.chatClaimComposerRestoration).toHaveBeenCalledTimes(1);
+	});
+
+	it("leaves the composer unchanged when a stale restoration claim loses", async () => {
+		bridgeMocks.chatClaimComposerRestoration.mockResolvedValue({ claimed: false });
+		renderPanel();
+		await waitFor(() => expect(bridgeMocks.chatSelectSession).toHaveBeenCalled());
+		const input = screen.getByPlaceholderText("Describe the edit you want.");
+		fireEvent.change(input, { target: { value: "Keep this draft" } });
+
+		act(() => {
+			chatSessionUpdateListener?.({
+				projectId: "proj_a",
+				sessionId: "session_1",
+				revision: 2,
+				operationId: "stale-rewind",
+				kind: "rewind",
+				messages: [rewindMessages[0]],
+				pendingComposerRestoration: { revision: 2 },
+			});
+		});
+
+		await waitFor(() =>
+			expect(bridgeMocks.chatClaimComposerRestoration).toHaveBeenCalledWith(
+				"proj_a",
+				"session_1",
+				2,
+			),
+		);
+		expect(input).toHaveValue("Keep this draft");
 	});
 
 	it("replays a missed rewind prompt when its conversation is selected later", async () => {
+		bridgeMocks.chatClaimComposerRestoration.mockResolvedValue({
+			claimed: true,
+			prompt: "Missed prompt",
+		});
 		bridgeMocks.chatSelectSession.mockImplementation(async (_projectId, sessionId) =>
 			sessionId === "session_2"
 				? {
@@ -753,7 +785,7 @@ describe("LeftPanel async document results", () => {
 						createdAt: "2026-08-16T10:01:00.000Z",
 						messages: [rewindMessages[0]],
 						revision: 3,
-						pendingComposerRestoration: { prompt: "Missed prompt", revision: 3 },
+						pendingComposerRestoration: { revision: 3 },
 					}
 				: {
 						id: "session_1",
@@ -784,10 +816,10 @@ describe("LeftPanel async document results", () => {
 				operationId: "missed-rewind",
 				kind: "rewind",
 				messages: [rewindMessages[0]],
-				prompt: "Missed prompt",
+				pendingComposerRestoration: { revision: 3 },
 			});
 		});
-		expect(bridgeMocks.chatAcknowledgeComposerRestoration).not.toHaveBeenCalled();
+		expect(bridgeMocks.chatClaimComposerRestoration).not.toHaveBeenCalled();
 		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("");
 
 		fireEvent.click(screen.getByRole("button", { name: "New conversation" }));
@@ -795,15 +827,15 @@ describe("LeftPanel async document results", () => {
 		await waitFor(() =>
 			expect(bridgeMocks.chatSelectSession).toHaveBeenCalledWith("proj_a", "session_2"),
 		);
-		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("Missed prompt");
-		expect(bridgeMocks.chatAcknowledgeComposerRestoration).toHaveBeenCalledWith(
-			"proj_a",
-			"session_2",
-			3,
+		await waitFor(() =>
+			expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue(
+				"Missed prompt",
+			),
 		);
+		expect(bridgeMocks.chatClaimComposerRestoration).toHaveBeenCalledWith("proj_a", "session_2", 3);
 	});
 
-	it("does not replay a composer restoration after it was acknowledged", async () => {
+	it("does not replay a composer restoration after it was claimed", async () => {
 		let pending = true;
 		bridgeMocks.chatSelectSession.mockImplementation(async () => ({
 			id: "session_1",
@@ -812,13 +844,11 @@ describe("LeftPanel async document results", () => {
 			createdAt: "2026-08-16T10:00:00.000Z",
 			messages: [rewindMessages[0]],
 			revision: 4,
-			...(pending
-				? { pendingComposerRestoration: { prompt: "One-time prompt", revision: 4 } }
-				: {}),
+			...(pending ? { pendingComposerRestoration: { revision: 4 } } : {}),
 		}));
-		bridgeMocks.chatAcknowledgeComposerRestoration.mockImplementation(async () => {
+		bridgeMocks.chatClaimComposerRestoration.mockImplementation(async () => {
 			pending = false;
-			return { success: true, acknowledged: true };
+			return { claimed: true, prompt: "One-time prompt" };
 		});
 		const first = renderPanel();
 
@@ -827,15 +857,13 @@ describe("LeftPanel async document results", () => {
 				"One-time prompt",
 			),
 		);
-		await waitFor(() =>
-			expect(bridgeMocks.chatAcknowledgeComposerRestoration).toHaveBeenCalledTimes(1),
-		);
+		await waitFor(() => expect(bridgeMocks.chatClaimComposerRestoration).toHaveBeenCalledTimes(1));
 		first.unmount();
 		renderPanel();
 		await waitFor(() => expect(bridgeMocks.chatSelectSession).toHaveBeenCalledTimes(2));
 
 		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("");
-		expect(bridgeMocks.chatAcknowledgeComposerRestoration).toHaveBeenCalledTimes(1);
+		expect(bridgeMocks.chatClaimComposerRestoration).toHaveBeenCalledTimes(1);
 	});
 
 	it("resolves a late failed save after the sending panel unmounts", async () => {
@@ -1032,8 +1060,8 @@ describe("LeftPanel async document results", () => {
 		bridgeMocks.chatCommitRewind.mockResolvedValue({
 			success: true,
 			messages: prepared.messages,
-			prompt: prepared.prompt,
 			sessionRevision: prepared.sessionRevision + 1,
+			pendingComposerRestoration: { revision: prepared.sessionRevision + 1 },
 		});
 		await startPendingRewind(Promise.resolve(prepared));
 
@@ -1044,7 +1072,11 @@ describe("LeftPanel async document results", () => {
 			dirty: false,
 		});
 		expect(screen.queryByText("Applied the old edit.")).not.toBeInTheDocument();
-		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("Try this edit");
+		await waitFor(() =>
+			expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue(
+				"Try this edit",
+			),
+		);
 	});
 
 	it("adopts a differing authoritative save and resolves rewind history", async () => {
@@ -1072,8 +1104,8 @@ describe("LeftPanel async document results", () => {
 		bridgeMocks.chatCommitRewind.mockResolvedValue({
 			success: true,
 			messages: prepared.messages,
-			prompt: prepared.prompt,
 			sessionRevision: prepared.sessionRevision + 1,
+			pendingComposerRestoration: { revision: prepared.sessionRevision + 1 },
 		});
 		await startPendingRewind(Promise.resolve(prepared));
 
@@ -1089,8 +1121,12 @@ describe("LeftPanel async document results", () => {
 		expect(bridgeMocks.chatAbortRewind).not.toHaveBeenCalled();
 		expect(useProjectStore.getState().document?.project.title).toBe("Rewound document");
 		expect(screen.queryByText("Applied the old edit.")).not.toBeInTheDocument();
-		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("Try this edit");
-		expect(bridgeMocks.chatAcknowledgeComposerRestoration).toHaveBeenCalledWith(
+		await waitFor(() =>
+			expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue(
+				"Try this edit",
+			),
+		);
+		expect(bridgeMocks.chatClaimComposerRestoration).toHaveBeenCalledWith(
 			"proj_a",
 			"session_1",
 			prepared.sessionRevision + 1,
@@ -1104,15 +1140,19 @@ describe("LeftPanel async document results", () => {
 			.mockResolvedValue({
 				success: true,
 				messages: prepared.messages,
-				prompt: prepared.prompt,
 				sessionRevision: prepared.sessionRevision + 1,
+				pendingComposerRestoration: { revision: prepared.sessionRevision + 1 },
 			});
 		await startPendingRewind(Promise.resolve(prepared));
 
 		await waitFor(() => expect(bridgeMocks.chatCommitRewind).toHaveBeenCalledTimes(2));
 		expect(bridgeMocks.chatAbortRewind).not.toHaveBeenCalled();
 		expect(screen.queryByText("Applied the old edit.")).not.toBeInTheDocument();
-		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("Try this edit");
+		await waitFor(() =>
+			expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue(
+				"Try this edit",
+			),
+		);
 	});
 
 	it("invalidates an unmounted rewind preparation and aborts it when the reply arrives", async () => {
@@ -1144,8 +1184,8 @@ describe("LeftPanel async document results", () => {
 		bridgeMocks.chatCommitRewind.mockResolvedValue({
 			success: true,
 			messages: prepared.messages,
-			prompt: prepared.prompt,
 			sessionRevision: prepared.sessionRevision + 1,
+			pendingComposerRestoration: { revision: prepared.sessionRevision + 1 },
 		});
 		const view = await startPendingRewind(Promise.resolve(prepared));
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));

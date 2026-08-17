@@ -44,9 +44,9 @@ function serviceOptions(overrides: Partial<AiEditionServiceOptions> = {}): AiEdi
 			messageCount: 0,
 		})),
 		selectSession: vi.fn(() => null),
-		acknowledgeComposerRestoration: vi.fn(() => ({
-			success: true as const,
-			acknowledged: true,
+		claimComposerRestoration: vi.fn(() => ({
+			claimed: true as const,
+			prompt: "restored",
 		})),
 		renameSession: vi.fn(() => null),
 		deleteSession: vi.fn(() => false),
@@ -55,7 +55,7 @@ function serviceOptions(overrides: Partial<AiEditionServiceOptions> = {}): AiEdi
 }
 
 describe("AiEditionService chat document ownership", () => {
-	it("forwards the opaque owner through every mutating operation", async () => {
+	it("forwards the opaque owner through document-bound chat operations", async () => {
 		const options = serviceOptions();
 		const service = new AiEditionService(options);
 		const owner = {};
@@ -68,7 +68,6 @@ describe("AiEditionService chat document ownership", () => {
 		service.chatPrepareRewind("project", "session", "message", owner);
 		service.chatCommitRewind("project", "session", "rewind", 3, owner);
 		service.chatAbortRewind("project", "session", "rewind", owner);
-		service.chatAcknowledgeComposerRestoration("project", "session", 4);
 
 		expect(options.runChat).toHaveBeenCalledWith(
 			"project",
@@ -113,7 +112,17 @@ describe("AiEditionService chat document ownership", () => {
 			"rewind",
 			owner,
 		);
-		expect(options.acknowledgeComposerRestoration).toHaveBeenCalledWith("project", "session", 4);
+	});
+
+	it("forwards atomic composer claims", () => {
+		const options = serviceOptions();
+		const service = new AiEditionService(options);
+
+		expect(service.chatClaimComposerRestoration("project", "session", 4)).toEqual({
+			claimed: true,
+			prompt: "restored",
+		});
+		expect(options.claimComposerRestoration).toHaveBeenCalledWith("project", "session", 4);
 	});
 
 	it("triggers reconciliation without blocking replacement status and session reads", async () => {
