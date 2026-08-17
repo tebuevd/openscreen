@@ -21,8 +21,8 @@ boundary is between the **RAW** ruler and the **COMPRESSED** playback sequence:
 | Frame | Definition | Who works in it |
 |---|---|---|
 | **RAW virtual** (`currentTimeSec`, the ruler, the playhead, `document.timeline.clips[].timelineStartSec`/`timelineEndSec`) | The ruler the user manipulates. **Trims still occupy their space.** Region authoring, clip drag/resize/reorder, and the timeline ruler all happen here. | `NewEditorShell` (transport, seek), `V4Timeline` (drag/resize of clips and pills), `useTimeline` (every region mutation), `document.timeline` ops |
-| **SOURCE** (a clip's own media time: `assetId` + `sourceStartSec`/`sourceEndSec`) | What the decoders and the native compositor actually advance. Region anchors (`clipId` + `sourceStartSec` + `sourceEndSec`) live here. | `NativeCompositorOverlay`, `useNativePlaybackSync`, `sceneDescription` (→ native preview), `documentExporter` (multi-clip export) |
-| **COMPRESSED** (the trim-narrowed `resolvePlaybackSegments` laid out back-to-back from 0) | What the native free-run stream and the export frame counter walk through. Indexed by `clipIndex` into `SceneDescription.clips`. | `buildSceneDescription` (`sceneDescription.ts`), the native compositor's `clip_index` field, `exportMultiNative` |
+| **SOURCE** (a clip's own media time: `assetId` + `sourceStartSec`/`sourceEndSec`) | What the decoders and the native compositor actually advance. Region anchors (`clipId` + `sourceStartSec` + `sourceEndSec`) live here. | `NativeCompositorOverlay`, `useNativePlaybackSync`, `buildSceneDescription` / `projectRegionsToSource` (preview and MP4/GIF export), native `Scene::for_clip_window` |
+| **COMPRESSED** (the trim-narrowed `resolvePlaybackSegments` laid out back-to-back from 0) | What the native free-run stream and the export frame counter walk through. Indexed by `clipIndex` into `SceneDescription.clips`. | `buildSceneDescription` (`sceneDescription.ts`), `walk_composited_timeline`, `exportMultiNative` / `exportGifNative` |
 
 The model splits the two so each consumer can read what it cares about without having
 to translate. Mixing them desyncs preview from render on zoom and trim: a region
@@ -232,7 +232,7 @@ the contract a reviewer can grade against. Each is asserted in
 - **Re-anchoring drops `groupId`.** A v4 import may carry a `groupId`; after a write
   or migration it is gone. (`anchorRegionsWithDerivedMs` "drops groupId when
   re-anchoring, so it stops propagating".)
-- **`visibleSegments` ordering matches `SceneDescription.clips`.** The `clipIndex`
+- **`resolveVisibleClips` ordering matches `SceneDescription.clips`.** The `clipIndex`
   emitted by `projectRegionsToSource` / `resolveNativePosition` lines up with the
   native stream because both consume the same array in the same order. Passing a
   different array (e.g. already-sorted segments) to the projection while sending the
@@ -259,11 +259,12 @@ in the same commit, or the project round-trips into an inconsistent state:
 | **Timeline UI** | `src/components/ai-edition/v4/V4Timeline.tsx` | Reads lanes through `coalesceRegionsForRuler` (`:321, :329, :337, :347`) and `coalescedTrimGroups` (`:363`); pill edit hits the pill resolved by `resolvePillIds` via the store. |
 | **Inspector selection pane** | `src/components/ai-edition/v4/FloatingInspector.tsx` (`SelectionPane`, `:444`) | Edits a selected region by pill id; routes through `useTimeline` and therefore through `replacePillSpan`. |
 | **Store / authoring (UI)** | `src/lib/ai-edition/store/useTimeline.ts` | Every `add*`, `update*Span`, `removeRegion` goes through `anchorRegionsWithDerivedMs` (`:134, :163, :278, :305, :329`) and `replacePillSpan` / `dropPillsByIds` / `resolvePillIds`. |
-| **Native preview scene** | `src/native/sceneDescription.ts` (`:489, :508, :517, :531`) | Calls `projectRegionsToSource` for every region kind before serialising to the native compositor. |
+| **Shared preview/export scene** | `src/native/sceneDescription.ts` | `resolveVisibleClips` fixes the ordered clip stream; `buildSceneDescription` calls `projectRegionsToSource` for each region kind and serialises the `SceneDescription` consumed by native preview and MP4/GIF export. |
+| **Output geometry** | `src/lib/ai-edition/document/outputFormat.ts`, `src/lib/exporter/mp4ExportSettings.ts` | Resolves crop-aware clip dimensions, aspect ratio, `SceneDescription.output`, and bounded MP4 width/height from the same visible clip stream used by scene serialization. |
 | **Native playback sync** | `src/native/useNativePlaybackSync.ts` (`:22, :39`) | Resolves the RAW playhead through `resolveNativePosition` to feed `setActiveClip` / `presentTime`. |
 | **Native compositor overlay** | `src/components/ai-edition/NativeCompositorOverlay.tsx` (`:3, :70`) | Same — `resolveNativePosition(currentTimeSec, nativeClips, document.timeline.clips)` — to keep preview in sync with the timeline ruler. |
-| **Multi-clip export** | `src/lib/ai-edition/exporter/documentExporter.ts` | Projects regions to source per-clip through `region-ventilation`'s `projectRegionsToSourceTime`; identity single-clip projects are unchanged. |
-| **Captions layer** | `src/lib/ai-edition/captions/cues.ts` (`:14-15` and `captionCuesToTextRegions`) | Caption cues are a derived view of the transcript; the projection to source at export goes through `projectRegionsToSourceTime` from `region-ventilation`, matching the multi-clip export path so preview and file agree. |
+| **Native MP4/GIF export** | `src/components/ai-edition/ExportDialog.tsx`, `src/cli/CliExportRunner.tsx`, `src/native/compositorViewClient.ts` | Sends `scene.clips` and the same serialized scene to `exportMultiNative` or `exportGifNative`; the shared native timeline walk consumes their `clipIndex` ordering. |
+| **Captions layer** | `src/lib/ai-edition/captions/cues.ts` (`captionCuesToTextRegions`), `src/native/sceneDescription.ts` | Derives timeline text regions from transcript cues; `buildSceneDescription` appends them to annotations and projects the combined list with `projectRegionsToSource`, so preview and export consume one mapping. |
 | **Agent LLM tools** | `electron/ai-edition/agent-tools.ts` (`:22-26, :80-95, :560-575, :772-820, :835-880, :952, :1025`) | Writes the same shape via `anchorRegionsWithDerivedMs` / `replacePillSpan` / `resolvePillIds`; reads it through `coalesceRegionsForRuler` (`coalesceForAgent`, `:77-86`) so the model reasons in virtual seconds over whole pills. |
 
 ## Known gaps
