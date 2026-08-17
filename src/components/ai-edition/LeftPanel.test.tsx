@@ -717,21 +717,26 @@ describe("LeftPanel async document results", () => {
 		expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(1);
 	});
 
-	it("commits Project A chat history while Project B is still loading", async () => {
+	it("commits Project A chat history once while Project B and C are loading", async () => {
 		const saving = deferred<{ success: true; document: AxcutDocument }>();
 		const loadingProjectB = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectC = deferred<{ success: true; document: AxcutDocument }>();
 		const resultDocument = withTitle(sampleDoc, "Persisted while Project B loads");
 		const projectB: AxcutDocument = {
 			...sampleDoc,
 			project: { ...sampleDoc.project, id: "proj_b", title: "Project B" },
 		};
+		const projectC: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, id: "proj_c", title: "Project C" },
+		};
 		const committed = canonicalChatCommit();
 		bridgeMocks.save.mockReturnValue(saving.promise);
-		bridgeMocks.get.mockImplementation((projectId: string) =>
-			projectId === "proj_b"
-				? loadingProjectB.promise
-				: Promise.resolve({ success: true as const, document: resultDocument }),
-		);
+		bridgeMocks.get.mockImplementation((projectId: string) => {
+			if (projectId === "proj_b") return loadingProjectB.promise;
+			if (projectId === "proj_c") return loadingProjectC.promise;
+			return Promise.resolve({ success: true as const, document: resultDocument });
+		});
 		bridgeMocks.chatCommitRun.mockImplementation(
 			async (_projectId: string, _sessionId: string, operationId: string) => {
 				chatSessionUpdateListener?.({
@@ -754,9 +759,11 @@ describe("LeftPanel async document results", () => {
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(resultDocument));
 
 		const selectCalls = bridgeMocks.chatSelectSession.mock.calls.length;
-		let loading!: Promise<void>;
+		let loadingB!: Promise<void>;
+		let loadingC!: Promise<void>;
 		await act(async () => {
-			loading = useProjectStore.getState().loadProject("proj_b");
+			loadingB = useProjectStore.getState().loadProject("proj_b");
+			loadingC = useProjectStore.getState().loadProject("proj_c");
 			await Promise.resolve();
 		});
 		await waitFor(() =>
@@ -773,32 +780,45 @@ describe("LeftPanel async document results", () => {
 		expect(useProjectStore.getState()).toMatchObject({
 			projectId: "proj_a",
 			document: sampleDoc,
+			loadingTargetProjectId: "proj_c",
+			loadingRetainedProjectId: "proj_a",
 			status: "loading",
 		});
 
 		await act(async () => {
 			loadingProjectB.resolve({ success: true, document: projectB });
-			await loading;
+			await loadingB;
 		});
 		expect(useProjectStore.getState()).toMatchObject({
-			projectId: "proj_b",
-			document: projectB,
+			projectId: "proj_a",
+			loadingTargetProjectId: "proj_c",
+			status: "loading",
+		});
+		await act(async () => {
+			loadingProjectC.resolve({ success: true, document: projectC });
+			await loadingC;
+		});
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_c",
+			document: projectC,
 			status: "ready",
 		});
+		expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(1);
 	});
 
-	it("keeps one canonical Project A checkpoint when owner teardown wins during a failed Project B load", async () => {
+	it("keeps one canonical Project A checkpoint when owner teardown wins during overlapping loads", async () => {
 		const saving = deferred<{ success: true; document: AxcutDocument }>();
-		const loadingProjectB = deferred<{ success: false; error: string }>();
+		const loadingProjectB = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectC = deferred<{ success: false; error: string }>();
 		const resultDocument = withTitle(sampleDoc, "Owner-reconciled edit");
 		const committed = canonicalChatCommit();
 		let ownerCommitted = false;
 		bridgeMocks.save.mockReturnValue(saving.promise);
-		bridgeMocks.get.mockImplementation((projectId: string) =>
-			projectId === "proj_b"
-				? loadingProjectB.promise
-				: Promise.resolve({ success: true as const, document: resultDocument }),
-		);
+		bridgeMocks.get.mockImplementation((projectId: string) => {
+			if (projectId === "proj_b") return loadingProjectB.promise;
+			if (projectId === "proj_c") return loadingProjectC.promise;
+			return Promise.resolve({ success: true as const, document: resultDocument });
+		});
 		bridgeMocks.chatCommitRun.mockResolvedValue({
 			success: false,
 			error: "Owner teardown already committed this operation.",
@@ -823,9 +843,11 @@ describe("LeftPanel async document results", () => {
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(resultDocument));
 
 		const selectCalls = bridgeMocks.chatSelectSession.mock.calls.length;
-		let loading!: Promise<void>;
+		let loadingB!: Promise<void>;
+		let loadingC!: Promise<void>;
 		await act(async () => {
-			loading = useProjectStore.getState().loadProject("proj_b");
+			loadingB = useProjectStore.getState().loadProject("proj_b");
+			loadingC = useProjectStore.getState().loadProject("proj_c");
 			await Promise.resolve();
 		});
 		await waitFor(() =>
@@ -834,15 +856,19 @@ describe("LeftPanel async document results", () => {
 		const operationId = bridgeMocks.chatRun.mock.calls[0][4] as string;
 		ownerCommitted = true;
 		act(() => {
-			chatSessionUpdateListener?.({
+			const update: AiEditionChatSessionUpdatedEvent = {
 				projectId: "proj_a",
 				sessionId: "session_1",
 				revision: committed.sessionRevision,
 				operationId,
 				kind: "chat",
 				messages: committed.messages,
-			});
+			};
+			chatSessionUpdateListener?.(update);
+			chatSessionUpdateListener?.(update);
 		});
+		loadingProjectC.resolve({ success: false, error: "Project C unavailable" });
+		await Promise.resolve();
 		await act(async () => {
 			saving.resolve({ success: true, document: resultDocument });
 			await saving.promise;
@@ -854,17 +880,31 @@ describe("LeftPanel async document results", () => {
 		expect(bridgeMocks.chatAbortRun).not.toHaveBeenCalled();
 
 		await act(async () => {
-			loadingProjectB.resolve({ success: false, error: "Project B unavailable" });
-			await loading;
+			await loadingC;
 		});
 		expect(useProjectStore.getState()).toMatchObject({
 			projectId: "proj_a",
 			document: resultDocument,
 			status: "error",
-			error: "Project B unavailable",
+			error: "Project C unavailable",
 			dirty: false,
 		});
 		expect(screen.getAllByText("The edit is ready.")).toHaveLength(1);
+		await act(async () => {
+			loadingProjectB.resolve({
+				success: true,
+				document: {
+					...sampleDoc,
+					project: { ...sampleDoc.project, id: "proj_b", title: "Ignored Project B" },
+				},
+			});
+			await loadingB;
+		});
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_a",
+			document: resultDocument,
+			status: "error",
+		});
 
 		act(() => useProjectStore.setState({ status: "ready", error: null }));
 		bridgeMocks.chatPrepareRewind.mockResolvedValue({ success: false, error: "stop" });

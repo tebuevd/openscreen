@@ -59,11 +59,34 @@ export class DocumentSaveError extends Error {
 // Monotonic identity for one loaded document instance. A project can be opened,
 // replaced, then opened again with the same id; project id alone cannot distinguish them.
 let nextDocumentGeneration = 0;
+let nextLoadRequestToken = 0;
 const saveQueues = new Map<number, Promise<void>>();
-const retainedLoadingAuthorities = new Map<number, AxcutDocument>();
+
+interface RetainedLoadOrigin {
+	projectId: string;
+	document: AxcutDocument;
+	documentGeneration: number;
+	revision: number;
+}
+
+interface ActiveLoadHandoff {
+	requestToken: number;
+	targetProjectId: string;
+	loadingDocumentGeneration: number;
+	retained: RetainedLoadOrigin | null;
+	authoritative: AxcutDocument | null;
+}
+
+// One bounded handoff survives any number of superseding load requests. Older
+// request promises retain only primitive metadata, never another document snapshot.
+let activeLoadHandoff: ActiveLoadHandoff | null = null;
 
 function allocateDocumentGeneration(): number {
 	return ++nextDocumentGeneration;
+}
+
+function allocateLoadRequestToken(): number {
+	return ++nextLoadRequestToken;
 }
 
 function enqueueSave<T>(generation: number, task: () => Promise<T>): Promise<T> {
@@ -102,12 +125,18 @@ function assertMatchingSaveResponse(intended: AxcutDocument, persisted: AxcutDoc
 export interface ProjectState {
 	projectId: string | null;
 	document: AxcutDocument | null;
-	/** Changes for every load/create/clear, including reopening the same project id. */
+	/** Changes for each document handoff/create/clear; superseding pending loads share one. */
 	documentGeneration: number;
+	/** Monotonic identity of the latest request in the active load handoff. */
+	loadingRequestToken: number | null;
 	/** Target being loaded while the previous document remains rendered. */
 	loadingTargetProjectId: string | null;
 	/** Explicit owner of that retained document; null outside a load handoff. */
 	loadingRetainedProjectId: string | null;
+	/** Bound generation owned by the retained project before loading began. */
+	loadingRetainedDocumentGeneration: number | null;
+	/** Revision owned by the retained project before loading began. */
+	loadingRetainedRevision: number | null;
 	revision: number;
 	status: ProjectStatus;
 	error: string | null;
@@ -149,6 +178,79 @@ export interface ProjectState {
 	setPlaying: (playing: boolean) => void;
 	markClean: () => void;
 	clear: () => void;
+}
+
+type LoadingRequestState = Pick<
+	ProjectState,
+	| "loadingRequestToken"
+	| "loadingTargetProjectId"
+	| "loadingRetainedProjectId"
+	| "loadingRetainedDocumentGeneration"
+	| "loadingRetainedRevision"
+>;
+
+const clearedLoadingRequestState: LoadingRequestState = {
+	loadingRequestToken: null,
+	loadingTargetProjectId: null,
+	loadingRetainedProjectId: null,
+	loadingRetainedDocumentGeneration: null,
+	loadingRetainedRevision: null,
+};
+
+function loadHandoffForState(state: ProjectState): ActiveLoadHandoff | null {
+	const handoff = activeLoadHandoff;
+	if (
+		!handoff ||
+		state.status !== "loading" ||
+		state.documentGeneration !== handoff.loadingDocumentGeneration ||
+		state.loadingRequestToken !== handoff.requestToken ||
+		state.loadingTargetProjectId !== handoff.targetProjectId ||
+		state.loadingRetainedProjectId !== (handoff.retained?.projectId ?? null) ||
+		state.loadingRetainedDocumentGeneration !== (handoff.retained?.documentGeneration ?? null) ||
+		state.loadingRetainedRevision !== (handoff.retained?.revision ?? null)
+	) {
+		return null;
+	}
+	return handoff;
+}
+
+function clearLoadHandoff(): void {
+	activeLoadHandoff = null;
+}
+
+function beginLoadRequest(state: ProjectState, targetProjectId: string) {
+	const previousHandoff = loadHandoffForState(state);
+	const retained =
+		previousHandoff?.retained ??
+		(state.projectId && state.document?.project.id === state.projectId
+			? {
+					projectId: state.projectId,
+					document: structuredClone(state.document),
+					documentGeneration: state.documentGeneration,
+					revision: state.revision,
+				}
+			: null);
+	const documentGeneration =
+		previousHandoff?.loadingDocumentGeneration ?? allocateDocumentGeneration();
+	const requestToken = allocateLoadRequestToken();
+	activeLoadHandoff = {
+		requestToken,
+		targetProjectId,
+		loadingDocumentGeneration: documentGeneration,
+		retained,
+		authoritative: previousHandoff?.authoritative ?? null,
+	};
+	return {
+		requestToken,
+		documentGeneration,
+		loadingRequestState: {
+			loadingRequestToken: requestToken,
+			loadingTargetProjectId: targetProjectId,
+			loadingRetainedProjectId: retained?.projectId ?? null,
+			loadingRetainedDocumentGeneration: retained?.documentGeneration ?? null,
+			loadingRetainedRevision: retained?.revision ?? null,
+		} satisfies LoadingRequestState,
+	};
 }
 
 function parseDocument(value: unknown): AxcutDocument {
@@ -220,8 +322,7 @@ async function reconcileLifecycleFailure(
 		set({
 			projectId: document.project.id,
 			document,
-			loadingTargetProjectId: null,
-			loadingRetainedProjectId: null,
+			...clearedLoadingRequestState,
 			revision: get().revision + 1,
 			status: "ready",
 			error: null,
@@ -242,8 +343,7 @@ async function reconcileLifecycleFailure(
 		set({
 			projectId: options.fallbackDocument?.project.id ?? options.activeProjectId,
 			document: options.fallbackDocument,
-			loadingTargetProjectId: null,
-			loadingRetainedProjectId: null,
+			...clearedLoadingRequestState,
 			revision: get().revision + 1,
 			status: "error",
 			error: `${operationMessage} Recovery failed: ${reconciliationMessage}`,
@@ -256,8 +356,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	projectId: null,
 	document: null,
 	documentGeneration: 0,
-	loadingTargetProjectId: null,
-	loadingRetainedProjectId: null,
+	...clearedLoadingRequestState,
 	revision: 0,
 	status: "idle",
 	error: null,
@@ -268,37 +367,30 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	lastSavedAt: null,
 
 	async loadProject(projectId) {
-		const before = get();
-		retainedLoadingAuthorities.delete(before.documentGeneration);
-		const retainedProjectId =
-			before.projectId && before.document?.project.id === before.projectId
-				? before.projectId
-				: null;
-		const retainedDocumentGeneration = before.documentGeneration;
-		const documentGeneration = allocateDocumentGeneration();
+		const { requestToken, documentGeneration, loadingRequestState } = beginLoadRequest(
+			get(),
+			projectId,
+		);
 		set({
 			documentGeneration,
-			loadingTargetProjectId: projectId,
-			loadingRetainedProjectId: retainedProjectId,
+			...loadingRequestState,
 			status: "loading",
 			error: null,
 		});
+		const isLatestRequest = () => loadHandoffForState(get())?.requestToken === requestToken;
 		try {
 			const result = await nativeBridgeClient.aiEdition.get(projectId);
+			if (!isLatestRequest()) return;
 			if (!result.success || !result.document) {
 				throw new Error(result.error ?? "Failed to load project");
 			}
 			const document = parseDocument(result.document);
-			if (get().documentGeneration !== documentGeneration) {
-				retainedLoadingAuthorities.delete(documentGeneration);
-				return;
-			}
-			retainedLoadingAuthorities.delete(documentGeneration);
+			if (!isLatestRequest()) return;
+			clearLoadHandoff();
 			set({
 				projectId,
 				document,
-				loadingTargetProjectId: null,
-				loadingRetainedProjectId: null,
+				...clearedLoadingRequestState,
 				revision: get().revision + 1,
 				status: "ready",
 				error: null,
@@ -307,22 +399,27 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			});
 			void import("./undo").then(({ clearHistory }) => clearHistory());
 		} catch (error) {
-			await (saveQueues.get(retainedDocumentGeneration) ?? Promise.resolve());
-			const current = get();
-			if (current.documentGeneration !== documentGeneration) {
-				retainedLoadingAuthorities.delete(documentGeneration);
-				return;
+			let handoff = loadHandoffForState(get());
+			if (handoff?.requestToken !== requestToken) return;
+			const retainedDocumentGeneration = handoff.retained?.documentGeneration;
+			handoff = null;
+			if (retainedDocumentGeneration !== undefined) {
+				await (saveQueues.get(retainedDocumentGeneration) ?? Promise.resolve());
 			}
-			const retainedAuthority = retainedLoadingAuthorities.get(documentGeneration) ?? null;
-			retainedLoadingAuthorities.delete(documentGeneration);
+			handoff = loadHandoffForState(get());
+			if (handoff?.requestToken !== requestToken) return;
+			const current = get();
+			const retainedOrigin = handoff.retained;
+			const retainedAuthority = handoff.authoritative;
 			const canRestoreAuthority =
 				retainedAuthority !== null &&
-				current.loadingTargetProjectId === projectId &&
-				current.loadingRetainedProjectId === retainedProjectId &&
-				current.projectId === retainedProjectId &&
-				current.document?.project.id === retainedProjectId &&
-				before.document !== null &&
-				documentsHaveEquivalentSaveContent(current.document, before.document);
+				retainedOrigin !== null &&
+				retainedAuthority.project.id === retainedOrigin.projectId &&
+				current.projectId === retainedOrigin.projectId &&
+				current.document?.project.id === retainedOrigin.projectId &&
+				current.revision === retainedOrigin.revision &&
+				documentsHaveEquivalentSaveContent(current.document, retainedOrigin.document);
+			clearLoadHandoff();
 			set({
 				...(canRestoreAuthority
 					? {
@@ -333,8 +430,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 							lastSavedAt: new Date(),
 						}
 					: {}),
-				loadingTargetProjectId: null,
-				loadingRetainedProjectId: null,
+				...clearedLoadingRequestState,
 				status: "error",
 				error: error instanceof Error ? error.message : String(error),
 			});
@@ -342,12 +438,11 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	async createProject(title) {
-		retainedLoadingAuthorities.delete(get().documentGeneration);
+		clearLoadHandoff();
 		const documentGeneration = allocateDocumentGeneration();
 		set({
 			documentGeneration,
-			loadingTargetProjectId: null,
-			loadingRetainedProjectId: null,
+			...clearedLoadingRequestState,
 			status: "loading",
 			error: null,
 		});
@@ -361,8 +456,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			set({
 				projectId: document.project.id,
 				document,
-				loadingTargetProjectId: null,
-				loadingRetainedProjectId: null,
+				...clearedLoadingRequestState,
 				revision: get().revision + 1,
 				status: "ready",
 				error: null,
@@ -374,8 +468,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 		} catch (error) {
 			if (get().documentGeneration === documentGeneration) {
 				set({
-					loadingTargetProjectId: null,
-					loadingRetainedProjectId: null,
+					...clearedLoadingRequestState,
 					status: "error",
 					error: error instanceof Error ? error.message : String(error),
 				});
@@ -387,12 +480,11 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	async importProject(document) {
 		const imported = parseDocument(document);
 		const before = get();
-		retainedLoadingAuthorities.delete(before.documentGeneration);
+		clearLoadHandoff();
 		const documentGeneration = allocateDocumentGeneration();
 		set({
 			documentGeneration,
-			loadingTargetProjectId: null,
-			loadingRetainedProjectId: null,
+			...clearedLoadingRequestState,
 			status: "loading",
 			error: null,
 		});
@@ -402,8 +494,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			set({
 				projectId: persisted.project.id,
 				document: persisted,
-				loadingTargetProjectId: null,
-				loadingRetainedProjectId: null,
+				...clearedLoadingRequestState,
 				revision: get().revision + 1,
 				status: "ready",
 				error: null,
@@ -430,13 +521,12 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 		const deletingActiveProject = before.projectId === projectId;
 		const documentGeneration = deletingActiveProject ? allocateDocumentGeneration() : null;
 		if (documentGeneration !== null) {
-			retainedLoadingAuthorities.delete(before.documentGeneration);
+			clearLoadHandoff();
 			// Invalidate first so saves waiting in the old generation never dispatch
 			// after the main process has queued this deletion.
 			set({
 				documentGeneration,
-				loadingTargetProjectId: null,
-				loadingRetainedProjectId: null,
+				...clearedLoadingRequestState,
 				status: "loading",
 				error: null,
 			});
@@ -851,25 +941,30 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			};
 			const detachedOutcome = (authoritative: AxcutDocument): DocumentResultApplyOutcome => {
 				const current = get();
+				const handoff = loadHandoffForState(current);
+				const retainedOrigin = handoff?.retained ?? null;
 				const currentDocumentMatches =
 					current.projectId === expected.projectId &&
 					current.document?.project.id === expected.projectId &&
 					documentsHaveEquivalentSaveContent(current.document, parsed);
 				const retainedLoadingDocumentMatches =
-					current.status === "loading" &&
-					current.documentGeneration === expected.documentGeneration + 1 &&
-					current.loadingTargetProjectId !== null &&
-					current.loadingRetainedProjectId === expected.projectId &&
+					handoff !== null &&
+					retainedOrigin !== null &&
+					retainedOrigin.projectId === expected.projectId &&
+					retainedOrigin.documentGeneration === expected.documentGeneration &&
+					retainedOrigin.revision === expected.revision &&
 					current.projectId === expected.projectId &&
 					current.document?.project.id === expected.projectId &&
-					documentsHaveEquivalentSaveContent(current.document, retainedDocument);
+					current.revision === retainedOrigin.revision &&
+					documentsHaveEquivalentSaveContent(retainedOrigin.document, retainedDocument) &&
+					documentsHaveEquivalentSaveContent(current.document, retainedOrigin.document);
 				if (
 					authoritative.project.id === expected.projectId &&
 					documentsHaveEquivalentSaveContent(authoritative, parsed) &&
 					((current.status === "ready" && currentDocumentMatches) || retainedLoadingDocumentMatches)
 				) {
-					if (retainedLoadingDocumentMatches) {
-						retainedLoadingAuthorities.set(current.documentGeneration, authoritative);
+					if (retainedLoadingDocumentMatches && handoff) {
+						activeLoadHandoff = { ...handoff, authoritative };
 					}
 					return {
 						success: true,
@@ -960,8 +1055,9 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	setDocument(document) {
 		const state = get();
 		const prev = state.document;
-		if (state.status === "loading") {
-			retainedLoadingAuthorities.delete(state.documentGeneration);
+		const handoff = loadHandoffForState(state);
+		if (handoff) {
+			activeLoadHandoff = { ...handoff, authoritative: null };
 		}
 		if (prev && prev !== document) {
 			// ponytail: push snapshot to undo history. Defer import to avoid
@@ -1004,13 +1100,12 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	clear() {
-		retainedLoadingAuthorities.clear();
+		clearLoadHandoff();
 		set({
 			projectId: null,
 			document: null,
 			documentGeneration: allocateDocumentGeneration(),
-			loadingTargetProjectId: null,
-			loadingRetainedProjectId: null,
+			...clearedLoadingRequestState,
 			revision: 0,
 			status: "idle",
 			error: null,

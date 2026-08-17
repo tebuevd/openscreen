@@ -107,6 +107,10 @@ function withTitle(document: AxcutDocument, title: string): AxcutDocument {
 	return { ...document, project: { ...document.project, title } };
 }
 
+function withProject(document: AxcutDocument, id: string, title: string): AxcutDocument {
+	return { ...document, project: { ...document.project, id, title } };
+}
+
 function deferred<T>() {
 	let resolve!: (value: T) => void;
 	let reject!: (reason?: unknown) => void;
@@ -988,6 +992,448 @@ describe("useProjectStore", () => {
 			projectId: "proj_b",
 			document: projectB,
 			status: "ready",
+		});
+	});
+
+	it.each([
+		"before",
+		"after",
+	] as const)("keeps one retained origin when older B succeeds %s latest C", async (olderTiming) => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectB = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectC = deferred<{ success: true; document: AxcutDocument }>();
+		const intended = withTitle(sampleDoc, "Persisted while B and C load");
+		const projectB = withProject(sampleDoc, "proj_b", "Project B");
+		const projectC = withProject(sampleDoc, "proj_c", "Project C");
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockImplementation((projectId: string) => {
+			if (projectId === "proj_b") return loadingProjectB.promise;
+			if (projectId === "proj_c") return loadingProjectC.promise;
+			if (projectId === "proj_d") {
+				return Promise.resolve({ success: false as const, error: "Project D unavailable" });
+			}
+			return Promise.resolve({ success: true as const, document: intended });
+		});
+		loadDocument();
+		const expected = operationToken();
+		const applying = useProjectStore.getState().applyDocumentResult(expected, intended);
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(intended));
+
+		const loadingB = useProjectStore.getState().loadProject("proj_b");
+		const afterB = useProjectStore.getState();
+		const loadingBGeneration = afterB.documentGeneration;
+		const loadingBToken = afterB.loadingRequestToken;
+		const loadingC = useProjectStore.getState().loadProject("proj_c");
+		const afterC = useProjectStore.getState();
+		expect(afterC).toMatchObject({
+			projectId: sampleDoc.project.id,
+			document: sampleDoc,
+			documentGeneration: loadingBGeneration,
+			loadingTargetProjectId: "proj_c",
+			loadingRetainedProjectId: sampleDoc.project.id,
+			loadingRetainedDocumentGeneration: expected.documentGeneration,
+			loadingRetainedRevision: expected.revision,
+			status: "loading",
+		});
+		expect(afterC.loadingRequestToken).toBeGreaterThan(loadingBToken ?? 0);
+
+		saving.resolve({ success: true, document: intended });
+		await expect(applying).resolves.toEqual({
+			success: true,
+			status: "authoritative-detached",
+			appliedToCurrent: false,
+		});
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+
+		if (olderTiming === "before") {
+			loadingProjectB.resolve({ success: true, document: projectB });
+			await loadingB;
+			expect(useProjectStore.getState()).toMatchObject({
+				projectId: sampleDoc.project.id,
+				loadingTargetProjectId: "proj_c",
+				status: "loading",
+			});
+		}
+
+		loadingProjectC.resolve({ success: true, document: projectC });
+		await loadingC;
+		if (olderTiming === "after") {
+			loadingProjectB.resolve({ success: true, document: projectB });
+			await loadingB;
+		}
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_c",
+			document: projectC,
+			loadingRequestToken: null,
+			loadingTargetProjectId: null,
+			loadingRetainedProjectId: null,
+			loadingRetainedDocumentGeneration: null,
+			loadingRetainedRevision: null,
+			status: "ready",
+			dirty: false,
+		});
+
+		await useProjectStore.getState().loadProject("proj_d");
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_c",
+			document: projectC,
+			status: "error",
+			error: "Project D unavailable",
+		});
+	});
+
+	it.each([
+		{ olderResult: "success", olderTiming: "before" },
+		{ olderResult: "failure", olderTiming: "before" },
+		{ olderResult: "success", olderTiming: "after" },
+		{ olderResult: "failure", olderTiming: "after" },
+	] as const)("restores authoritative A when B $olderResult resolves $olderTiming failing C", async ({
+		olderResult,
+		olderTiming,
+	}) => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectB = deferred<
+			{ success: true; document: AxcutDocument } | { success: false; error: string }
+		>();
+		const loadingProjectC = deferred<{ success: false; error: string }>();
+		const intended = withTitle(sampleDoc, "Authoritative retained A");
+		const projectB = withProject(sampleDoc, "proj_b", "Ignored Project B");
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockImplementation((projectId: string) => {
+			if (projectId === "proj_b") return loadingProjectB.promise;
+			if (projectId === "proj_c") return loadingProjectC.promise;
+			return Promise.resolve({ success: true as const, document: intended });
+		});
+		loadDocument();
+		const expected = operationToken();
+		const applying = useProjectStore.getState().applyDocumentResult(expected, intended);
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(intended));
+		const loadingB = useProjectStore.getState().loadProject("proj_b");
+		const loadingC = useProjectStore.getState().loadProject("proj_c");
+		const cToken = useProjectStore.getState().loadingRequestToken;
+		const resolveOlder = () =>
+			loadingProjectB.resolve(
+				olderResult === "success"
+					? { success: true, document: projectB }
+					: { success: false, error: "Project B unavailable" },
+			);
+
+		if (olderTiming === "before") {
+			resolveOlder();
+			await loadingB;
+			expect(useProjectStore.getState()).toMatchObject({
+				loadingRequestToken: cToken,
+				loadingTargetProjectId: "proj_c",
+				status: "loading",
+			});
+		}
+
+		loadingProjectC.resolve({ success: false, error: "Project C unavailable" });
+		await Promise.resolve();
+		if (olderTiming === "after") {
+			resolveOlder();
+			await loadingB;
+			expect(useProjectStore.getState()).toMatchObject({
+				loadingRequestToken: cToken,
+				status: "loading",
+			});
+		}
+
+		saving.reject(new Error("save response lost"));
+		await expect(applying).resolves.toEqual({
+			success: true,
+			status: "authoritative-detached",
+			appliedToCurrent: false,
+		});
+		await loadingC;
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: sampleDoc.project.id,
+			document: intended,
+			loadingRequestToken: null,
+			loadingTargetProjectId: null,
+			loadingRetainedProjectId: null,
+			status: "error",
+			error: "Project C unavailable",
+			dirty: false,
+		});
+	});
+
+	it("supersedes an older failed load already waiting on the retained save queue", async () => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectB = deferred<{ success: false; error: string }>();
+		const loadingProjectC = deferred<{ success: false; error: string }>();
+		const intended = withTitle(sampleDoc, "Authority after two failed loads");
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockImplementation((projectId: string) => {
+			if (projectId === "proj_b") return loadingProjectB.promise;
+			if (projectId === "proj_c") return loadingProjectC.promise;
+			return Promise.resolve({ success: true as const, document: intended });
+		});
+		loadDocument();
+		const origin = operationToken();
+		const applying = useProjectStore.getState().applyDocumentResult(origin, intended);
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(intended));
+		const loadingB = useProjectStore.getState().loadProject("proj_b");
+		const loadingGeneration = useProjectStore.getState().documentGeneration;
+
+		loadingProjectB.resolve({ success: false, error: "Project B unavailable" });
+		await Promise.resolve();
+		expect(useProjectStore.getState()).toMatchObject({
+			loadingTargetProjectId: "proj_b",
+			status: "loading",
+		});
+		const loadingC = useProjectStore.getState().loadProject("proj_c");
+		expect(useProjectStore.getState()).toMatchObject({
+			documentGeneration: loadingGeneration,
+			loadingTargetProjectId: "proj_c",
+			loadingRetainedDocumentGeneration: origin.documentGeneration,
+			status: "loading",
+		});
+		loadingProjectC.resolve({ success: false, error: "Project C unavailable" });
+
+		saving.reject(new Error("save response lost"));
+		await expect(applying).resolves.toEqual({
+			success: true,
+			status: "authoritative-detached",
+			appliedToCurrent: false,
+		});
+		await Promise.all([loadingB, loadingC]);
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: sampleDoc.project.id,
+			document: intended,
+			loadingRequestToken: null,
+			status: "error",
+			error: "Project C unavailable",
+			dirty: false,
+		});
+	});
+
+	it.each([
+		"success",
+		"failure",
+	] as const)("preserves the retained origin across superseding same-id loads ending in %s", async (latestResult) => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingOlderA = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingLatestA = deferred<
+			{ success: true; document: AxcutDocument } | { success: false; error: string }
+		>();
+		const intended = withTitle(sampleDoc, "Persisted same-id authority");
+		const latestA = withUpdatedAt(intended, "2026-08-17T10:00:00.000Z");
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get
+			.mockReturnValueOnce(loadingOlderA.promise)
+			.mockReturnValueOnce(loadingLatestA.promise)
+			.mockResolvedValue({ success: true, document: intended });
+		loadDocument();
+		const expected = operationToken();
+		const applying = useProjectStore.getState().applyDocumentResult(expected, intended);
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(intended));
+		const loadingOlder = useProjectStore.getState().loadProject(sampleDoc.project.id);
+		const firstLoadingGeneration = useProjectStore.getState().documentGeneration;
+		const loadingLatest = useProjectStore.getState().loadProject(sampleDoc.project.id);
+		expect(useProjectStore.getState()).toMatchObject({
+			documentGeneration: firstLoadingGeneration,
+			loadingRetainedDocumentGeneration: expected.documentGeneration,
+			loadingRetainedRevision: expected.revision,
+		});
+
+		saving.resolve({ success: true, document: intended });
+		await expect(applying).resolves.toEqual({
+			success: true,
+			status: "authoritative-detached",
+			appliedToCurrent: false,
+		});
+		loadingLatestA.resolve(
+			latestResult === "success"
+				? { success: true, document: latestA }
+				: { success: false, error: "Latest same-id load failed" },
+		);
+		await loadingLatest;
+		loadingOlderA.resolve({
+			success: true,
+			document: withTitle(sampleDoc, "Ignored older same-id load"),
+		});
+		await loadingOlder;
+
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: sampleDoc.project.id,
+			document: latestResult === "success" ? latestA : intended,
+			status: latestResult === "success" ? "ready" : "error",
+			dirty: false,
+		});
+	});
+
+	it("keeps one origin and loading generation across an arbitrary superseding chain", async () => {
+		const targetIds = ["proj_b", "proj_c", "proj_d", "proj_e"];
+		const pending = targetIds.map(() =>
+			deferred<{ success: true; document: AxcutDocument } | { success: false; error: string }>(),
+		);
+		bridgeMocks.get.mockImplementation((projectId: string) => {
+			const index = targetIds.indexOf(projectId);
+			if (index < 0) throw new Error(`Unexpected project ${projectId}`);
+			return pending[index].promise;
+		});
+		loadDocument();
+		const origin = operationToken();
+		const loads: Promise<void>[] = [];
+		const tokens: number[] = [];
+		let loadingGeneration: number | null = null;
+		for (const projectId of targetIds) {
+			loads.push(useProjectStore.getState().loadProject(projectId));
+			const state = useProjectStore.getState();
+			loadingGeneration ??= state.documentGeneration;
+			expect(state).toMatchObject({
+				projectId: sampleDoc.project.id,
+				document: sampleDoc,
+				documentGeneration: loadingGeneration,
+				loadingTargetProjectId: projectId,
+				loadingRetainedProjectId: sampleDoc.project.id,
+				loadingRetainedDocumentGeneration: origin.documentGeneration,
+				loadingRetainedRevision: origin.revision,
+				status: "loading",
+			});
+			tokens.push(state.loadingRequestToken ?? -1);
+		}
+		expect(new Set(tokens).size).toBe(targetIds.length);
+
+		pending[0].resolve({ success: false, error: "Ignored B failure" });
+		pending[1].resolve({ success: false, error: "Ignored C failure" });
+		await Promise.all(loads.slice(0, 2));
+		expect(useProjectStore.getState()).toMatchObject({
+			loadingRequestToken: tokens.at(-1),
+			loadingTargetProjectId: "proj_e",
+			status: "loading",
+		});
+
+		pending[3].resolve({ success: false, error: "Latest E failure" });
+		await loads[3];
+		pending[2].resolve({
+			success: true,
+			document: withProject(sampleDoc, "proj_d", "Ignored Project D"),
+		});
+		await loads[2];
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: sampleDoc.project.id,
+			document: sampleDoc,
+			loadingRequestToken: null,
+			status: "error",
+			error: "Latest E failure",
+		});
+	});
+
+	it("does not restore overlapping retained authority over a divergent A edit", async () => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectB = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectC = deferred<{ success: false; error: string }>();
+		const intended = withTitle(sampleDoc, "Persisted agent result");
+		const edited = withTitle(sampleDoc, "Newer A edit during B and C");
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockImplementation((projectId: string) => {
+			if (projectId === "proj_b") return loadingProjectB.promise;
+			if (projectId === "proj_c") return loadingProjectC.promise;
+			return Promise.resolve({ success: true as const, document: intended });
+		});
+		loadDocument();
+		const applying = useProjectStore.getState().applyDocumentResult(operationToken(), intended);
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(intended));
+		const loadingB = useProjectStore.getState().loadProject("proj_b");
+		const loadingC = useProjectStore.getState().loadProject("proj_c");
+		useProjectStore.getState().setDocument(edited);
+
+		saving.resolve({ success: true, document: intended });
+		await expect(applying).resolves.toEqual({ success: false, status: "superseded" });
+		loadingProjectC.resolve({ success: false, error: "Project C unavailable" });
+		await loadingC;
+		loadingProjectB.resolve({
+			success: true,
+			document: withProject(sampleDoc, "proj_b", "Ignored Project B"),
+		});
+		await loadingB;
+
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: sampleDoc.project.id,
+			document: edited,
+			loadingRequestToken: null,
+			status: "error",
+			dirty: true,
+		});
+	});
+
+	it("lets a same-id A import invalidate an overlapping load handoff", async () => {
+		const agentSave = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectB = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectC = deferred<{ success: false; error: string }>();
+		const intended = withTitle(sampleDoc, "Persisted agent result");
+		const imported = withTitle(sampleDoc, "Imported A replacement");
+		bridgeMocks.save.mockImplementation((document: AxcutDocument) =>
+			document.project.title === imported.project.title
+				? Promise.resolve({ success: true as const, document: imported })
+				: agentSave.promise,
+		);
+		bridgeMocks.get.mockImplementation((projectId: string) => {
+			if (projectId === "proj_b") return loadingProjectB.promise;
+			if (projectId === "proj_c") return loadingProjectC.promise;
+			return Promise.resolve({ success: true as const, document: imported });
+		});
+		loadDocument();
+		const applying = useProjectStore.getState().applyDocumentResult(operationToken(), intended);
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(intended));
+		const loadingB = useProjectStore.getState().loadProject("proj_b");
+		const loadingC = useProjectStore.getState().loadProject("proj_c");
+		await expect(useProjectStore.getState().importProject(imported)).resolves.toBe(true);
+
+		loadingProjectC.resolve({ success: false, error: "Ignored C failure" });
+		loadingProjectB.resolve({
+			success: true,
+			document: withProject(sampleDoc, "proj_b", "Ignored Project B"),
+		});
+		await Promise.all([loadingB, loadingC]);
+		agentSave.resolve({ success: true, document: intended });
+		await expect(applying).resolves.toEqual({ success: false, status: "superseded" });
+
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: sampleDoc.project.id,
+			document: imported,
+			loadingRequestToken: null,
+			status: "ready",
+			dirty: false,
+		});
+	});
+
+	it("does not restore overlapping A authority when disk content diverges", async () => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectB = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectC = deferred<{ success: false; error: string }>();
+		const intended = withTitle(sampleDoc, "Intended agent result");
+		const authoritative = withTitle(sampleDoc, "Different disk document");
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockImplementation((projectId: string) => {
+			if (projectId === "proj_b") return loadingProjectB.promise;
+			if (projectId === "proj_c") return loadingProjectC.promise;
+			return Promise.resolve({ success: true as const, document: authoritative });
+		});
+		loadDocument();
+		const applying = useProjectStore.getState().applyDocumentResult(operationToken(), intended);
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(intended));
+		const loadingB = useProjectStore.getState().loadProject("proj_b");
+		const loadingC = useProjectStore.getState().loadProject("proj_c");
+
+		saving.resolve({ success: true, document: intended });
+		await expect(applying).resolves.toEqual({ success: false, status: "superseded" });
+		loadingProjectC.resolve({ success: false, error: "Project C unavailable" });
+		await loadingC;
+		loadingProjectB.resolve({
+			success: true,
+			document: withProject(sampleDoc, "proj_b", "Ignored Project B"),
+		});
+		await loadingB;
+
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: sampleDoc.project.id,
+			document: sampleDoc,
+			loadingRequestToken: null,
+			status: "error",
+			error: "Project C unavailable",
 		});
 	});
 
