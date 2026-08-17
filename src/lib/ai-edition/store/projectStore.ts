@@ -14,6 +14,12 @@ import { type AxcutAsset, type AxcutDocument, documentSchema } from "../schema";
 
 export type ProjectStatus = "idle" | "loading" | "ready" | "error";
 
+export interface DocumentOperationToken {
+	readonly projectId: string;
+	readonly documentGeneration: number;
+	readonly revision: number;
+}
+
 // Monotonic identity for one loaded document instance. A project can be opened,
 // replaced, then opened again with the same id; project id alone cannot distinguish them.
 let nextDocumentGeneration = 0;
@@ -77,6 +83,10 @@ export interface ProjectState {
 		documentGeneration: number,
 		update: (document: AxcutDocument) => AxcutDocument | null,
 		isCurrent?: () => boolean,
+	) => Promise<boolean>;
+	applyDocumentResult: (
+		expected: DocumentOperationToken,
+		document: AxcutDocument,
 	) => Promise<boolean>;
 	setDocument: (document: AxcutDocument) => void;
 	replaceTimeline: (intervals: Interval[], reason: string) => Promise<void>;
@@ -587,6 +597,71 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				return true;
 			}
 		});
+	},
+
+	async applyDocumentResult(expected, document) {
+		const before = get();
+		if (
+			before.documentGeneration !== expected.documentGeneration ||
+			before.projectId !== expected.projectId ||
+			before.revision !== expected.revision ||
+			before.status !== "ready" ||
+			before.document?.project.id !== expected.projectId
+		) {
+			return false;
+		}
+
+		const parsed = parseDocument(document);
+		if (parsed.project.id !== expected.projectId) {
+			throw new Error(
+				`Document result belongs to ${parsed.project.id}, expected ${expected.projectId}`,
+			);
+		}
+
+		// Validation and installation are one synchronous store transaction. A project switch or
+		// edit that happened while the producer was running therefore cannot slip between a
+		// component-level check and this full-document replacement.
+		void import("./undo").then(({ pushHistory }) => {
+			pushHistory({ projectId: expected.projectId, doc: structuredClone(before.document!) });
+		});
+		set({
+			document: parsed,
+			revision: expected.revision + 1,
+			dirty: true,
+		});
+
+		await enqueueSave(expected.documentGeneration, async () => {
+			const saving = get();
+			if (
+				saving.documentGeneration !== expected.documentGeneration ||
+				saving.projectId !== expected.projectId ||
+				saving.status !== "ready" ||
+				!saving.document ||
+				saving.document.project.id !== expected.projectId
+			) {
+				return;
+			}
+
+			// If the user edited after this result was accepted, persist that newer document instead
+			// of replaying the accepted snapshot over it.
+			const revision = saving.revision;
+			const persisted = await persistDocument(saving.document);
+			const current = get();
+			if (
+				current.documentGeneration !== expected.documentGeneration ||
+				current.projectId !== expected.projectId ||
+				current.revision !== revision
+			) {
+				return;
+			}
+			set({
+				document: persisted,
+				revision: revision + 1,
+				dirty: false,
+				lastSavedAt: new Date(),
+			});
+		});
+		return true;
 	},
 
 	setDocument(document) {

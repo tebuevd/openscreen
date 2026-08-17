@@ -236,6 +236,7 @@
 		"selectModelFailed": "Could not select model",
 		"providerSettings": "Provider settings…",
 		"applyEditsFailed": "Could not apply the agent's edits",
+		"documentChangedDuringOperation": "The project changed while this was running, so its edits were not applied.",
 		"chatFailed": "Chat failed",
 		"rewindFailed": "Rewind failed",
 		"rewoundSuccess": "Rewound to the start of that message",

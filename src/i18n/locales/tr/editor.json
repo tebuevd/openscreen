@@ -236,6 +236,7 @@
 		"selectModelFailed": "Model seçilemedi",
 		"providerSettings": "Sağlayıcı ayarları…",
 		"applyEditsFailed": "Aracının düzenlemeleri uygulanamadı",
+		"documentChangedDuringOperation": "Bu işlem çalışırken proje değişti, bu nedenle düzenlemeler uygulanmadı.",
 		"chatFailed": "Sohbet başarısız oldu",
 		"rewindFailed": "Geri sarma başarısız oldu",
 		"rewoundSuccess": "O mesajın başına geri sarıldı",

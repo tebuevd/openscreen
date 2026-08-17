@@ -3,7 +3,7 @@ import { waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { removeAsset as removeAssetFromDocument } from "../document/timeline";
 import type { AxcutDocument } from "../schema";
-import { useProjectStore } from "./projectStore";
+import { type DocumentOperationToken, useProjectStore } from "./projectStore";
 
 const bridgeMocks = vi.hoisted(() => ({
 	get: vi.fn(),
@@ -116,6 +116,16 @@ function loadDocument(document: AxcutDocument = sampleDoc) {
 		error: null,
 		dirty: false,
 	});
+}
+
+function operationToken(): DocumentOperationToken {
+	const state = useProjectStore.getState();
+	if (!state.projectId) throw new Error("Expected a loaded project");
+	return {
+		projectId: state.projectId,
+		documentGeneration: state.documentGeneration,
+		revision: state.revision,
+	};
 }
 
 describe("useProjectStore", () => {
@@ -450,6 +460,112 @@ describe("useProjectStore", () => {
 			dirty: true,
 		});
 		expect(useProjectStore.getState().documentGeneration).toBeGreaterThan(firstGeneration);
+	});
+
+	it("atomically applies and persists a current full-document result once", async () => {
+		bridgeMocks.save.mockImplementation(async (document: AxcutDocument) => ({
+			success: true,
+			document,
+		}));
+		loadDocument();
+		const expected = operationToken();
+		const resultDocument: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Agent result" },
+		};
+
+		await expect(
+			useProjectStore.getState().applyDocumentResult(expected, resultDocument),
+		).resolves.toBe(true);
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(bridgeMocks.save).toHaveBeenCalledWith(resultDocument);
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_test",
+			document: { project: { title: "Agent result" } },
+			dirty: false,
+		});
+	});
+
+	it("refuses a full-document result after the expected revision changes", async () => {
+		loadDocument();
+		const expected = operationToken();
+		const edited: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Newer user edit" },
+		};
+		useProjectStore.getState().setDocument(edited);
+
+		await expect(
+			useProjectStore.getState().applyDocumentResult(expected, {
+				...sampleDoc,
+				project: { ...sampleDoc.project, title: "Stale agent result" },
+			}),
+		).resolves.toBe(false);
+
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Newer user edit" } },
+			dirty: true,
+		});
+	});
+
+	it("refuses a full-document result from an older same-project generation", async () => {
+		loadDocument();
+		const expected = operationToken();
+		const reopened: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Reopened project" },
+		};
+		useProjectStore.getState().clear();
+		loadDocument(reopened);
+
+		await expect(
+			useProjectStore.getState().applyDocumentResult(expected, {
+				...sampleDoc,
+				project: { ...sampleDoc.project, title: "Old generation result" },
+			}),
+		).resolves.toBe(false);
+
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+		expect(useProjectStore.getState().document).toBe(reopened);
+	});
+
+	it("persists a newer edit instead of replaying an accepted result waiting in the save queue", async () => {
+		const firstSave = deferred<{ success: true; document: AxcutDocument }>();
+		const snapshots: AxcutDocument[] = [];
+		bridgeMocks.save.mockImplementation((document: AxcutDocument) => {
+			snapshots.push(document);
+			return snapshots.length === 1
+				? firstSave.promise
+				: Promise.resolve({ success: true as const, document });
+		});
+		loadDocument();
+		const firstSaving = useProjectStore.getState().saveDocument({
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Earlier queued save" },
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		const applying = useProjectStore.getState().applyDocumentResult(operationToken(), {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Accepted agent result" },
+		});
+		const accepted = useProjectStore.getState().document!;
+		useProjectStore.getState().setDocument({
+			...accepted,
+			project: { ...accepted.project, title: "Edit after accepted result" },
+		});
+
+		firstSave.resolve({ success: true, document: snapshots[0] });
+		await firstSaving;
+		await expect(applying).resolves.toBe(true);
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(2);
+		expect(snapshots[1].project.title).toBe("Edit after accepted result");
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Edit after accepted result" } },
+			dirty: false,
+		});
 	});
 
 	it("merges a delayed add response without clearing a newer dirty edit", async () => {

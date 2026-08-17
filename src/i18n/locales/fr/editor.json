@@ -236,6 +236,7 @@
 		"selectModelFailed": "Impossible de sélectionner le modèle",
 		"providerSettings": "Réglages du fournisseur…",
 		"applyEditsFailed": "Impossible d'appliquer les modifications de l'agent",
+		"documentChangedDuringOperation": "Le projet a changé pendant cette opération ; ses modifications n’ont donc pas été appliquées.",
 		"chatFailed": "Échec du chat",
 		"rewindFailed": "Échec du retour en arrière",
 		"rewoundSuccess": "Retour au début de ce message effectué",

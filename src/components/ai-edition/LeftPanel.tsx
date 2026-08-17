@@ -4,7 +4,7 @@ import { createPortal } from "react-dom";
 import { toast } from "sonner";
 import { useScopedT } from "@/contexts/I18nContext";
 import { type AxcutAsset, ensureDocument } from "@/lib/ai-edition/schema";
-import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
+import { type DocumentOperationToken, useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import {
 	useAssetTranscriptions,
 	useTranscriptionStore,
@@ -869,15 +869,18 @@ function ChatStripPanel() {
 		scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
 	});
 
-	// Apply a document returned by the agent (tool batch or undo). setDocument
-	// pushes the previous doc to the local undo stack (Cmd+Z also works), then
-	// saveDocument persists it to disk.
-	const applyAgentDocument = useCallback(async (doc: unknown) => {
-		const parsed = ensureDocument(doc);
-		const store = useProjectStore.getState();
-		store.setDocument(parsed);
-		await store.saveDocument(parsed);
-	}, []);
+	// Full documents returned by chat and rewind are snapshots of the launch document. The
+	// store validates that immutable version and performs replacement + persistence atomically.
+	const applyAgentDocument = useCallback(
+		async (doc: unknown, operation: DocumentOperationToken) =>
+			useProjectStore.getState().applyDocumentResult(operation, ensureDocument(doc)),
+		[],
+	);
+	const showStaleDocumentResult = useCallback(() => {
+		toast.error(t("chat.applyEditsFailed"), {
+			description: t("chat.documentChangedDuringOperation"),
+		});
+	}, [t]);
 
 	const send = async (overrideText?: string) => {
 		const text = (overrideText ?? input).trim();
@@ -890,6 +893,15 @@ function ChatStripPanel() {
 			setSettingsOpen(true);
 			return;
 		}
+		const launchState = useProjectStore.getState();
+		if (launchState.projectId !== projectId || launchState.status !== "ready") return;
+		const documentOperation: DocumentOperationToken = {
+			projectId,
+			documentGeneration: launchState.documentGeneration,
+			revision: launchState.revision,
+		};
+		const documentSnapshot =
+			launchState.document?.project.id === projectId ? launchState.document : undefined;
 		setInput("");
 		setBusy(true);
 		// ponytail: prepare the live reasoning-trace accumulator. Late events
@@ -926,9 +938,8 @@ function ChatStripPanel() {
 			// ponytail: start collecting the live reasoning trace for THIS run —
 			// the subscription only appends deltas whose sessionId matches.
 			thinkingRunSessionRef.current = sessionId;
-			// Send the current document snapshot so the agent can run edit tools
-			// against it (P1). Falls back to text-only chat when no doc is open.
-			const documentSnapshot = useProjectStore.getState().document ?? undefined;
+			// Send exactly the document version represented by documentOperation so a later result
+			// can only replace the same unchanged version.
 			const result = await nativeBridgeClient.aiEdition.chatRun(
 				projectId,
 				sessionId,
@@ -939,7 +950,8 @@ function ChatStripPanel() {
 			if (result.success && assistant) {
 				if (result.document) {
 					try {
-						await applyAgentDocument(result.document);
+						const applied = await applyAgentDocument(result.document, documentOperation);
+						if (!applied) showStaleDocumentResult();
 					} catch (err) {
 						toast.error(t("chat.applyEditsFailed"), {
 							description: err instanceof Error ? err.message : String(err),
@@ -1007,6 +1019,13 @@ function ChatStripPanel() {
 	const confirmRewind = useCallback(
 		async (messageId: string) => {
 			if (!projectId || !activeSessionId) return;
+			const launchState = useProjectStore.getState();
+			if (launchState.projectId !== projectId || launchState.status !== "ready") return;
+			const documentOperation: DocumentOperationToken = {
+				projectId,
+				documentGeneration: launchState.documentGeneration,
+				revision: launchState.revision,
+			};
 			try {
 				const result = await nativeBridgeClient.aiEdition.chatRewind(
 					projectId,
@@ -1019,7 +1038,13 @@ function ChatStripPanel() {
 					return;
 				}
 				const doc = (result as { document?: unknown }).document;
-				if (doc) await applyAgentDocument(doc);
+				if (doc) {
+					const applied = await applyAgentDocument(doc, documentOperation);
+					if (!applied) {
+						showStaleDocumentResult();
+						return;
+					}
+				}
 				setMessages(
 					result.messages.map((m) => ({
 						id: m.id,
@@ -1040,7 +1065,7 @@ function ChatStripPanel() {
 				setRewindFor(null);
 			}
 		},
-		[projectId, activeSessionId, applyAgentDocument, t],
+		[projectId, activeSessionId, applyAgentDocument, showStaleDocumentResult, t],
 	);
 
 	useEffect(() => {

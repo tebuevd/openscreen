@@ -236,6 +236,7 @@
 		"selectModelFailed": "Không thể chọn mô hình",
 		"providerSettings": "Cài đặt nhà cung cấp…",
 		"applyEditsFailed": "Không thể áp dụng chỉnh sửa của tác nhân",
+		"documentChangedDuringOperation": "Dự án đã thay đổi trong khi thao tác đang chạy, nên các chỉnh sửa không được áp dụng.",
 		"chatFailed": "Trò chuyện thất bại",
 		"rewindFailed": "Tua lại thất bại",
 		"rewoundSuccess": "Đã tua lại đến đầu tin nhắn đó",

@@ -236,6 +236,7 @@
 		"selectModelFailed": "تعذّر اختيار النموذج",
 		"providerSettings": "إعدادات المزوّد…",
 		"applyEditsFailed": "تعذّر تطبيق تعديلات الوكيل",
+		"documentChangedDuringOperation": "تغيّر المشروع أثناء تشغيل هذه العملية، لذلك لم يتم تطبيق تعديلاتها.",
 		"chatFailed": "فشلت المحادثة",
 		"rewindFailed": "فشلت إعادة الضبط",
 		"rewoundSuccess": "تمت إعادة الضبط إلى بداية تلك الرسالة",

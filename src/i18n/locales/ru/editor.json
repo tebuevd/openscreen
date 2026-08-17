@@ -236,6 +236,7 @@
 		"selectModelFailed": "Не удалось выбрать модель",
 		"providerSettings": "Настройки провайдера…",
 		"applyEditsFailed": "Не удалось применить правки агента",
+		"documentChangedDuringOperation": "Проект изменился во время выполнения операции, поэтому её правки не были применены.",
 		"chatFailed": "Ошибка чата",
 		"rewindFailed": "Ошибка отката",
 		"rewoundSuccess": "Откат к началу этого сообщения выполнен",
