@@ -87,6 +87,16 @@ function operationMustFinish(operation: PanelOperation): boolean {
 type SuccessfulChatCommit = Extract<AiEditionChatCommitResult, { success: true }>;
 type SuccessfulRewindCommit = Extract<AiEditionChatRewindCommitResult, { success: true }>;
 
+interface RewindComposerDelivery {
+	revision: number;
+	applied: boolean;
+	claimAttempts: number;
+	confirmAttempts: number;
+}
+
+const REWIND_COMPOSER_RETRY_LIMIT = 4;
+const REWIND_COMPOSER_RETRY_DELAY_MS = 100;
+
 type CommitResolution<T> =
 	| { state: "committed"; result: T }
 	| { state: "aborted"; error: string }
@@ -887,7 +897,7 @@ function ChatStripPanel() {
 	activeSessionIdRef.current = activeSessionId;
 	const sessionRevisionRef = useRef(new Map<string, number>());
 	const appliedSessionUpdatesRef = useRef(new Set<string>());
-	const claimedComposerRestorationsRef = useRef(new Map<string, number>());
+	const rewindComposerDeliveriesRef = useRef(new Map<string, RewindComposerDelivery>());
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	// ponytail: live reasoning trace for the in-flight turn. Reset at send()
 	// start; deltas append through the chat-event subscription; once the run
@@ -963,8 +973,9 @@ function ChatStripPanel() {
 		void refreshLlm();
 	}, [refreshLlm]);
 
-	const claimComposerRestoration = useCallback(
+	const claimRewindComposer = useCallback(
 		(projectId: string, sessionId: string, revision: number) => {
+			const key = `${projectId}::${sessionId}`;
 			const current = useProjectStore.getState();
 			if (
 				current.projectId !== projectId ||
@@ -973,29 +984,74 @@ function ChatStripPanel() {
 			) {
 				return;
 			}
-			const key = `${projectId}::${sessionId}`;
-			if (claimedComposerRestorationsRef.current.get(key) === revision) return;
-			claimedComposerRestorationsRef.current.set(key, revision);
-			void nativeBridgeClient.aiEdition
-				.chatClaimComposerRestoration(projectId, sessionId, revision)
-				.then((result) => {
-					if (!result.claimed) return;
-					const latest = useProjectStore.getState();
-					if (
-						mountedRef.current &&
-						latest.projectId === projectId &&
-						activeSessionIdRef.current === sessionId &&
-						sessionRevisionRef.current.get(sessionId) === revision &&
-						claimedComposerRestorationsRef.current.get(key) === revision
-					) {
-						setInput(result.prompt);
+			if (rewindComposerDeliveriesRef.current.get(key)?.revision === revision) return;
+
+			const delivery: RewindComposerDelivery = {
+				revision,
+				applied: false,
+				claimAttempts: 0,
+				confirmAttempts: 0,
+			};
+			rewindComposerDeliveriesRef.current.set(key, delivery);
+			const ownsUi = () => {
+				const latest = useProjectStore.getState();
+				return (
+					mountedRef.current &&
+					latest.projectId === projectId &&
+					activeSessionIdRef.current === sessionId &&
+					sessionRevisionRef.current.get(sessionId) === revision &&
+					rewindComposerDeliveriesRef.current.get(key) === delivery
+				);
+			};
+			const retryDelay = (attempt: number) =>
+				REWIND_COMPOSER_RETRY_DELAY_MS * 2 ** Math.max(0, attempt - 1);
+			const confirm = async (claimId: string): Promise<void> => {
+				delivery.confirmAttempts++;
+				try {
+					const result = await nativeBridgeClient.aiEdition.chatConfirmRewindComposerClaim(claimId);
+					if (result.confirmed) return;
+				} catch {
+					if (delivery.confirmAttempts < REWIND_COMPOSER_RETRY_LIMIT) {
+						setTimeout(() => void confirm(claimId), retryDelay(delivery.confirmAttempts));
 					}
-				})
-				.catch(() => {
-					if (claimedComposerRestorationsRef.current.get(key) === revision) {
-						claimedComposerRestorationsRef.current.delete(key);
+				}
+			};
+			const claim = async (): Promise<void> => {
+				delivery.claimAttempts++;
+				let result: Awaited<
+					ReturnType<typeof nativeBridgeClient.aiEdition.chatClaimRewindComposer>
+				>;
+				try {
+					result = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+						projectId,
+						sessionId,
+						revision,
+					);
+				} catch {
+					if (ownsUi() && delivery.claimAttempts < REWIND_COMPOSER_RETRY_LIMIT) {
+						setTimeout(() => void claim(), retryDelay(delivery.claimAttempts));
+					} else if (rewindComposerDeliveriesRef.current.get(key) === delivery) {
+						rewindComposerDeliveriesRef.current.delete(key);
 					}
-				});
+					return;
+				}
+				if (!result.claimed) return;
+				if (!ownsUi()) {
+					void nativeBridgeClient.aiEdition
+						.chatReleaseRewindComposerClaim(result.claimId)
+						.catch(() => undefined);
+					if (rewindComposerDeliveriesRef.current.get(key) === delivery) {
+						rewindComposerDeliveriesRef.current.delete(key);
+					}
+					return;
+				}
+				if (!delivery.applied) {
+					delivery.applied = true;
+					setInput(result.prompt);
+				}
+				await confirm(result.claimId);
+			};
+			void claim();
 		},
 		[],
 	);
@@ -1050,11 +1106,11 @@ function ChatStripPanel() {
 				);
 				const restoration = event.pendingComposerRestoration;
 				if (event.kind === "rewind" && restoration) {
-					claimComposerRestoration(event.projectId, event.sessionId, restoration.revision);
+					claimRewindComposer(event.projectId, event.sessionId, restoration.revision);
 				}
 			},
 		);
-	}, [projectId, documentGeneration, claimComposerRestoration]);
+	}, [projectId, documentGeneration, claimRewindComposer]);
 
 	useEffect(() => {
 		mountedRef.current = true;
@@ -1094,7 +1150,7 @@ function ChatStripPanel() {
 		thinkingRunSessionRef.current = null;
 		sessionRevisionRef.current.clear();
 		appliedSessionUpdatesRef.current.clear();
-		claimedComposerRestorationsRef.current.clear();
+		rewindComposerDeliveriesRef.current.clear();
 		thinkingTextRef.current = "";
 		setThinkingText("");
 		if (!projectId) {
@@ -1135,7 +1191,7 @@ function ChatStripPanel() {
 					setMessages(toDisplayMessages(session.messages));
 					const restoration = session.pendingComposerRestoration;
 					if (restoration?.revision === session.revision) {
-						claimComposerRestoration(projectId, activeSessionId, restoration.revision);
+						claimRewindComposer(projectId, activeSessionId, restoration.revision);
 					}
 				} else {
 					setMessages([]);
@@ -1147,7 +1203,7 @@ function ChatStripPanel() {
 		return () => {
 			cancelled = true;
 		};
-	}, [projectId, documentGeneration, activeSessionId, claimComposerRestoration]);
+	}, [projectId, documentGeneration, activeSessionId, claimRewindComposer]);
 
 	useEffect(() => {
 		scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -1300,7 +1356,7 @@ function ChatStripPanel() {
 				sessionRevisionRef.current.set(session.id, session.revision);
 				setMessages(toDisplayMessages(session.messages));
 				if (session.pendingComposerRestoration?.revision === session.revision) {
-					claimComposerRestoration(projectId, session.id, session.revision);
+					claimRewindComposer(projectId, session.id, session.revision);
 				}
 			} catch {
 				// A process restart is represented by an unavailable/empty in-memory session.
@@ -1598,7 +1654,7 @@ function ChatStripPanel() {
 					sessionRevisionRef.current.set(session.id, session.revision);
 					setMessages(toDisplayMessages(session.messages));
 					if (session.pendingComposerRestoration?.revision === session.revision) {
-						claimComposerRestoration(projectId, session.id, session.revision);
+						claimRewindComposer(projectId, session.id, session.revision);
 					}
 				} catch {
 					// A restarted main process has no in-memory session to recover.
@@ -1686,7 +1742,7 @@ function ChatStripPanel() {
 					sessionRevisionRef.current.set(activeSessionId, resolution.result.sessionRevision);
 					rememberAppliedSessionUpdate(appliedSessionUpdatesRef.current, prepared.operationId);
 					setMessages(toDisplayMessages(resolution.result.messages));
-					claimComposerRestoration(
+					claimRewindComposer(
 						projectId,
 						activeSessionId,
 						resolution.result.pendingComposerRestoration.revision,
@@ -1717,7 +1773,7 @@ function ChatStripPanel() {
 			busy,
 			rewindBusy,
 			applyAgentDocument,
-			claimComposerRestoration,
+			claimRewindComposer,
 			showStaleDocumentResult,
 			t,
 		],

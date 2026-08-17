@@ -315,6 +315,9 @@ function createShimBridgeClient() {
 	const terminalOperationTtlMs = 10 * 60_000;
 	const maxActiveOperations = 128;
 	const maxTerminalOperations = 256;
+	const rewindComposerClaimLeaseMs = 15_000;
+	const confirmedRewindComposerClaimTtlMs = 10 * 60_000;
+	const maxConfirmedRewindComposerClaims = 256;
 	const sessionsByProject = new Map<string, Map<string, ShimSession>>();
 	type ShimOperation = {
 		operationId: string;
@@ -342,6 +345,17 @@ function createShimBridgeClient() {
 	const pendingChatRuns = new Map<string, PendingShimChatRun>();
 	const terminalChatRuns = new Map<string, TerminalShimChatRun>();
 	const operationExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	type ShimRewindComposerClaim = {
+		claimId: string;
+		projectId: string;
+		sessionId: string;
+		revision: number;
+		leaseExpiresAt: number;
+	};
+	const rewindComposerClaims = new Map<string, ShimRewindComposerClaim>();
+	const rewindComposerClaimBySession = new Map<string, string>();
+	const rewindComposerClaimExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+	const confirmedRewindComposerClaims = new Map<string, number>();
 	const operationBelongsToSession = (
 		operation: ShimOperation,
 		projectId: string,
@@ -444,6 +458,72 @@ function createShimBridgeClient() {
 			operationBelongsToSession(operation, projectId, sessionId),
 		);
 	};
+	const composerSessionKey = (projectId: string, sessionId: string) => `${projectId}::${sessionId}`;
+	const removeRewindComposerClaim = (claim: ShimRewindComposerClaim) => {
+		if (rewindComposerClaims.get(claim.claimId) === claim) {
+			rewindComposerClaims.delete(claim.claimId);
+		}
+		const key = composerSessionKey(claim.projectId, claim.sessionId);
+		if (rewindComposerClaimBySession.get(key) === claim.claimId) {
+			rewindComposerClaimBySession.delete(key);
+		}
+		const timeout = rewindComposerClaimExpiryTimers.get(claim.claimId);
+		if (timeout) clearTimeout(timeout);
+		rewindComposerClaimExpiryTimers.delete(claim.claimId);
+	};
+	const activeRewindComposerClaim = (projectId: string, sessionId: string) => {
+		const key = composerSessionKey(projectId, sessionId);
+		const claimId = rewindComposerClaimBySession.get(key);
+		if (!claimId) return null;
+		const claim = rewindComposerClaims.get(claimId);
+		if (!claim || claim.projectId !== projectId || claim.sessionId !== sessionId) {
+			rewindComposerClaimBySession.delete(key);
+			return null;
+		}
+		if (claim.leaseExpiresAt <= Date.now()) {
+			removeRewindComposerClaim(claim);
+			return null;
+		}
+		return claim;
+	};
+	const scheduleRewindComposerClaimExpiry = (claim: ShimRewindComposerClaim) => {
+		const expire = () => {
+			if (rewindComposerClaims.get(claim.claimId) !== claim) return;
+			const remaining = claim.leaseExpiresAt - Date.now();
+			if (remaining > 0) {
+				rewindComposerClaimExpiryTimers.set(claim.claimId, setTimeout(expire, remaining));
+				return;
+			}
+			removeRewindComposerClaim(claim);
+		};
+		rewindComposerClaimExpiryTimers.set(
+			claim.claimId,
+			setTimeout(expire, Math.max(0, claim.leaseExpiresAt - Date.now())),
+		);
+	};
+	const clearPendingComposerRestoration = (session: ShimSession) => {
+		const claim = activeRewindComposerClaim(session.projectId, session.id);
+		if (claim) removeRewindComposerClaim(claim);
+		delete session.pendingComposerRestoration;
+	};
+	const pruneConfirmedRewindComposerClaims = () => {
+		const now = Date.now();
+		for (const [claimId, expiresAt] of confirmedRewindComposerClaims) {
+			if (expiresAt <= now) confirmedRewindComposerClaims.delete(claimId);
+		}
+	};
+	const rememberConfirmedRewindComposerClaim = (claimId: string) => {
+		pruneConfirmedRewindComposerClaims();
+		confirmedRewindComposerClaims.set(claimId, Date.now() + confirmedRewindComposerClaimTtlMs);
+		while (confirmedRewindComposerClaims.size > maxConfirmedRewindComposerClaims) {
+			const oldestClaimId = confirmedRewindComposerClaims.keys().next().value;
+			if (typeof oldestClaimId !== "string") break;
+			confirmedRewindComposerClaims.delete(oldestClaimId);
+		}
+	};
+	const releaseAllRewindComposerClaims = () => {
+		for (const claim of [...rewindComposerClaims.values()]) removeRewindComposerClaim(claim);
+	};
 	(() => {
 		try {
 			const raw = localStorage.getItem(chatStorageKey);
@@ -532,6 +612,7 @@ function createShimBridgeClient() {
 		// before their resolved Promise is returned, so no write can still land after
 		// pagehide. Releasing every staged operation here is therefore deterministic.
 		for (const operation of [...pendingChatRuns.values()]) rememberAbortedRun(operation);
+		releaseAllRewindComposerClaims();
 	};
 	removeBrowserChatOwnerTeardownListener?.();
 	window.addEventListener("pagehide", handleDocumentOwnerTeardown);
@@ -722,7 +803,7 @@ function createShimBridgeClient() {
 					}
 				} else {
 					s.messages.push(...stagedMessages);
-					delete s.pendingComposerRestoration;
+					clearPendingComposerRestoration(s);
 					s.revision++;
 					persistChat();
 				}
@@ -753,7 +834,7 @@ function createShimBridgeClient() {
 					return Promise.resolve({ success: false, error: "Chat operation is stale." });
 				}
 				session.messages.push(...pending.messages);
-				delete session.pendingComposerRestoration;
+				clearPendingComposerRestoration(session);
 				session.revision++;
 				const result = {
 					success: true as const,
@@ -938,7 +1019,7 @@ function createShimBridgeClient() {
 					createdAt: new Date().toISOString(),
 				};
 				s.messages.push(assistantMessage);
-				delete s.pendingComposerRestoration;
+				clearPendingComposerRestoration(s);
 				s.revision++;
 				persistChat();
 				return Promise.resolve({ success: true, assistantMessage });
@@ -960,7 +1041,7 @@ function createShimBridgeClient() {
 				if (m) {
 					for (const s of m.values()) {
 						s.messages = [];
-						delete s.pendingComposerRestoration;
+						clearPendingComposerRestoration(s);
 						s.revision++;
 					}
 				}
@@ -991,16 +1072,90 @@ function createShimBridgeClient() {
 				const s = sessionsByProject.get(projectId)?.get(sessionId);
 				return Promise.resolve(s ? publicSession(s) : null);
 			},
-			chatClaimComposerRestoration: (projectId: string, sessionId: string, revision: number) => {
+			chatClaimRewindComposer: (projectId: string, sessionId: string, revision: number) => {
 				const session = sessionsByProject.get(projectId)?.get(sessionId);
 				if (!session) return Promise.resolve({ claimed: false as const });
 				const pending = session.pendingComposerRestoration;
 				if (!pending || pending.revision !== revision) {
 					return Promise.resolve({ claimed: false as const });
 				}
+				const existing = activeRewindComposerClaim(projectId, sessionId);
+				if (existing) {
+					if (existing.revision !== revision) {
+						return Promise.resolve({ claimed: false as const });
+					}
+					return Promise.resolve({
+						claimed: true as const,
+						prompt: pending.prompt,
+						claimId: existing.claimId,
+						leaseExpiresAt: existing.leaseExpiresAt,
+					});
+				}
+				let claimId = `browser_rewind_composer_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+				while (rewindComposerClaims.has(claimId) || confirmedRewindComposerClaims.has(claimId)) {
+					claimId = `browser_rewind_composer_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+				}
+				const claim: ShimRewindComposerClaim = {
+					claimId,
+					projectId,
+					sessionId,
+					revision,
+					leaseExpiresAt: Date.now() + rewindComposerClaimLeaseMs,
+				};
+				rewindComposerClaims.set(claimId, claim);
+				rewindComposerClaimBySession.set(composerSessionKey(projectId, sessionId), claimId);
+				scheduleRewindComposerClaimExpiry(claim);
+				return Promise.resolve({
+					claimed: true as const,
+					prompt: pending.prompt,
+					claimId,
+					leaseExpiresAt: claim.leaseExpiresAt,
+				});
+			},
+			chatConfirmRewindComposerClaim: (claimId: string) => {
+				pruneConfirmedRewindComposerClaims();
+				if (confirmedRewindComposerClaims.has(claimId)) {
+					return Promise.resolve({ confirmed: true as const, alreadyConfirmed: true });
+				}
+				const claim = rewindComposerClaims.get(claimId);
+				if (!claim) return Promise.resolve({ confirmed: false as const });
+				if (claim.leaseExpiresAt <= Date.now()) {
+					removeRewindComposerClaim(claim);
+					return Promise.resolve({ confirmed: false as const });
+				}
+				const session = sessionsByProject.get(claim.projectId)?.get(claim.sessionId);
+				if (
+					!session?.pendingComposerRestoration ||
+					session.pendingComposerRestoration.revision !== claim.revision ||
+					rewindComposerClaimBySession.get(composerSessionKey(claim.projectId, claim.sessionId)) !==
+						claimId
+				) {
+					return Promise.resolve({ confirmed: false as const });
+				}
 				delete session.pendingComposerRestoration;
+				removeRewindComposerClaim(claim);
+				rememberConfirmedRewindComposerClaim(claimId);
 				persistChat();
-				return Promise.resolve({ claimed: true as const, prompt: pending.prompt });
+				return Promise.resolve({ confirmed: true as const, alreadyConfirmed: false });
+			},
+			chatReleaseRewindComposerClaim: (claimId: string) => {
+				const claim = rewindComposerClaims.get(claimId);
+				if (!claim) return Promise.resolve({ released: false });
+				if (claim.leaseExpiresAt <= Date.now()) {
+					removeRewindComposerClaim(claim);
+					return Promise.resolve({ released: false });
+				}
+				const session = sessionsByProject.get(claim.projectId)?.get(claim.sessionId);
+				if (
+					!session?.pendingComposerRestoration ||
+					session.pendingComposerRestoration.revision !== claim.revision ||
+					rewindComposerClaimBySession.get(composerSessionKey(claim.projectId, claim.sessionId)) !==
+						claimId
+				) {
+					return Promise.resolve({ released: false });
+				}
+				removeRewindComposerClaim(claim);
+				return Promise.resolve({ released: true });
 			},
 			chatRenameSession: (projectId: string, sessionId: string, title: string) => {
 				const s = sessionsByProject.get(projectId)?.get(sessionId);
@@ -1009,7 +1164,7 @@ function createShimBridgeClient() {
 				const trimmed = title.trim();
 				if (trimmed && trimmed !== s.title) {
 					s.title = trimmed;
-					delete s.pendingComposerRestoration;
+					clearPendingComposerRestoration(s);
 					s.revision++;
 				}
 				persistChat();
@@ -1021,6 +1176,8 @@ function createShimBridgeClient() {
 				if (sessionHasPendingOperation(projectId, sessionId)) {
 					return Promise.resolve({ success: false });
 				}
+				const session = m.get(sessionId);
+				if (session) clearPendingComposerRestoration(session);
 				m.delete(sessionId);
 				persistChat();
 				return Promise.resolve({ success: true });

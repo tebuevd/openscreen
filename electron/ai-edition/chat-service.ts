@@ -21,12 +21,14 @@ import type {
 	AiEditionChatCommitResult,
 	AiEditionChatCompactResult,
 	AiEditionChatComposerRestoration,
-	AiEditionChatComposerRestorationClaimResult,
 	AiEditionChatMessage,
 	AiEditionChatOperationStatus,
 	AiEditionChatPersistenceResolution,
 	AiEditionChatResult,
 	AiEditionChatRewindCommitResult,
+	AiEditionChatRewindComposerClaimResult,
+	AiEditionChatRewindComposerConfirmResult,
+	AiEditionChatRewindComposerReleaseResult,
 	AiEditionChatRewindPrepareResult,
 	AiEditionChatSession,
 	AiEditionChatSessionUpdatedEvent,
@@ -65,6 +67,9 @@ const PREPARED_OPERATION_TTL_MS = 5 * 60_000;
 const TERMINAL_OPERATION_TTL_MS = 10 * 60_000;
 const MAX_ACTIVE_OPERATIONS = 128;
 const MAX_TERMINAL_OPERATIONS = 256;
+const REWIND_COMPOSER_CLAIM_LEASE_MS = 15_000;
+const CONFIRMED_REWIND_COMPOSER_CLAIM_TTL_MS = 10 * 60_000;
+const MAX_CONFIRMED_REWIND_COMPOSER_CLAIMS = 256;
 
 interface LeasedChatOperation {
 	operationId: string;
@@ -76,6 +81,20 @@ interface LeasedChatOperation {
 }
 
 export type ChatOperationOwner = object;
+
+interface RewindComposerClaim {
+	claimId: string;
+	projectId: string;
+	sessionId: string;
+	revision: number;
+	owner: ChatOperationOwner;
+	leaseExpiresAt: number;
+}
+
+interface ConfirmedRewindComposerClaim {
+	owner: ChatOperationOwner;
+	expiresAt: number;
+}
 
 export interface ChatDocumentAuthority {
 	getProject(projectId: string): Promise<AxcutDocument>;
@@ -138,6 +157,11 @@ const terminalChatOperations = new Map<string, TerminalChatOperation>();
 const operationExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const operationReconciliations = new Map<string, Promise<void>>();
 const sessionUpdateListeners = new Set<(event: AiEditionChatSessionUpdatedEvent) => void>();
+// The prompt remains on the session until confirmation; these maps only serialize delivery.
+const rewindComposerClaims = new Map<string, RewindComposerClaim>();
+const rewindComposerClaimBySession = new Map<string, string>();
+const rewindComposerClaimExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const confirmedRewindComposerClaims = new Map<string, ConfirmedRewindComposerClaim>();
 
 function sessionKey(projectId: string, sessionId: string): string {
 	return `${projectId}::${sessionId}`;
@@ -515,6 +539,7 @@ export async function handleChatOperationOwnerTeardown(
 	owner: ChatOperationOwner,
 	documents: ChatDocumentAuthority,
 ): Promise<void> {
+	releaseRewindComposerClaimsForOwner(owner);
 	const reconciliations: Promise<void>[] = [];
 	for (const operation of [...pendingChatRuns.values(), ...pendingRewinds.values()]) {
 		if (operation.owner !== owner) continue;
@@ -654,6 +679,87 @@ export interface ChatSession {
 	compaction?: SessionCompaction;
 }
 
+function removeRewindComposerClaim(claim: RewindComposerClaim): void {
+	if (rewindComposerClaims.get(claim.claimId) === claim) {
+		rewindComposerClaims.delete(claim.claimId);
+	}
+	const key = sessionKey(claim.projectId, claim.sessionId);
+	if (rewindComposerClaimBySession.get(key) === claim.claimId) {
+		rewindComposerClaimBySession.delete(key);
+	}
+	const timeout = rewindComposerClaimExpiryTimers.get(claim.claimId);
+	if (timeout) clearTimeout(timeout);
+	rewindComposerClaimExpiryTimers.delete(claim.claimId);
+}
+
+function activeRewindComposerClaim(
+	projectId: string,
+	sessionId: string,
+): RewindComposerClaim | null {
+	const key = sessionKey(projectId, sessionId);
+	const claimId = rewindComposerClaimBySession.get(key);
+	if (!claimId) return null;
+	const claim = rewindComposerClaims.get(claimId);
+	if (!claim || claim.projectId !== projectId || claim.sessionId !== sessionId) {
+		rewindComposerClaimBySession.delete(key);
+		return null;
+	}
+	if (claim.leaseExpiresAt <= Date.now()) {
+		removeRewindComposerClaim(claim);
+		return null;
+	}
+	return claim;
+}
+
+function scheduleRewindComposerClaimExpiry(claim: RewindComposerClaim): void {
+	const expire = () => {
+		if (rewindComposerClaims.get(claim.claimId) !== claim) return;
+		const remaining = claim.leaseExpiresAt - Date.now();
+		if (remaining > 0) {
+			const timeout = setTimeout(expire, remaining);
+			timeout.unref?.();
+			rewindComposerClaimExpiryTimers.set(claim.claimId, timeout);
+			return;
+		}
+		removeRewindComposerClaim(claim);
+	};
+	const timeout = setTimeout(expire, Math.max(0, claim.leaseExpiresAt - Date.now()));
+	timeout.unref?.();
+	rewindComposerClaimExpiryTimers.set(claim.claimId, timeout);
+}
+
+function clearPendingComposerRestoration(session: ChatSession): void {
+	const claim = activeRewindComposerClaim(session.projectId, session.id);
+	if (claim) removeRewindComposerClaim(claim);
+	delete session.pendingComposerRestoration;
+}
+
+function pruneConfirmedRewindComposerClaims(): void {
+	const now = Date.now();
+	for (const [claimId, claim] of confirmedRewindComposerClaims) {
+		if (claim.expiresAt <= now) confirmedRewindComposerClaims.delete(claimId);
+	}
+}
+
+function rememberConfirmedRewindComposerClaim(claim: RewindComposerClaim): void {
+	pruneConfirmedRewindComposerClaims();
+	confirmedRewindComposerClaims.set(claim.claimId, {
+		owner: claim.owner,
+		expiresAt: Date.now() + CONFIRMED_REWIND_COMPOSER_CLAIM_TTL_MS,
+	});
+	while (confirmedRewindComposerClaims.size > MAX_CONFIRMED_REWIND_COMPOSER_CLAIMS) {
+		const oldestClaimId = confirmedRewindComposerClaims.keys().next().value;
+		if (typeof oldestClaimId !== "string") break;
+		confirmedRewindComposerClaims.delete(oldestClaimId);
+	}
+}
+
+function releaseRewindComposerClaimsForOwner(owner: ChatOperationOwner): void {
+	for (const claim of [...rewindComposerClaims.values()]) {
+		if (claim.owner === owner) removeRewindComposerClaim(claim);
+	}
+}
+
 /** The message list compaction hands the model: summary first, then everything
  *  after the boundary. Identical to the transcript until a compaction lands. */
 function modelMessages(session: ChatSession): AiEditionChatMessage[] {
@@ -759,17 +865,103 @@ export function selectSession(projectId: string, sessionId: string): AiEditionCh
 	};
 }
 
-export function claimComposerRestoration(
+export function claimRewindComposer(
 	projectId: string,
 	sessionId: string,
 	revision: number,
-): AiEditionChatComposerRestorationClaimResult {
+	owner: ChatOperationOwner,
+): AiEditionChatRewindComposerClaimResult {
 	const session = sessionsByProject.get(projectId)?.get(sessionId);
 	if (!session) return { claimed: false };
 	const pending = session.pendingComposerRestoration;
 	if (!pending || pending.revision !== revision) return { claimed: false };
+	const existing = activeRewindComposerClaim(projectId, sessionId);
+	if (existing) {
+		if (existing.revision !== revision || existing.owner !== owner) return { claimed: false };
+		return {
+			claimed: true,
+			prompt: pending.prompt,
+			claimId: existing.claimId,
+			leaseExpiresAt: existing.leaseExpiresAt,
+		};
+	}
+
+	let claimId = `chat_rewind_composer_${randomUUID()}`;
+	while (rewindComposerClaims.has(claimId) || confirmedRewindComposerClaims.has(claimId)) {
+		claimId = `chat_rewind_composer_${randomUUID()}`;
+	}
+	const claim: RewindComposerClaim = {
+		claimId,
+		projectId,
+		sessionId,
+		revision,
+		owner,
+		leaseExpiresAt: Date.now() + REWIND_COMPOSER_CLAIM_LEASE_MS,
+	};
+	rewindComposerClaims.set(claimId, claim);
+	rewindComposerClaimBySession.set(sessionKey(projectId, sessionId), claimId);
+	scheduleRewindComposerClaimExpiry(claim);
+	return {
+		claimed: true,
+		prompt: pending.prompt,
+		claimId,
+		leaseExpiresAt: claim.leaseExpiresAt,
+	};
+}
+
+export function confirmRewindComposerClaim(
+	claimId: string,
+	owner: ChatOperationOwner,
+): AiEditionChatRewindComposerConfirmResult {
+	pruneConfirmedRewindComposerClaims();
+	const confirmed = confirmedRewindComposerClaims.get(claimId);
+	if (confirmed) {
+		return confirmed.owner === owner
+			? { confirmed: true, alreadyConfirmed: true }
+			: { confirmed: false };
+	}
+
+	const claim = rewindComposerClaims.get(claimId);
+	if (!claim || claim.owner !== owner) return { confirmed: false };
+	if (claim.leaseExpiresAt <= Date.now()) {
+		removeRewindComposerClaim(claim);
+		return { confirmed: false };
+	}
+	const session = sessionsByProject.get(claim.projectId)?.get(claim.sessionId);
+	if (
+		!session?.pendingComposerRestoration ||
+		session.pendingComposerRestoration.revision !== claim.revision ||
+		rewindComposerClaimBySession.get(sessionKey(claim.projectId, claim.sessionId)) !== claimId
+	) {
+		return { confirmed: false };
+	}
+
 	delete session.pendingComposerRestoration;
-	return { claimed: true, prompt: pending.prompt };
+	removeRewindComposerClaim(claim);
+	rememberConfirmedRewindComposerClaim(claim);
+	return { confirmed: true, alreadyConfirmed: false };
+}
+
+export function releaseRewindComposerClaim(
+	claimId: string,
+	owner: ChatOperationOwner,
+): AiEditionChatRewindComposerReleaseResult {
+	const claim = rewindComposerClaims.get(claimId);
+	if (!claim || claim.owner !== owner) return { released: false };
+	if (claim.leaseExpiresAt <= Date.now()) {
+		removeRewindComposerClaim(claim);
+		return { released: false };
+	}
+	const session = sessionsByProject.get(claim.projectId)?.get(claim.sessionId);
+	if (
+		!session?.pendingComposerRestoration ||
+		session.pendingComposerRestoration.revision !== claim.revision ||
+		rewindComposerClaimBySession.get(sessionKey(claim.projectId, claim.sessionId)) !== claimId
+	) {
+		return { released: false };
+	}
+	removeRewindComposerClaim(claim);
+	return { released: true };
 }
 
 export function renameSession(
@@ -784,7 +976,7 @@ export function renameSession(
 	const trimmed = title.trim();
 	if (trimmed && trimmed !== s.title) {
 		s.title = trimmed;
-		delete s.pendingComposerRestoration;
+		clearPendingComposerRestoration(s);
 		s.revision++;
 	}
 	return toSummary(s);
@@ -794,6 +986,8 @@ export function deleteSession(projectId: string, sessionId: string): boolean {
 	const m = sessionsByProject.get(projectId);
 	if (!m?.has(sessionId)) return false;
 	if (sessionHasPendingOperation(projectId, sessionId)) return false;
+	const session = m.get(sessionId);
+	if (session) clearPendingComposerRestoration(session);
 	m.delete(sessionId);
 	messageCheckpointsBySession.delete(sessionKey(projectId, sessionId));
 	return true;
@@ -1090,7 +1284,7 @@ export function commitChatRun(
 		recordMessageCheckpoint(projectId, sessionId, pending.userMessage.id, pending.checkpoint);
 	}
 	session.messages.push(cloneMessage(pending.userMessage), cloneMessage(pending.assistantMessage));
-	delete session.pendingComposerRestoration;
+	clearPendingComposerRestoration(session);
 	session.revision++;
 	const result: Extract<AiEditionChatCommitResult, { success: true }> = {
 		success: true,
@@ -1273,6 +1467,7 @@ export function commitRewindToMessage(
 		session.compaction = undefined;
 	}
 	dropCheckpointsFrom(projectId, sessionId, target.checkpointId);
+	clearPendingComposerRestoration(session);
 	session.revision++;
 	session.pendingComposerRestoration = {
 		prompt: prepared.prompt,
@@ -1402,7 +1597,7 @@ export async function runTimelineOperation(
 			createdAt: new Date().toISOString(),
 		};
 		session.messages.push(assistantMessage);
-		delete session.pendingComposerRestoration;
+		clearPendingComposerRestoration(session);
 		session.revision++;
 	}
 
@@ -1641,7 +1836,7 @@ async function tryCompactSession(opts: {
 		return null;
 	}
 	session.compaction = { summary: summaryMessage, coveredCount: plan.coveredCount };
-	delete session.pendingComposerRestoration;
+	clearPendingComposerRestoration(session);
 	session.revision++;
 	return {
 		summaryMessageId: summaryMessage.id,

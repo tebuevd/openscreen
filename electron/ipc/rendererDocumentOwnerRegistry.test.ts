@@ -118,7 +118,12 @@ describe("RendererDocumentOwnerRegistry", () => {
 		const outgoingOwner = registry.bindProject(request(sender) as never, "project-a");
 		const foreignSender = new FakeSender(71);
 		registry.bindProject(request(foreignSender) as never, "project-b");
-		const claim = vi.fn(() => ({ claimed: true, prompt: "restore" }));
+		const claim = vi.fn(() => ({
+			claimed: true,
+			prompt: "restore",
+			claimId: "replacement-claim",
+			leaseExpiresAt: 100,
+		}));
 		const dispatchClaim = (ownerRequest: ReturnType<typeof request>) => {
 			registry.ownerForProject(ownerRequest as never, "project-a");
 			return claim();
@@ -135,8 +140,29 @@ describe("RendererDocumentOwnerRegistry", () => {
 		expect(() => dispatchClaim(request(sender))).toThrow(/does not own the requested project/);
 		const replacementOwner = registry.bindProject(request(sender) as never, "project-a");
 		expect(replacementOwner).not.toBe(outgoingOwner);
-		expect(dispatchClaim(request(sender))).toEqual({ claimed: true, prompt: "restore" });
+		expect(dispatchClaim(request(sender))).toEqual({
+			claimed: true,
+			prompt: "restore",
+			claimId: "replacement-claim",
+			leaseExpiresAt: 100,
+		});
 		expect(claim).toHaveBeenCalledTimes(1);
+	});
+
+	it("starts a fresh owner when the committed document switches projects", () => {
+		const releaseOwner = vi.fn(async () => undefined);
+		const registry = new RendererDocumentOwnerRegistry({ releaseOwner });
+		const sender = new FakeSender(72);
+		const firstOwner = registry.bindProject(request(sender) as never, "project-a");
+
+		const secondOwner = registry.bindProject(request(sender) as never, "project-b");
+
+		expect(secondOwner).not.toBe(firstOwner);
+		expect(releaseOwner).toHaveBeenCalledWith(firstOwner);
+		expect(() => registry.ownerForProject(request(sender) as never, "project-a")).toThrow(
+			/does not own the requested project/,
+		);
+		expect(registry.ownerForProject(request(sender) as never, "project-b")).toBe(secondOwner);
 	});
 
 	it("recovers a failed main-frame navigation with a fresh owner for the surviving document", () => {

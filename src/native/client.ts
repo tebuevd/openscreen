@@ -4,12 +4,14 @@ import {
 	type AiEditionChatBudget,
 	type AiEditionChatCommitResult,
 	type AiEditionChatCompactResult,
-	type AiEditionChatComposerRestorationClaimResult,
 	type AiEditionChatOperationResult,
 	type AiEditionChatOperationStatus,
 	type AiEditionChatPersistenceResolution,
 	type AiEditionChatResult,
 	type AiEditionChatRewindCommitResult,
+	type AiEditionChatRewindComposerClaimResult,
+	type AiEditionChatRewindComposerConfirmResult,
+	type AiEditionChatRewindComposerReleaseResult,
 	type AiEditionChatRewindPrepareResult,
 	type AiEditionChatSession,
 	type AiEditionChatSessionSummary,
@@ -305,11 +307,23 @@ export const nativeBridgeClient = {
 				action: "chat.selectSession",
 				payload: { projectId, sessionId },
 			}),
-		chatClaimComposerRestoration: (projectId: string, sessionId: string, revision: number) =>
-			requireNativeBridgeData<AiEditionChatComposerRestorationClaimResult>({
+		chatClaimRewindComposer: (projectId: string, sessionId: string, revision: number) =>
+			requireNativeBridgeData<AiEditionChatRewindComposerClaimResult>({
 				domain: "aiEdition",
-				action: "chat.composerRestoration.claim",
+				action: "chat.rewindComposer.claim",
 				payload: { projectId, sessionId, revision },
+			}),
+		chatConfirmRewindComposerClaim: (claimId: string) =>
+			requireNativeBridgeData<AiEditionChatRewindComposerConfirmResult>({
+				domain: "aiEdition",
+				action: "chat.rewindComposer.confirm",
+				payload: { claimId },
+			}),
+		chatReleaseRewindComposerClaim: (claimId: string) =>
+			requireNativeBridgeData<AiEditionChatRewindComposerReleaseResult>({
+				domain: "aiEdition",
+				action: "chat.rewindComposer.release",
+				payload: { claimId },
 			}),
 		chatRenameSession: (projectId: string, sessionId: string, title: string) =>
 			requireNativeBridgeData<AiEditionChatSessionSummary | null>({

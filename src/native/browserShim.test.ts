@@ -3,6 +3,28 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { installBrowserShims } from "./browserShim";
 import { nativeBridgeClient } from "./client";
 
+function installPersistedRestoration(prompt = "restore me", revision = 7) {
+	localStorage.setItem(
+		"browser-shim-chat-v1",
+		JSON.stringify({
+			project: {
+				session: {
+					id: "session",
+					projectId: "project",
+					title: "Conversation",
+					createdAt: "2026-08-17T00:00:00.000Z",
+					messages: [],
+					revision,
+					pendingComposerRestoration: { prompt, revision },
+				},
+			},
+		}),
+	);
+	// biome-ignore lint/suspicious/noExplicitAny: test-only browser bridge reload
+	delete (window as any).electronAPI;
+	installBrowserShims();
+}
+
 describe("browser chat operation shim", () => {
 	beforeEach(() => {
 		localStorage.clear();
@@ -67,41 +89,98 @@ describe("browser chat operation shim", () => {
 		).toHaveLength(2);
 	});
 
-	it("atomically claims a persisted composer restoration once", async () => {
-		localStorage.setItem(
-			"browser-shim-chat-v1",
-			JSON.stringify({
-				project: {
-					session: {
-						id: "session",
-						projectId: "project",
-						title: "Conversation",
-						createdAt: "2026-08-17T00:00:00.000Z",
-						messages: [],
-						revision: 7,
-						pendingComposerRestoration: { prompt: "restore me", revision: 7 },
-					},
-				},
-			}),
-		);
-		// biome-ignore lint/suspicious/noExplicitAny: test-only browser bridge reload
-		delete (window as any).electronAPI;
-		installBrowserShims();
-
+	it("leases, releases, and idempotently confirms a persisted restoration", async () => {
+		installPersistedRestoration();
 		const selected = await nativeBridgeClient.aiEdition.chatSelectSession("project", "session");
 		expect(selected?.pendingComposerRestoration).toEqual({ revision: 7 });
 		expect(
-			await nativeBridgeClient.aiEdition.chatClaimComposerRestoration("project", "session", 6),
+			await nativeBridgeClient.aiEdition.chatClaimRewindComposer("project", "session", 6),
 		).toEqual({ claimed: false });
-		const claims = await Promise.all([
-			nativeBridgeClient.aiEdition.chatClaimComposerRestoration("project", "session", 7),
-			nativeBridgeClient.aiEdition.chatClaimComposerRestoration("project", "session", 7),
-		]);
-		expect(claims).toEqual([{ claimed: true, prompt: "restore me" }, { claimed: false }]);
+		const firstClaim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+			"project",
+			"session",
+			7,
+		);
+		expect(firstClaim).toMatchObject({ claimed: true, prompt: "restore me" });
+		if (!firstClaim.claimed) return;
+		expect(
+			await nativeBridgeClient.aiEdition.chatClaimRewindComposer("project", "session", 7),
+		).toEqual(firstClaim);
+		expect(
+			(await nativeBridgeClient.aiEdition.chatSelectSession("project", "session"))
+				?.pendingComposerRestoration,
+		).toEqual({ revision: 7 });
+		expect(
+			await nativeBridgeClient.aiEdition.chatReleaseRewindComposerClaim(firstClaim.claimId),
+		).toEqual({ released: true });
+		const replacementClaim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+			"project",
+			"session",
+			7,
+		);
+		expect(replacementClaim).toMatchObject({ claimed: true, prompt: "restore me" });
+		if (!replacementClaim.claimed) return;
+		expect(replacementClaim.claimId).not.toBe(firstClaim.claimId);
+		expect(
+			await nativeBridgeClient.aiEdition.chatConfirmRewindComposerClaim(replacementClaim.claimId),
+		).toEqual({ confirmed: true, alreadyConfirmed: false });
+		expect(
+			await nativeBridgeClient.aiEdition.chatConfirmRewindComposerClaim(replacementClaim.claimId),
+		).toEqual({ confirmed: true, alreadyConfirmed: true });
 		expect(
 			(await nativeBridgeClient.aiEdition.chatSelectSession("project", "session"))
 				?.pendingComposerRestoration,
 		).toBeUndefined();
+	});
+
+	it("releases browser claims on pagehide", async () => {
+		installPersistedRestoration("pagehide prompt");
+		const firstClaim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+			"project",
+			"session",
+			7,
+		);
+		expect(firstClaim.claimed).toBe(true);
+		if (!firstClaim.claimed) return;
+
+		window.dispatchEvent(new Event("pagehide"));
+		// biome-ignore lint/suspicious/noExplicitAny: simulate the replacement page owner
+		delete (window as any).electronAPI;
+		installBrowserShims();
+
+		const replacementClaim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+			"project",
+			"session",
+			7,
+		);
+		expect(replacementClaim).toMatchObject({ claimed: true, prompt: "pagehide prompt" });
+		if (!replacementClaim.claimed) return;
+		expect(replacementClaim.claimId).not.toBe(firstClaim.claimId);
+		await nativeBridgeClient.aiEdition.chatReleaseRewindComposerClaim(replacementClaim.claimId);
+	});
+
+	it("releases browser claims when their lease expires", async () => {
+		vi.useFakeTimers();
+		installPersistedRestoration("expiry prompt");
+		const firstClaim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+			"project",
+			"session",
+			7,
+		);
+		expect(firstClaim.claimed).toBe(true);
+		if (!firstClaim.claimed) return;
+
+		vi.advanceTimersByTime(firstClaim.leaseExpiresAt - Date.now());
+
+		const replacementClaim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+			"project",
+			"session",
+			7,
+		);
+		expect(replacementClaim).toMatchObject({ claimed: true, prompt: "expiry prompt" });
+		if (!replacementClaim.claimed) return;
+		expect(replacementClaim.claimId).not.toBe(firstClaim.claimId);
+		await nativeBridgeClient.aiEdition.chatReleaseRewindComposerClaim(replacementClaim.claimId);
 	});
 
 	it("does not let foreign commit or abort calls consume another session's operation", async () => {

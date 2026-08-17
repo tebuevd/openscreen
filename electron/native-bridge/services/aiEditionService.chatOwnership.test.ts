@@ -44,10 +44,17 @@ function serviceOptions(overrides: Partial<AiEditionServiceOptions> = {}): AiEdi
 			messageCount: 0,
 		})),
 		selectSession: vi.fn(() => null),
-		claimComposerRestoration: vi.fn(() => ({
+		claimRewindComposer: vi.fn(() => ({
 			claimed: true as const,
 			prompt: "restored",
+			claimId: "claim",
+			leaseExpiresAt: 100,
 		})),
+		confirmRewindComposerClaim: vi.fn(() => ({
+			confirmed: true as const,
+			alreadyConfirmed: false,
+		})),
+		releaseRewindComposerClaim: vi.fn(() => ({ released: true })),
 		renameSession: vi.fn(() => null),
 		deleteSession: vi.fn(() => false),
 		...overrides,
@@ -114,15 +121,25 @@ describe("AiEditionService chat document ownership", () => {
 		);
 	});
 
-	it("forwards atomic composer claims", () => {
+	it("forwards owner-bound composer claim leases", () => {
 		const options = serviceOptions();
 		const service = new AiEditionService(options);
+		const owner = {};
 
-		expect(service.chatClaimComposerRestoration("project", "session", 4)).toEqual({
+		expect(service.chatClaimRewindComposer("project", "session", 4, owner)).toEqual({
 			claimed: true,
 			prompt: "restored",
+			claimId: "claim",
+			leaseExpiresAt: 100,
 		});
-		expect(options.claimComposerRestoration).toHaveBeenCalledWith("project", "session", 4);
+		expect(service.chatConfirmRewindComposerClaim("claim", owner)).toEqual({
+			confirmed: true,
+			alreadyConfirmed: false,
+		});
+		expect(service.chatReleaseRewindComposerClaim("claim", owner)).toEqual({ released: true });
+		expect(options.claimRewindComposer).toHaveBeenCalledWith("project", "session", 4, owner);
+		expect(options.confirmRewindComposerClaim).toHaveBeenCalledWith("claim", owner);
+		expect(options.releaseRewindComposerClaim).toHaveBeenCalledWith("claim", owner);
 	});
 
 	it("triggers reconciliation without blocking replacement status and session reads", async () => {

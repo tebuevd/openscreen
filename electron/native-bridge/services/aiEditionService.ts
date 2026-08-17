@@ -5,13 +5,15 @@ import type {
 	AiEditionChatBudget,
 	AiEditionChatCommitResult,
 	AiEditionChatCompactResult,
-	AiEditionChatComposerRestorationClaimResult,
 	AiEditionChatMessage,
 	AiEditionChatOperationResult,
 	AiEditionChatOperationStatus,
 	AiEditionChatPersistenceResolution,
 	AiEditionChatResult,
 	AiEditionChatRewindCommitResult,
+	AiEditionChatRewindComposerClaimResult,
+	AiEditionChatRewindComposerConfirmResult,
+	AiEditionChatRewindComposerReleaseResult,
 	AiEditionChatRewindPrepareResult,
 	AiEditionChatSession,
 	AiEditionChatSessionSummary,
@@ -127,11 +129,20 @@ export interface AiEditionServiceOptions {
 	listSessions: (projectId: string) => AiEditionChatSessionSummary[];
 	createSession: (projectId: string, title?: string) => AiEditionChatSessionSummary;
 	selectSession: (projectId: string, sessionId: string) => AiEditionChatSession | null;
-	claimComposerRestoration: (
+	claimRewindComposer: (
 		projectId: string,
 		sessionId: string,
 		revision: number,
-	) => AiEditionChatComposerRestorationClaimResult;
+		owner: ChatOperationOwner,
+	) => AiEditionChatRewindComposerClaimResult;
+	confirmRewindComposerClaim: (
+		claimId: string,
+		owner: ChatOperationOwner,
+	) => AiEditionChatRewindComposerConfirmResult;
+	releaseRewindComposerClaim: (
+		claimId: string,
+		owner: ChatOperationOwner,
+	) => AiEditionChatRewindComposerReleaseResult;
 	renameSession: (
 		projectId: string,
 		sessionId: string,
@@ -463,12 +474,27 @@ export class AiEditionService {
 		return this.options.selectSession(projectId, sessionId);
 	}
 
-	chatClaimComposerRestoration(
+	chatClaimRewindComposer(
 		projectId: string,
 		sessionId: string,
 		revision: number,
-	): AiEditionChatComposerRestorationClaimResult {
-		return this.options.claimComposerRestoration(projectId, sessionId, revision);
+		owner: ChatOperationOwner,
+	): AiEditionChatRewindComposerClaimResult {
+		return this.options.claimRewindComposer(projectId, sessionId, revision, owner);
+	}
+
+	chatConfirmRewindComposerClaim(
+		claimId: string,
+		owner: ChatOperationOwner,
+	): AiEditionChatRewindComposerConfirmResult {
+		return this.options.confirmRewindComposerClaim(claimId, owner);
+	}
+
+	chatReleaseRewindComposerClaim(
+		claimId: string,
+		owner: ChatOperationOwner,
+	): AiEditionChatRewindComposerReleaseResult {
+		return this.options.releaseRewindComposerClaim(claimId, owner);
 	}
 
 	chatRenameSession(

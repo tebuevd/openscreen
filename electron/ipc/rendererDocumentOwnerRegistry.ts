@@ -99,11 +99,16 @@ export class RendererDocumentOwnerRegistry {
 
 	/** Marks the project currently loaded by this committed renderer document. */
 	bindProject(event: OwnerRequest, projectId: string): RendererDocumentOwner {
-		const owner = this.ownerFor(event);
+		this.ownerFor(event);
 		const session = this.sessions.get(event.sender);
 		if (!session) throw new Error("Renderer document owner is unavailable.");
+		if (session.projectId !== null && session.projectId !== projectId) {
+			this.revokeOwner(session, event.sender.id);
+			session.owner = {};
+		}
 		session.projectId = projectId;
-		return owner;
+		session.owner ??= {};
+		return session.owner;
 	}
 
 	/** Returns the committed owner only when its current project matches exactly. */

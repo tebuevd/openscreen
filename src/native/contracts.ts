@@ -355,9 +355,17 @@ export interface AiEditionChatComposerRestoration {
 	revision: number;
 }
 
-export type AiEditionChatComposerRestorationClaimResult =
-	| { claimed: true; prompt: string }
+export type AiEditionChatRewindComposerClaimResult =
+	| { claimed: true; prompt: string; claimId: string; leaseExpiresAt: number }
 	| { claimed: false };
+
+export type AiEditionChatRewindComposerConfirmResult =
+	| { confirmed: true; alreadyConfirmed: boolean }
+	| { confirmed: false };
+
+export interface AiEditionChatRewindComposerReleaseResult {
+	released: boolean;
+}
 
 export type AiEditionChatOperationStatus =
 	| {
@@ -717,8 +725,14 @@ export type NativeBridgeRequest =
 	  }
 	| {
 			domain: "aiEdition";
-			action: "chat.composerRestoration.claim";
+			action: "chat.rewindComposer.claim";
 			payload: { projectId: string; sessionId: string; revision: number };
+			requestId?: string;
+	  }
+	| {
+			domain: "aiEdition";
+			action: "chat.rewindComposer.confirm" | "chat.rewindComposer.release";
+			payload: { claimId: string };
 			requestId?: string;
 	  }
 	| {

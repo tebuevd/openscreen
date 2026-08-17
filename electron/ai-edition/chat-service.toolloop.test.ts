@@ -20,9 +20,10 @@ import {
 	abortRewindToMessage,
 	beginChatOperationPersistence,
 	type ChatDocumentAuthority,
-	claimComposerRestoration,
+	claimRewindComposer,
 	commitChatRun,
 	commitRewindToMessage,
+	confirmRewindComposerClaim,
 	createSession,
 	deleteSession,
 	getChatOperationStatus,
@@ -30,6 +31,7 @@ import {
 	prepareRewindToMessage,
 	reconcileDetachedChatOperation,
 	reconcileDetachedChatOperationsForProject,
+	releaseRewindComposerClaim,
 	renameSession,
 	resolveChatOperationPersistence,
 	runChat,
@@ -277,7 +279,7 @@ describe("runChat tool loop", () => {
 		expect(result.toolCalls?.[0].summary).toMatch(/added trim/);
 	});
 
-	it("rewinds the document and lets exactly one competing renderer claim the prompt", async () => {
+	it("leases a rewind prompt once and idempotently recovers lost claim and confirm responses", async () => {
 		invokeMock.mockImplementationOnce(async (args) => {
 			args.sink.toolStart("addTrim", { startSec: 1, endSec: 2 });
 			args.sink.toolEnd("addTrim", true, "added trim 0:01.0 – 0:02.0");
@@ -334,17 +336,52 @@ describe("runChat tool loop", () => {
 			},
 		});
 		expect(selectSession("proj_rewind", session.id)?.messages).toHaveLength(1);
+		const firstOwner = {};
+		const replacementOwner = {};
 		expect(
-			claimComposerRestoration("proj_rewind", session.id, committed.sessionRevision - 1),
+			claimRewindComposer("proj_rewind", session.id, committed.sessionRevision - 1, firstOwner),
 		).toEqual({ claimed: false });
-		const competingClaims = [
-			claimComposerRestoration("proj_rewind", session.id, committed.sessionRevision),
-			claimComposerRestoration("proj_rewind", session.id, committed.sessionRevision),
-		];
-		expect(competingClaims).toEqual([
-			{ claimed: true, prompt: "cut the silence" },
-			{ claimed: false },
-		]);
+		const firstClaim = claimRewindComposer(
+			"proj_rewind",
+			session.id,
+			committed.sessionRevision,
+			firstOwner,
+		);
+		expect(firstClaim).toMatchObject({ claimed: true, prompt: "cut the silence" });
+		if (!firstClaim.claimed) return;
+		expect(
+			claimRewindComposer("proj_rewind", session.id, committed.sessionRevision, firstOwner),
+		).toEqual(firstClaim);
+		expect(
+			claimRewindComposer("proj_rewind", session.id, committed.sessionRevision, replacementOwner),
+		).toEqual({ claimed: false });
+		expect(confirmRewindComposerClaim(firstClaim.claimId, replacementOwner)).toEqual({
+			confirmed: false,
+		});
+		expect(releaseRewindComposerClaim(firstClaim.claimId, replacementOwner)).toEqual({
+			released: false,
+		});
+		expect(selectSession("proj_rewind", session.id)?.pendingComposerRestoration).toEqual({
+			revision: committed.sessionRevision,
+		});
+		expect(releaseRewindComposerClaim(firstClaim.claimId, firstOwner)).toEqual({ released: true });
+		const replacementClaim = claimRewindComposer(
+			"proj_rewind",
+			session.id,
+			committed.sessionRevision,
+			replacementOwner,
+		);
+		expect(replacementClaim).toMatchObject({ claimed: true, prompt: "cut the silence" });
+		if (!replacementClaim.claimed) return;
+		expect(replacementClaim.claimId).not.toBe(firstClaim.claimId);
+		expect(confirmRewindComposerClaim(replacementClaim.claimId, replacementOwner)).toEqual({
+			confirmed: true,
+			alreadyConfirmed: false,
+		});
+		expect(confirmRewindComposerClaim(replacementClaim.claimId, replacementOwner)).toEqual({
+			confirmed: true,
+			alreadyConfirmed: true,
+		});
 		expect(selectSession("proj_rewind", session.id)?.pendingComposerRestoration).toBeUndefined();
 		expect(
 			commitRewindToMessage(
@@ -389,6 +426,16 @@ describe("runChat tool loop", () => {
 		);
 		expect(firstCommit.success).toBe(true);
 		if (!firstCommit.success) return;
+		const firstOwner = {};
+		const secondOwner = {};
+		const firstClaim = claimRewindComposer(
+			projectId,
+			session.id,
+			firstCommit.sessionRevision,
+			firstOwner,
+		);
+		expect(firstClaim).toMatchObject({ claimed: true, prompt: "second restored prompt" });
+		if (!firstClaim.claimed) return;
 
 		const secondPrepared = prepareRewindToMessage(projectId, session.id, firstTarget.id);
 		expect(secondPrepared.success).toBe(true);
@@ -403,18 +450,87 @@ describe("runChat tool loop", () => {
 		expect(secondCommit.success).toBe(true);
 		if (!secondCommit.success) return;
 
-		expect(claimComposerRestoration(projectId, session.id, firstCommit.sessionRevision)).toEqual({
-			claimed: false,
+		expect(confirmRewindComposerClaim(firstClaim.claimId, firstOwner)).toEqual({
+			confirmed: false,
 		});
+		expect(releaseRewindComposerClaim(firstClaim.claimId, firstOwner)).toEqual({ released: false });
 		expect(
-			claimComposerRestoration(projectId, "foreign-session", secondCommit.sessionRevision),
+			claimRewindComposer(projectId, session.id, firstCommit.sessionRevision, firstOwner),
+		).toEqual({ claimed: false });
+		expect(
+			claimRewindComposer(projectId, "foreign-session", secondCommit.sessionRevision, secondOwner),
 		).toEqual({ claimed: false });
 		expect(selectSession(projectId, session.id)?.pendingComposerRestoration).toEqual({
 			revision: secondCommit.sessionRevision,
 		});
-		expect(claimComposerRestoration(projectId, session.id, secondCommit.sessionRevision)).toEqual({
+		const secondClaim = claimRewindComposer(
+			projectId,
+			session.id,
+			secondCommit.sessionRevision,
+			secondOwner,
+		);
+		expect(secondClaim).toMatchObject({ claimed: true, prompt: "first restored prompt" });
+		if (!secondClaim.claimed) return;
+		expect(confirmRewindComposerClaim(secondClaim.claimId, firstOwner)).toEqual({
+			confirmed: false,
+		});
+		expect(releaseRewindComposerClaim(secondClaim.claimId, firstOwner)).toEqual({
+			released: false,
+		});
+		expect(confirmRewindComposerClaim(secondClaim.claimId, secondOwner)).toEqual({
+			confirmed: true,
+			alreadyConfirmed: false,
+		});
+	});
+
+	it("releases an unconfirmed composer claim when its lease expires", async () => {
+		vi.useFakeTimers();
+		const projectId = "proj_rewind_claim_expiry";
+		const document = projectDocument(projectId, "Rewind claim expiry");
+		const session = createSession(projectId);
+		await runChat(projectId, session.id, "restore after expiry", stubConfig(), document);
+		const target = selectSession(projectId, session.id)!.messages[0];
+		const prepared = prepareRewindToMessage(projectId, session.id, target.id);
+		expect(prepared.success).toBe(true);
+		if (!prepared.success) return;
+		beginChatOperationPersistence(projectId, session.id, prepared.operationId);
+		const committed = commitRewindToMessage(
+			projectId,
+			session.id,
+			prepared.operationId,
+			prepared.sessionRevision,
+		);
+		expect(committed.success).toBe(true);
+		if (!committed.success) return;
+		const firstOwner = {};
+		const firstClaim = claimRewindComposer(
+			projectId,
+			session.id,
+			committed.sessionRevision,
+			firstOwner,
+		);
+		expect(firstClaim.claimed).toBe(true);
+		if (!firstClaim.claimed) return;
+
+		vi.advanceTimersByTime(firstClaim.leaseExpiresAt - Date.now());
+
+		expect(confirmRewindComposerClaim(firstClaim.claimId, firstOwner)).toEqual({
+			confirmed: false,
+		});
+		const replacementOwner = {};
+		const replacementClaim = claimRewindComposer(
+			projectId,
+			session.id,
+			committed.sessionRevision,
+			replacementOwner,
+		);
+		expect(replacementClaim).toMatchObject({
 			claimed: true,
-			prompt: "first restored prompt",
+			prompt: "restore after expiry",
+		});
+		if (!replacementClaim.claimed) return;
+		expect(confirmRewindComposerClaim(replacementClaim.claimId, replacementOwner)).toMatchObject({
+			confirmed: true,
 		});
 	});
 
@@ -942,7 +1058,7 @@ describe("runChat tool loop", () => {
 		expect(selectSession(projectId, session.id)?.messages).toHaveLength(2);
 	});
 
-	it("reconciles an owned rewind through the same authoritative queue", async () => {
+	it("reconciles an owned rewind and releases its composer lease on owner teardown", async () => {
 		const projectId = "proj_owned_rewind";
 		const document = projectDocument(projectId, "Before rewind target");
 		const session = createSession(projectId);
@@ -982,9 +1098,30 @@ describe("runChat tool loop", () => {
 			}),
 		]);
 		expect(updates[0]).not.toHaveProperty("prompt");
-		expect(claimComposerRestoration(projectId, session.id, restoredSession!.revision)).toEqual({
-			claimed: true,
-			prompt: "first turn",
+		const outgoingOwner = {};
+		const outgoingClaim = claimRewindComposer(
+			projectId,
+			session.id,
+			restoredSession!.revision,
+			outgoingOwner,
+		);
+		expect(outgoingClaim).toMatchObject({ claimed: true, prompt: "first turn" });
+		if (!outgoingClaim.claimed) return;
+		await handleChatOperationOwnerTeardown(outgoingOwner, {
+			getProject: vi.fn(async () => prepared.document as AxcutDocument),
+		});
+		const replacementOwner = {};
+		const replacementClaim = claimRewindComposer(
+			projectId,
+			session.id,
+			restoredSession!.revision,
+			replacementOwner,
+		);
+		expect(replacementClaim).toMatchObject({ claimed: true, prompt: "first turn" });
+		expect(replacementClaim).not.toMatchObject({ claimId: outgoingClaim.claimId });
+		if (!replacementClaim.claimed) return;
+		expect(confirmRewindComposerClaim(replacementClaim.claimId, replacementOwner)).toMatchObject({
+			confirmed: true,
 		});
 		unsubscribe();
 	});

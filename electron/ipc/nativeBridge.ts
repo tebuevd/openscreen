@@ -156,11 +156,20 @@ export interface NativeBridgeContext {
 		projectId: string,
 		sessionId: string,
 	) => import("../../src/native/contracts").AiEditionChatSession | null;
-	claimAiEditionComposerRestoration: (
+	claimAiEditionRewindComposer: (
 		projectId: string,
 		sessionId: string,
 		revision: number,
-	) => import("../../src/native/contracts").AiEditionChatComposerRestorationClaimResult;
+		owner: ChatOperationOwner,
+	) => import("../../src/native/contracts").AiEditionChatRewindComposerClaimResult;
+	confirmAiEditionRewindComposerClaim: (
+		claimId: string,
+		owner: ChatOperationOwner,
+	) => import("../../src/native/contracts").AiEditionChatRewindComposerConfirmResult;
+	releaseAiEditionRewindComposerClaim: (
+		claimId: string,
+		owner: ChatOperationOwner,
+	) => import("../../src/native/contracts").AiEditionChatRewindComposerReleaseResult;
 	renameAiEditionChatSession: (
 		projectId: string,
 		sessionId: string,
@@ -316,7 +325,9 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		listSessions: context.listAiEditionChatSessions,
 		createSession: context.createAiEditionChatSession,
 		selectSession: context.selectAiEditionChatSession,
-		claimComposerRestoration: context.claimAiEditionComposerRestoration,
+		claimRewindComposer: context.claimAiEditionRewindComposer,
+		confirmRewindComposerClaim: context.confirmAiEditionRewindComposerClaim,
+		releaseRewindComposerClaim: context.releaseAiEditionRewindComposerClaim,
 		renameSession: context.renameAiEditionChatSession,
 		deleteSession: context.deleteAiEditionChatSession,
 	});
@@ -815,16 +826,32 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.sessionId,
 								),
 							);
-						case "chat.composerRestoration.claim":
-							documentOwners.ownerForProject(event, request.payload.projectId);
+						case "chat.rewindComposer.claim": {
+							const owner = documentOwners.ownerForProject(event, request.payload.projectId);
 							return createSuccessResponse(
 								requestId,
-								aiEditionService.chatClaimComposerRestoration(
+								aiEditionService.chatClaimRewindComposer(
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.revision,
+									owner,
 								),
 							);
+						}
+						case "chat.rewindComposer.confirm": {
+							const owner = documentOwners.ownerFor(event);
+							return createSuccessResponse(
+								requestId,
+								aiEditionService.chatConfirmRewindComposerClaim(request.payload.claimId, owner),
+							);
+						}
+						case "chat.rewindComposer.release": {
+							const owner = documentOwners.ownerFor(event);
+							return createSuccessResponse(
+								requestId,
+								aiEditionService.chatReleaseRewindComposerClaim(request.payload.claimId, owner),
+							);
+						}
 						case "chat.renameSession":
 							return createSuccessResponse(
 								requestId,

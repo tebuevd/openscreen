@@ -75,15 +75,25 @@ describe("native chat operation client", () => {
 	});
 
 	it("sends rewind prepare commit and abort identities", async () => {
-		await nativeBridgeClient.aiEdition.chatClaimComposerRestoration("project", "session", 6);
+		await nativeBridgeClient.aiEdition.chatClaimRewindComposer("project", "session", 6);
+		await nativeBridgeClient.aiEdition.chatConfirmRewindComposerClaim("claim-1");
+		await nativeBridgeClient.aiEdition.chatReleaseRewindComposerClaim("claim-2");
 		await nativeBridgeClient.aiEdition.chatPrepareRewind("project", "session", "message");
 		await nativeBridgeClient.aiEdition.chatCommitRewind("project", "session", "rewind-1", 7);
 		await nativeBridgeClient.aiEdition.chatAbortRewind("project", "session", "rewind-2");
 
 		expect(invoke.mock.calls.map(([request]) => request)).toEqual([
 			expect.objectContaining({
-				action: "chat.composerRestoration.claim",
+				action: "chat.rewindComposer.claim",
 				payload: { projectId: "project", sessionId: "session", revision: 6 },
+			}),
+			expect.objectContaining({
+				action: "chat.rewindComposer.confirm",
+				payload: { claimId: "claim-1" },
+			}),
+			expect.objectContaining({
+				action: "chat.rewindComposer.release",
+				payload: { claimId: "claim-2" },
 			}),
 			expect.objectContaining({
 				action: "chat.rewind.prepare",
