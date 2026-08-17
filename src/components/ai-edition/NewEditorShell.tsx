@@ -13,7 +13,7 @@ import {
 	replaceTimeline as replaceTimelineOp,
 } from "@/lib/ai-edition/document/timeline";
 import { type AxcutClip, documentSchema } from "@/lib/ai-edition/schema";
-import { DocumentSaveError, useProjectStore } from "@/lib/ai-edition/store/projectStore";
+import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import {
 	useAssetTranscriptions,
 	useAutoTranscription,
@@ -40,6 +40,12 @@ import {
 	type UnsavedChoice,
 } from "./Modals";
 import { Preview } from "./Preview";
+import {
+	type ProjectReplacementAction,
+	registerProjectReplacementPrompt,
+	replaceCurrentProject,
+	saveCurrentProjectFromUserIntent,
+} from "./projectReplacementGate";
 import type { TrimTarget } from "./RightPanes";
 import { importPendingRecording } from "./recordingImport";
 import v4 from "./v4/EditorShellV4.module.css";
@@ -48,6 +54,8 @@ import { type Facet, FloatingInspector } from "./v4/FloatingInspector";
 import { MediaStage } from "./v4/MediaStage";
 import { RecStage } from "./v4/RecStage";
 import { V4Timeline } from "./v4/V4Timeline";
+
+export { saveCurrentProjectFromUserIntent };
 
 interface SeekTarget {
 	timeSec: number;
@@ -84,31 +92,6 @@ function NativePlaybackSync({
 	// is measured against. resolveNativePosition needs both (see timelineMap).
 	useNativePlaybackSync(playing, currentTimeSec, visibleClips, clips);
 	return null;
-}
-
-export async function saveCurrentProjectFromUserIntent(): Promise<void> {
-	const state = useProjectStore.getState();
-	if (!state.document) throw new DocumentSaveError("No project document is loaded");
-
-	const outcome =
-		state.status === "error"
-			? await state.saveRecoveryDocument()
-			: await state.saveDocument(state.document);
-	if (!outcome.appliedToCurrent) {
-		throw new DocumentSaveError("The project changed while it was being saved");
-	}
-
-	const current = useProjectStore.getState();
-	if (
-		current.documentGeneration !== outcome.documentGeneration ||
-		current.revision !== outcome.revision ||
-		current.projectId !== outcome.projectId ||
-		current.document?.project.id !== outcome.projectId ||
-		current.status !== "ready" ||
-		current.dirty
-	) {
-		throw new DocumentSaveError("The current project was not authoritatively saved");
-	}
 }
 
 export async function saveCurrentProjectBeforeClose(): Promise<boolean> {
@@ -163,7 +146,7 @@ export function NewEditorShell() {
 	const [editClipTarget, setEditClipTarget] = useState<AxcutClip | null>(null);
 	const [exportOpen, setExportOpen] = useState(false);
 	const [unsavedPrompt, setUnsavedPrompt] = useState<{
-		action: "close" | "new" | "open" | "record";
+		action: "close" | ProjectReplacementAction;
 		resolve: (choice: UnsavedChoice) => void;
 	} | null>(null);
 	const { shortcuts, isMac, openConfig: openShortcutsConfig } = useShortcuts();
@@ -214,14 +197,36 @@ export function NewEditorShell() {
 		saveDocument,
 	});
 
-	const promptUnsaved = useCallback(
-		(action: "close" | "new" | "open" | "record"): Promise<UnsavedChoice> => {
-			if (!dirty) return Promise.resolve("discard");
+	const showUnsavedPrompt = useCallback(
+		(action: "close" | ProjectReplacementAction): Promise<UnsavedChoice> => {
 			return new Promise<UnsavedChoice>((resolve) => {
 				setUnsavedPrompt({ action, resolve });
 			});
 		},
-		[dirty],
+		[],
+	);
+	const promptUnsaved = useCallback(
+		(action: "close" | ProjectReplacementAction): Promise<UnsavedChoice> => {
+			if (!useProjectStore.getState().dirty) return Promise.resolve("discard");
+			return showUnsavedPrompt(action);
+		},
+		[showUnsavedPrompt],
+	);
+
+	useEffect(
+		() => registerProjectReplacementPrompt((action) => showUnsavedPrompt(action)),
+		[showUnsavedPrompt],
+	);
+
+	const loadExistingProject = useCallback(
+		async (id: string): Promise<void> => {
+			await loadProject(id);
+			const state = useProjectStore.getState();
+			if (state.status !== "ready" || state.projectId !== id || state.document?.project.id !== id) {
+				throw new Error(state.error ?? "Project did not become current");
+			}
+		},
+		[loadProject],
 	);
 
 	const primaryAssetPath =
@@ -259,10 +264,12 @@ export function NewEditorShell() {
 		void (async () => {
 			if (!window.electronAPI) return;
 			try {
-				if (await importPendingRecording()) {
+				const pendingRecording = await importPendingRecording();
+				if (pendingRecording === "imported") {
 					toast.success("Recording added to a new project");
 					return;
 				}
+				if (pendingRecording === "blocked") return;
 			} catch (err) {
 				toast.error("Could not auto-create project from recording", {
 					description: err instanceof Error ? err.message : String(err),
@@ -282,7 +289,7 @@ export function NewEditorShell() {
 				console.info("[editor] listProjects returned", projects);
 				if (projects.length > 0) {
 					console.info("[editor] auto-loading project", projects[0].id);
-					await loadProject(projects[0].id);
+					await replaceCurrentProject("open", () => loadExistingProject(projects[0].id));
 					const state = useProjectStore.getState();
 					console.info(
 						"[editor] post-loadProject status=",
@@ -297,7 +304,7 @@ export function NewEditorShell() {
 				console.warn("[editor] auto-load failed", e);
 			}
 		})();
-	}, [loadProject]);
+	}, [loadExistingProject]);
 
 	// Warn on close when dirty
 	useEffect(() => {
@@ -535,21 +542,25 @@ export function NewEditorShell() {
 
 	const handleBrowseProject = useCallback(async () => {
 		try {
-			const result = await window.electronAPI?.loadProjectFile();
-			if (!result?.success || !result.project) return;
-			const raw = result.project as unknown;
-			// A current project file already carries its own `schemaVersion` (v3/v4
-			// AxcutDocument); an older legacy export is EditorProjectData and must be
-			// migrated. Discriminate on the version field so a current document is
-			// never fed to the legacy migrator (which reads `.media`/`.editor` and
-			// would yield an empty doc).
-			const isAxcutDocument =
-				typeof raw === "object" && raw !== null && "schemaVersion" in raw && "timeline" in raw;
-			const doc = isAxcutDocument
-				? documentSchema.parse(migrateRawDocumentToCurrent(raw)) // disk-load: upgrade v3/v4 → v5, then validate
-				: migrateProjectDataToAxcutDocument(raw as EditorProjectData);
-			if (await importProject(doc)) {
-				toast.success(isAxcutDocument ? "Project opened" : "Legacy project migrated and loaded");
+			const outcome = await replaceCurrentProject("open", async () => {
+				const result = await window.electronAPI?.loadProjectFile();
+				if (!result?.success || !result.project) return null;
+				const raw = result.project as unknown;
+				// A current project file already carries its own `schemaVersion` (v3/v4
+				// AxcutDocument); an older legacy export is EditorProjectData and must be
+				// migrated. Discriminate on the version field so a current document is
+				// never fed to the legacy migrator (which reads `.media`/`.editor` and
+				// would yield an empty doc).
+				const isAxcutDocument =
+					typeof raw === "object" && raw !== null && "schemaVersion" in raw && "timeline" in raw;
+				const doc = isAxcutDocument
+					? documentSchema.parse(migrateRawDocumentToCurrent(raw)) // disk-load: upgrade v3/v4 → v5, then validate
+					: migrateProjectDataToAxcutDocument(raw as EditorProjectData);
+				if (!(await importProject(doc))) throw new Error("Project import was superseded");
+				return isAxcutDocument;
+			});
+			if (outcome.status === "completed" && outcome.value !== null) {
+				toast.success(outcome.value ? "Project opened" : "Legacy project migrated and loaded");
 			}
 		} catch (err) {
 			toast.error("Could not load project", {
@@ -595,14 +606,14 @@ export function NewEditorShell() {
 	const handleSelectProject = useCallback(
 		async (id: string) => {
 			try {
-				await loadProject(id);
+				await replaceCurrentProject("open", () => loadExistingProject(id));
 			} catch (err) {
 				toast.error("Could not open project", {
 					description: err instanceof Error ? err.message : String(err),
 				});
 			}
 		},
-		[loadProject],
+		[loadExistingProject],
 	);
 
 	// The dialog's starting point picks the tab the fresh project opens on:
@@ -610,8 +621,10 @@ export function NewEditorShell() {
 	const handleCreateProject = useCallback(
 		async (title: string, startingPoint: StartingPoint) => {
 			try {
-				await createProject(title);
-				setMode(startingPoint === "screen-recording" ? "rec" : "media");
+				const outcome = await replaceCurrentProject("new", () => createProject(title));
+				if (outcome.status === "completed") {
+					setMode(startingPoint === "screen-recording" ? "rec" : "media");
+				}
 			} catch (err) {
 				toast.error("Could not create project", {
 					description: err instanceof Error ? err.message : String(err),
@@ -627,7 +640,13 @@ export function NewEditorShell() {
 	const handleDeleteProject = useCallback(
 		async (id: string) => {
 			try {
-				await deleteProject(id);
+				const remove = () => deleteProject(id);
+				if (useProjectStore.getState().projectId === id) {
+					const outcome = await replaceCurrentProject("open", remove);
+					if (outcome.status !== "completed") return;
+				} else {
+					await remove();
+				}
 				setProjectSummaries((prev) => prev.filter((p) => p.id !== id));
 				toast.success("Project deleted");
 			} catch (err) {
@@ -655,6 +674,8 @@ export function NewEditorShell() {
 	// listened to them, but the v4 shell replaced it, leaving the File items
 	// dead. Wire them to the same handlers the top-bar buttons use so the
 	// File/Edit/View menu bar works again (Edit/View items use Electron roles).
+	// Opening a modal is non-destructive; its select/create/browse handler owns
+	// the single replacement gate, just like the renderer keyboard route.
 	// The v4 editor has no separate "Save As" location, so it maps to Save.
 	useEffect(() => {
 		const api = window.electronAPI;
@@ -689,44 +710,23 @@ export function NewEditorShell() {
 	const handleConfirmUnsaved = useCallback(
 		(choice: UnsavedChoice) => {
 			if (!unsavedPrompt) return;
-			const { action, resolve } = unsavedPrompt;
+			const { resolve } = unsavedPrompt;
 			setUnsavedPrompt(null);
-			// ponytail: resolve the action when the user picks save / discard.
-			// The "continue with action" path is handled below in handleNewRecording /
-			// the open-project branch. We resolve the promise once the work is done
-			// (or cancelled).
-			void (async () => {
-				if (choice === "cancel") {
-					resolve("cancel");
-					return;
-				}
-				if (choice === "save") {
-					try {
-						await saveCurrentProjectFromUserIntent();
-					} catch {
-						resolve("cancel");
-						return;
-					}
-				}
-				if (action === "record") {
-					void window.electronAPI?.startNewRecording?.().catch((err) => {
-						console.warn("[editor] failed to start a new recording:", err);
-					});
-				}
-				resolve(choice);
-			})();
+			resolve(choice);
 		},
 		[unsavedPrompt],
 	);
 
 	const handleNewRecording = useCallback(async () => {
-		const choice = await promptUnsaved("record");
-		if (choice !== "cancel") {
-			void window.electronAPI?.startNewRecording?.().catch((err) => {
-				console.warn("[editor] failed to start a new recording:", err);
+		try {
+			await replaceCurrentProject("record", async () => {
+				const result = await window.electronAPI?.startNewRecording?.();
+				if (!result?.success) throw new Error(result?.error ?? "Could not start recording");
 			});
+		} catch (err) {
+			console.warn("[editor] failed to start a new recording:", err);
 		}
-	}, [promptUnsaved]);
+	}, []);
 
 	const handleExport = useCallback(() => {
 		if (!hasAsset) {
@@ -859,34 +859,12 @@ export function NewEditorShell() {
 			}
 			if (ctrl && e.key === "n") {
 				e.preventDefault();
-				void (async () => {
-					const choice = await promptUnsaved("new");
-					if (choice === "cancel") return;
-					if (choice === "save") {
-						try {
-							await saveCurrentProjectFromUserIntent();
-						} catch {
-							return;
-						}
-					}
-					setNewProjectOpen(true);
-				})();
+				setNewProjectOpen(true);
 				return;
 			}
 			if (ctrl && e.key === "o") {
 				e.preventDefault();
-				void (async () => {
-					const choice = await promptUnsaved("open");
-					if (choice === "cancel") return;
-					if (choice === "save") {
-						try {
-							await saveCurrentProjectFromUserIntent();
-						} catch {
-							return;
-						}
-					}
-					setOpenProjectOpen(true);
-				})();
+				setOpenProjectOpen(true);
 				return;
 			}
 			if (!hasProject && e.key !== "?") return;
@@ -1036,7 +1014,6 @@ export function NewEditorShell() {
 		handleSave,
 		pasteRegion,
 		tl,
-		promptUnsaved,
 		copiedClipId,
 		openShortcutsConfig,
 		shortcuts,

@@ -285,6 +285,7 @@ interface LifecycleRecoveryOptions {
 	fallbackDocument: AxcutDocument | null;
 	operationError: unknown;
 	clearIfMissing: boolean;
+	preserveFallbackDocument?: boolean;
 }
 
 async function reconcileLifecycleFailure(
@@ -319,6 +320,22 @@ async function reconcileLifecycleFailure(
 			);
 		}
 		if (!isCurrentOperation()) return;
+		if (options.preserveFallbackDocument && options.fallbackDocument) {
+			const operationMessage =
+				options.operationError instanceof Error
+					? options.operationError.message
+					: String(options.operationError);
+			set({
+				projectId: options.fallbackDocument.project.id,
+				document: options.fallbackDocument,
+				...clearedLoadingRequestState,
+				revision: get().revision + 1,
+				status: "error",
+				error: operationMessage,
+				dirty: true,
+			});
+			return;
+		}
 		set({
 			projectId: document.project.id,
 			document,
@@ -544,6 +561,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 					fallbackDocument: before.document,
 					operationError: error,
 					clearIfMissing: true,
+					preserveFallbackDocument: before.dirty,
 				});
 			}
 			throw error;

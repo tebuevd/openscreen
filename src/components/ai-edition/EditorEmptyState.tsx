@@ -24,6 +24,7 @@ import {
 import { documentSchema } from "@/lib/ai-edition/schema";
 import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import styles from "./NewEditorShell.module.css";
+import { replaceCurrentProject } from "./projectReplacementGate";
 
 type DropError = "unsupported-format" | "load-failed" | null;
 
@@ -51,28 +52,27 @@ export function EditorEmptyState({
 	const addAsset = useProjectStore((s) => s.addAsset);
 	const importProject = useProjectStore((s) => s.importProject);
 
-	const ensureProject = useCallback(async (): Promise<string | null> => {
-		const existing = useProjectStore.getState().projectId;
-		if (existing) return existing;
-		const doc = await createProject(`Project ${new Date().toLocaleString()}`);
-		return doc.project.id;
-	}, [createProject]);
-
 	const handleImportVideo = useCallback(async () => {
 		const result = await window.electronAPI?.openVideoFilePicker?.();
 		if (!result || result.canceled || !result.success || !result.path) return;
+		const path = result.path;
 		try {
-			const projectId = await ensureProject();
-			if (!projectId) return;
-			const label = result.name || result.path.split(/[\\/]/).pop() || "Recording";
-			await addAsset(result.path, label);
+			const label = result.name || path.split(/[\\/]/).pop() || "Recording";
+			if (useProjectStore.getState().projectId) {
+				await addAsset(path, label);
+			} else {
+				await replaceCurrentProject("new", async () => {
+					await createProject(`Project ${new Date().toLocaleString()}`);
+					await addAsset(path, label);
+				});
+			}
 		} catch (err) {
 			setDropError("load-failed");
 			// ponytail: surface as a console message only — the dialog above
 			// already tells the user something went wrong.
 			console.error("Failed to import video", err);
 		}
-	}, [addAsset, ensureProject]);
+	}, [addAsset, createProject]);
 
 	// A loaded project JSON is either a current AxcutDocument (has its own
 	// `schemaVersion`) or a legacy EditorProjectData that must be migrated.
@@ -80,13 +80,14 @@ export function EditorEmptyState({
 	// the legacy migrator (which reads `.media`/`.editor` and would yield an
 	// empty doc). Returns true once the project is saved and loaded.
 	const openLoadedProject = useCallback(
-		async (raw: unknown): Promise<boolean> => {
+		async (raw: unknown): Promise<boolean | null> => {
 			const isAxcutDocument =
 				typeof raw === "object" && raw !== null && "schemaVersion" in raw && "timeline" in raw;
 			const doc = isAxcutDocument
 				? documentSchema.parse(migrateRawDocumentToCurrent(raw)) // disk-load: upgrade v3/v4 → v5, then validate
 				: migrateProjectDataToAxcutDocument(raw as never);
-			return importProject(doc);
+			const outcome = await replaceCurrentProject("open", () => importProject(doc));
+			return outcome.status === "completed" ? outcome.value : null;
 		},
 		[importProject],
 	);
@@ -95,7 +96,7 @@ export function EditorEmptyState({
 		try {
 			const result = await window.electronAPI?.loadProjectFile?.();
 			if (!result?.success || !result.project) return;
-			if (!(await openLoadedProject(result.project))) {
+			if ((await openLoadedProject(result.project)) === false) {
 				setDropError("load-failed");
 			}
 		} catch {
@@ -144,7 +145,7 @@ export function EditorEmptyState({
 				return;
 			}
 			try {
-				if (!(await openLoadedProject(result.project))) {
+				if ((await openLoadedProject(result.project)) === false) {
 					setDropError("load-failed");
 				}
 			} catch {

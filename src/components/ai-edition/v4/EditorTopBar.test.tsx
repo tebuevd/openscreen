@@ -21,6 +21,8 @@ const noop = () => {};
 
 function renderTopBar(projectTitle: string | null) {
 	const onRename = vi.fn();
+	const openProject = vi.fn();
+	const newProject = vi.fn();
 	render(
 		<EditorTopBar
 			mode="edit"
@@ -30,8 +32,8 @@ function renderTopBar(projectTitle: string | null) {
 			canExport={false}
 			chatOpen={false}
 			actions={{
-				openProject: noop,
-				newProject: noop,
+				openProject,
+				newProject,
 				save: noop,
 				export: noop,
 				openSettings: noop,
@@ -40,10 +42,20 @@ function renderTopBar(projectTitle: string | null) {
 			}}
 		/>,
 	);
-	return { onRename };
+	return { onRename, openProject, newProject };
 }
 
 describe("ProjectNameField (issue #180)", () => {
+	it("routes Open and New through the shell actions", () => {
+		const { openProject, newProject } = renderTopBar("Demo Project");
+
+		fireEvent.click(screen.getByRole("button", { name: "topbar.openProject" }));
+		fireEvent.click(screen.getByRole("button", { name: "topbar.newProject" }));
+
+		expect(openProject).toHaveBeenCalledTimes(1);
+		expect(newProject).toHaveBeenCalledTimes(1);
+	});
+
 	it("renders the project title on the button", () => {
 		renderTopBar("Demo Project");
 		expect(screen.getByRole("button", { name: "topbar.renameProject" })).toHaveTextContent(

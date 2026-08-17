@@ -7,6 +7,7 @@ import { I18nProvider } from "@/contexts/I18nContext";
 import type { AxcutDocument } from "@/lib/ai-edition/schema";
 import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import { EditorEmptyState } from "./EditorEmptyState";
+import { registerProjectReplacementPrompt } from "./projectReplacementGate";
 
 function renderWithI18n(ui: ReactElement) {
 	return render(<I18nProvider>{ui}</I18nProvider>);
@@ -250,5 +251,37 @@ describe("EditorEmptyState (new editor)", () => {
 		await waitFor(() => {
 			expect(screen.getByText(/unsupported format/i)).toBeInTheDocument();
 		});
+	});
+
+	it("gates a dropped project before replacing a dirty empty project", async () => {
+		useProjectStore.setState({
+			projectId: sampleDoc.project.id,
+			document: sampleDoc,
+			revision: 1,
+			status: "ready",
+			error: null,
+			dirty: true,
+		});
+		bridgeMocks.getPathForFile.mockReturnValue("/tmp/replacement.openscreen");
+		bridgeMocks.loadProjectFileFromPath.mockResolvedValue({
+			success: true,
+			project: { id: "replacement", title: "Replacement" },
+		});
+		const prompt = vi.fn(async () => "cancel" as const);
+		const unregister = registerProjectReplacementPrompt(prompt);
+		try {
+			renderWithI18n(<EditorEmptyState hasProject={true} />);
+			const file = new File(["project"], "replacement.openscreen");
+			const dropZone = screen.getByText(/add a video to get started/i).parentElement?.parentElement
+				?.parentElement as HTMLElement;
+
+			fireEvent.drop(dropZone, { dataTransfer: { files: [file] } });
+
+			await waitFor(() => expect(prompt).toHaveBeenCalledWith("open"));
+			expect(bridgeMocks.save).not.toHaveBeenCalled();
+			expect(useProjectStore.getState()).toMatchObject({ document: sampleDoc, dirty: true });
+		} finally {
+			unregister();
+		}
 	});
 });

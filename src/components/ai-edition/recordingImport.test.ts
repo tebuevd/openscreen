@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createEmptyDocument } from "@/lib/ai-edition/schema";
 import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import { importPendingRecording } from "./recordingImport";
 
@@ -32,7 +33,10 @@ describe("importPendingRecording", () => {
 	beforeEach(() => {
 		vi.clearAllMocks();
 		useProjectStore.setState({
+			projectId: null,
 			document: null,
+			status: "idle",
+			dirty: false,
 			// biome-ignore lint/suspicious/noExplicitAny: partial action stubs, the rest of the store is untouched
 			createProject: createProject as any,
 			// biome-ignore lint/suspicious/noExplicitAny: partial action stubs, the rest of the store is untouched
@@ -43,14 +47,14 @@ describe("importPendingRecording", () => {
 
 	it("does nothing when no recording is waiting", async () => {
 		stubElectronApi(null);
-		await expect(importPendingRecording()).resolves.toBe(false);
+		await expect(importPendingRecording()).resolves.toBe("none");
 		expect(createProject).not.toHaveBeenCalled();
 	});
 
 	it("imports the recording into a new project and consumes the hand-off", async () => {
 		const api = stubElectronApi("C:\\recordings\\recording-1.mp4");
 
-		await expect(importPendingRecording()).resolves.toBe(true);
+		await expect(importPendingRecording()).resolves.toBe("imported");
 
 		expect(createProject).toHaveBeenCalledTimes(1);
 		expect(addAsset).toHaveBeenCalledWith("C:\\recordings\\recording-1.mp4", "recording-1.mp4");
@@ -65,7 +69,7 @@ describe("importPendingRecording", () => {
 		stubElectronApi("C:\\recordings\\recording-1.mp4");
 
 		await importPendingRecording();
-		await expect(importPendingRecording()).resolves.toBe(false);
+		await expect(importPendingRecording()).resolves.toBe("none");
 
 		expect(createProject).toHaveBeenCalledTimes(1);
 		expect(addAsset).toHaveBeenCalledTimes(1);
@@ -87,5 +91,21 @@ describe("importPendingRecording", () => {
 			[{ startSec: 0, endSec: 60 }],
 			"Auto-imported recording",
 		);
+	});
+
+	it("leaves a pending recording untouched when dirty replacement cannot be confirmed", async () => {
+		const api = stubElectronApi("/recordings/blocked.webm");
+		const current = createEmptyDocument({ projectId: "proj_dirty", title: "Dirty" });
+		useProjectStore.setState({
+			projectId: current.project.id,
+			document: current,
+			status: "ready",
+			dirty: true,
+		});
+
+		await expect(importPendingRecording()).resolves.toBe("blocked");
+
+		expect(createProject).not.toHaveBeenCalled();
+		expect(api.setCurrentRecordingSession).not.toHaveBeenCalled();
 	});
 });

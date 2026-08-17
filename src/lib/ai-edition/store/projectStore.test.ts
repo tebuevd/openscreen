@@ -364,6 +364,26 @@ describe("useProjectStore", () => {
 		expect(bridgeMocks.get).toHaveBeenCalledWith("proj_test");
 	});
 
+	it("preserves a dirty recovery document when active deletion fails", async () => {
+		bridgeMocks.delete.mockResolvedValue({ success: false, error: "permission denied" });
+		bridgeMocks.get.mockResolvedValue({ success: true, document: sampleDoc });
+		loadDocument();
+		const edited = withTitle(sampleDoc, "Unsaved project before delete");
+		useProjectStore.getState().setDocument(edited);
+
+		await expect(useProjectStore.getState().deleteProject("proj_test")).rejects.toThrow(
+			"permission denied",
+		);
+
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_test",
+			document: edited,
+			status: "error",
+			error: "permission denied",
+			dirty: true,
+		});
+	});
+
 	it("does not clear a project opened while deletion is pending", async () => {
 		const pendingDelete = deferred<{ success: true }>();
 		bridgeMocks.delete.mockReturnValue(pendingDelete.promise);
