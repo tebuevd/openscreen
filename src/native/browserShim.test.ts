@@ -2,6 +2,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { installBrowserShims } from "./browserShim";
 import { nativeBridgeClient } from "./client";
+import { MAX_ACTIVE_REWIND_COMPOSER_CLAIMS } from "./contracts";
 
 function installPersistedRestoration(prompt = "restore me", revision = 7) {
 	localStorage.setItem(
@@ -20,6 +21,27 @@ function installPersistedRestoration(prompt = "restore me", revision = 7) {
 			},
 		}),
 	);
+	// biome-ignore lint/suspicious/noExplicitAny: test-only browser bridge reload
+	delete (window as any).electronAPI;
+	installBrowserShims();
+}
+
+function installPersistedRestorations(count: number) {
+	const sessions = Object.fromEntries(
+		Array.from({ length: count }, (_, index) => [
+			`session-${index}`,
+			{
+				id: `session-${index}`,
+				projectId: "project",
+				title: `Conversation ${index}`,
+				createdAt: "2026-08-17T00:00:00.000Z",
+				messages: [],
+				revision: 1,
+				pendingComposerRestoration: { prompt: `prompt ${index}`, revision: 1 },
+			},
+		]),
+	);
+	localStorage.setItem("browser-shim-chat-v1", JSON.stringify({ project: sessions }));
 	// biome-ignore lint/suspicious/noExplicitAny: test-only browser bridge reload
 	delete (window as any).electronAPI;
 	installBrowserShims();
@@ -181,6 +203,93 @@ describe("browser chat operation shim", () => {
 		if (!replacementClaim.claimed) return;
 		expect(replacementClaim.claimId).not.toBe(firstClaim.claimId);
 		await nativeBridgeClient.aiEdition.chatReleaseRewindComposerClaim(replacementClaim.claimId);
+	});
+
+	it("caps active browser composer leases without evicting existing claims", async () => {
+		vi.useFakeTimers();
+		installPersistedRestorations(MAX_ACTIVE_REWIND_COMPOSER_CLAIMS + 3);
+		const claims: Array<{
+			claimed: true;
+			prompt: string;
+			claimId: string;
+			leaseExpiresAt: number;
+		}> = [];
+		for (let index = 0; index < MAX_ACTIVE_REWIND_COMPOSER_CLAIMS; index++) {
+			const claim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+				"project",
+				`session-${index}`,
+				1,
+			);
+			expect(claim.claimed).toBe(true);
+			if (!claim.claimed) throw new Error("Expected browser composer lease");
+			claims.push(claim);
+		}
+		const timersAtCapacity = vi.getTimerCount();
+
+		expect(
+			await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+				"project",
+				`session-${MAX_ACTIVE_REWIND_COMPOSER_CLAIMS}`,
+				1,
+			),
+		).toEqual({ claimed: false });
+		expect(vi.getTimerCount()).toBe(timersAtCapacity);
+		expect(
+			(
+				await nativeBridgeClient.aiEdition.chatSelectSession(
+					"project",
+					`session-${MAX_ACTIVE_REWIND_COMPOSER_CLAIMS}`,
+				)
+			)?.pendingComposerRestoration,
+		).toEqual({ revision: 1 });
+		expect(
+			await nativeBridgeClient.aiEdition.chatClaimRewindComposer("project", "session-0", 1),
+		).toEqual(claims[0]);
+		expect(vi.getTimerCount()).toBe(timersAtCapacity);
+
+		expect(
+			await nativeBridgeClient.aiEdition.chatReleaseRewindComposerClaim(claims[0].claimId),
+		).toEqual({ released: true });
+		const releasedSlotClaim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+			"project",
+			`session-${MAX_ACTIVE_REWIND_COMPOSER_CLAIMS}`,
+			1,
+		);
+		expect(releasedSlotClaim).toMatchObject({
+			claimed: true,
+			prompt: `prompt ${MAX_ACTIVE_REWIND_COMPOSER_CLAIMS}`,
+		});
+		expect(vi.getTimerCount()).toBe(timersAtCapacity);
+
+		expect(
+			await nativeBridgeClient.aiEdition.chatConfirmRewindComposerClaim(claims[1].claimId),
+		).toMatchObject({ confirmed: true });
+		expect(
+			await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+				"project",
+				`session-${MAX_ACTIVE_REWIND_COMPOSER_CLAIMS + 1}`,
+				1,
+			),
+		).toMatchObject({ claimed: true });
+
+		const timersBeforeExpiryRejection = vi.getTimerCount();
+		expect(
+			await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+				"project",
+				`session-${MAX_ACTIVE_REWIND_COMPOSER_CLAIMS + 2}`,
+				1,
+			),
+		).toEqual({ claimed: false });
+		expect(vi.getTimerCount()).toBe(timersBeforeExpiryRejection);
+		vi.advanceTimersByTime(claims[2].leaseExpiresAt - Date.now());
+		const expirySlotClaim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+			"project",
+			`session-${MAX_ACTIVE_REWIND_COMPOSER_CLAIMS + 2}`,
+			1,
+		);
+		expect(expirySlotClaim).toMatchObject({ claimed: true });
+		if (!expirySlotClaim.claimed) return;
+		await nativeBridgeClient.aiEdition.chatReleaseRewindComposerClaim(expirySlotClaim.claimId);
 	});
 
 	it("does not let foreign commit or abort calls consume another session's operation", async () => {

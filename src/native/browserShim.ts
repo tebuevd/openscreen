@@ -6,10 +6,11 @@
 import { PROVIDER_DEFINITIONS } from "../../electron/ai-edition/provider-registry";
 import { axcutSchemaVersion, migrateRawDocumentToCurrent } from "../lib/ai-edition/schema";
 import { nativeBridgeClient as realClient } from "./client";
-import type {
-	AiEditionChatPersistenceResolution,
-	AiEditionChatSession,
-	AiEditionChatSessionUpdatedEvent,
+import {
+	type AiEditionChatPersistenceResolution,
+	type AiEditionChatSession,
+	type AiEditionChatSessionUpdatedEvent,
+	MAX_ACTIVE_REWIND_COMPOSER_CLAIMS,
 } from "./contracts";
 
 const BROWSER_CHAT_SESSION_UPDATED_EVENT = "openscreen:chat-session-updated";
@@ -485,6 +486,12 @@ function createShimBridgeClient() {
 			return null;
 		}
 		return claim;
+	};
+	const pruneExpiredRewindComposerClaims = () => {
+		const now = Date.now();
+		for (const claim of [...rewindComposerClaims.values()]) {
+			if (claim.leaseExpiresAt <= now) removeRewindComposerClaim(claim);
+		}
 	};
 	const scheduleRewindComposerClaimExpiry = (claim: ShimRewindComposerClaim) => {
 		const expire = () => {
@@ -1079,6 +1086,7 @@ function createShimBridgeClient() {
 				if (!pending || pending.revision !== revision) {
 					return Promise.resolve({ claimed: false as const });
 				}
+				pruneExpiredRewindComposerClaims();
 				const existing = activeRewindComposerClaim(projectId, sessionId);
 				if (existing) {
 					if (existing.revision !== revision) {
@@ -1090,6 +1098,9 @@ function createShimBridgeClient() {
 						claimId: existing.claimId,
 						leaseExpiresAt: existing.leaseExpiresAt,
 					});
+				}
+				if (rewindComposerClaims.size >= MAX_ACTIVE_REWIND_COMPOSER_CLAIMS) {
+					return Promise.resolve({ claimed: false as const });
 				}
 				let claimId = `browser_rewind_composer_${Date.now()}_${Math.random().toString(36).slice(2)}`;
 				while (rewindComposerClaims.has(claimId) || confirmedRewindComposerClaims.has(claimId)) {

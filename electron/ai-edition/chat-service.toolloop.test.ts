@@ -10,6 +10,7 @@ import {
 	createEmptyDocument,
 	documentSchema,
 } from "../../src/lib/ai-edition/schema";
+import { MAX_ACTIVE_REWIND_COMPOSER_CLAIMS } from "../../src/native/contracts";
 
 vi.mock("./deep-agent/service", () => ({
 	invokeOpenScreenAgent: vi.fn(),
@@ -129,6 +130,32 @@ function stubConfig(overrides: Record<string, unknown> = {}): LlmConfigStore {
 			entry: { kind: "api-key", apiKey: "sk-test" },
 		}),
 	} as unknown as LlmConfigStore;
+}
+
+async function createComposerRestoration(
+	projectId: string,
+	document: AxcutDocument,
+	index: number,
+) {
+	const prompt = `restore prompt ${index}`;
+	const session = createSession(projectId);
+	await runChat(projectId, session.id, prompt, stubConfig(), document);
+	const target = selectSession(projectId, session.id)!.messages[0];
+	const prepared = prepareRewindToMessage(projectId, session.id, target.id);
+	expect(prepared.success).toBe(true);
+	if (!prepared.success) throw new Error(prepared.error);
+	expect(beginChatOperationPersistence(projectId, session.id, prepared.operationId)).toEqual({
+		success: true,
+	});
+	const committed = commitRewindToMessage(
+		projectId,
+		session.id,
+		prepared.operationId,
+		prepared.sessionRevision,
+	);
+	expect(committed.success).toBe(true);
+	if (!committed.success) throw new Error(committed.error);
+	return { sessionId: session.id, revision: committed.sessionRevision, prompt };
 }
 
 // ponytail: a tiny stub that simulates the deep agent. It captures the args
@@ -531,6 +558,92 @@ describe("runChat tool loop", () => {
 		if (!replacementClaim.claimed) return;
 		expect(confirmRewindComposerClaim(replacementClaim.claimId, replacementOwner)).toMatchObject({
 			confirmed: true,
+		});
+	});
+
+	it("caps active composer leases without evicting or allocating for rejected claims", async () => {
+		vi.useFakeTimers();
+		const projectId = "proj_rewind_claim_capacity";
+		const document = projectDocument(projectId, "Rewind claim capacity");
+		const restorations = [];
+		for (let index = 0; index < MAX_ACTIVE_REWIND_COMPOSER_CLAIMS + 3; index++) {
+			restorations.push(await createComposerRestoration(projectId, document, index));
+		}
+		const owners = Array.from({ length: MAX_ACTIVE_REWIND_COMPOSER_CLAIMS }, () => ({}));
+		const leases: Array<Extract<ReturnType<typeof claimRewindComposer>, { claimed: true }>> = [];
+		for (let index = 0; index < MAX_ACTIVE_REWIND_COMPOSER_CLAIMS; index++) {
+			const restoration = restorations[index];
+			const claim = claimRewindComposer(
+				projectId,
+				restoration.sessionId,
+				restoration.revision,
+				owners[index],
+			);
+			expect(claim.claimed).toBe(true);
+			if (!claim.claimed) throw new Error("Expected composer lease");
+			leases.push(claim);
+		}
+		const overflow = restorations[MAX_ACTIVE_REWIND_COMPOSER_CLAIMS];
+		const timersAtCapacity = vi.getTimerCount();
+
+		expect(claimRewindComposer(projectId, overflow.sessionId, overflow.revision, {})).toEqual({
+			claimed: false,
+		});
+		expect(vi.getTimerCount()).toBe(timersAtCapacity);
+		expect(selectSession(projectId, overflow.sessionId)?.pendingComposerRestoration).toEqual({
+			revision: overflow.revision,
+		});
+		expect(
+			claimRewindComposer(
+				projectId,
+				restorations[0].sessionId,
+				restorations[0].revision,
+				owners[0],
+			),
+		).toEqual(leases[0]);
+		expect(vi.getTimerCount()).toBe(timersAtCapacity);
+
+		expect(releaseRewindComposerClaim(leases[0].claimId, owners[0])).toEqual({ released: true });
+		const overflowOwner = {};
+		const overflowClaim = claimRewindComposer(
+			projectId,
+			overflow.sessionId,
+			overflow.revision,
+			overflowOwner,
+		);
+		expect(overflowClaim).toMatchObject({ claimed: true, prompt: overflow.prompt });
+		expect(vi.getTimerCount()).toBe(timersAtCapacity);
+
+		const confirmOverflow = restorations[MAX_ACTIVE_REWIND_COMPOSER_CLAIMS + 1];
+		expect(confirmRewindComposerClaim(leases[1].claimId, owners[1])).toMatchObject({
+			confirmed: true,
+		});
+		const confirmedSlotClaim = claimRewindComposer(
+			projectId,
+			confirmOverflow.sessionId,
+			confirmOverflow.revision,
+			{},
+		);
+		expect(confirmedSlotClaim.claimed).toBe(true);
+
+		const expiryOverflow = restorations[MAX_ACTIVE_REWIND_COMPOSER_CLAIMS + 2];
+		const timersBeforeExpiryRejection = vi.getTimerCount();
+		expect(
+			claimRewindComposer(projectId, expiryOverflow.sessionId, expiryOverflow.revision, {}),
+		).toEqual({ claimed: false });
+		expect(vi.getTimerCount()).toBe(timersBeforeExpiryRejection);
+		vi.advanceTimersByTime(leases[2].leaseExpiresAt - Date.now());
+		const expiryOwner = {};
+		const expirySlotClaim = claimRewindComposer(
+			projectId,
+			expiryOverflow.sessionId,
+			expiryOverflow.revision,
+			expiryOwner,
+		);
+		expect(expirySlotClaim.claimed).toBe(true);
+		if (!expirySlotClaim.claimed) return;
+		expect(releaseRewindComposerClaim(expirySlotClaim.claimId, expiryOwner)).toEqual({
+			released: true,
 		});
 	});
 

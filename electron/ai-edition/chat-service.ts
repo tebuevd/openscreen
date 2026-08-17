@@ -17,22 +17,23 @@ import {
 	createEmptyDocument,
 	documentSchema,
 } from "../../src/lib/ai-edition/schema";
-import type {
-	AiEditionChatCommitResult,
-	AiEditionChatCompactResult,
-	AiEditionChatComposerRestoration,
-	AiEditionChatMessage,
-	AiEditionChatOperationStatus,
-	AiEditionChatPersistenceResolution,
-	AiEditionChatResult,
-	AiEditionChatRewindCommitResult,
-	AiEditionChatRewindComposerClaimResult,
-	AiEditionChatRewindComposerConfirmResult,
-	AiEditionChatRewindComposerReleaseResult,
-	AiEditionChatRewindPrepareResult,
-	AiEditionChatSession,
-	AiEditionChatSessionUpdatedEvent,
-	AiEditionToolCallSummary,
+import {
+	type AiEditionChatCommitResult,
+	type AiEditionChatCompactResult,
+	type AiEditionChatComposerRestoration,
+	type AiEditionChatMessage,
+	type AiEditionChatOperationStatus,
+	type AiEditionChatPersistenceResolution,
+	type AiEditionChatResult,
+	type AiEditionChatRewindCommitResult,
+	type AiEditionChatRewindComposerClaimResult,
+	type AiEditionChatRewindComposerConfirmResult,
+	type AiEditionChatRewindComposerReleaseResult,
+	type AiEditionChatRewindPrepareResult,
+	type AiEditionChatSession,
+	type AiEditionChatSessionUpdatedEvent,
+	type AiEditionToolCallSummary,
+	MAX_ACTIVE_REWIND_COMPOSER_CLAIMS,
 } from "../../src/native/contracts";
 import {
 	applyCompaction,
@@ -711,6 +712,13 @@ function activeRewindComposerClaim(
 	return claim;
 }
 
+function pruneExpiredRewindComposerClaims(): void {
+	const now = Date.now();
+	for (const claim of [...rewindComposerClaims.values()]) {
+		if (claim.leaseExpiresAt <= now) removeRewindComposerClaim(claim);
+	}
+}
+
 function scheduleRewindComposerClaimExpiry(claim: RewindComposerClaim): void {
 	const expire = () => {
 		if (rewindComposerClaims.get(claim.claimId) !== claim) return;
@@ -875,6 +883,7 @@ export function claimRewindComposer(
 	if (!session) return { claimed: false };
 	const pending = session.pendingComposerRestoration;
 	if (!pending || pending.revision !== revision) return { claimed: false };
+	pruneExpiredRewindComposerClaims();
 	const existing = activeRewindComposerClaim(projectId, sessionId);
 	if (existing) {
 		if (existing.revision !== revision || existing.owner !== owner) return { claimed: false };
@@ -884,6 +893,9 @@ export function claimRewindComposer(
 			claimId: existing.claimId,
 			leaseExpiresAt: existing.leaseExpiresAt,
 		};
+	}
+	if (rewindComposerClaims.size >= MAX_ACTIVE_REWIND_COMPOSER_CLAIMS) {
+		return { claimed: false };
 	}
 
 	let claimId = `chat_rewind_composer_${randomUUID()}`;

@@ -1,5 +1,6 @@
 export const NATIVE_BRIDGE_CHANNEL = "native-bridge:invoke";
 export const NATIVE_BRIDGE_VERSION = 1;
+export const MAX_ACTIVE_REWIND_COMPOSER_CLAIMS = 128;
 
 export type NativePlatform = "darwin" | "win32" | "linux";
 export type CursorProviderKind = "native" | "none";
