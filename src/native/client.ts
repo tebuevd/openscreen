@@ -6,6 +6,7 @@ import {
 	type AiEditionChatCompactResult,
 	type AiEditionChatOperationResult,
 	type AiEditionChatOperationStatus,
+	type AiEditionChatPersistenceResolution,
 	type AiEditionChatResult,
 	type AiEditionChatRewindCommitResult,
 	type AiEditionChatRewindPrepareResult,
@@ -268,11 +269,16 @@ export const nativeBridgeClient = {
 				action: "chat.operation.status",
 				payload: { projectId, sessionId, operationId },
 			}),
-		chatResolvePersistence: (projectId: string, sessionId: string, operationId: string) =>
+		chatResolvePersistence: (
+			projectId: string,
+			sessionId: string,
+			operationId: string,
+			outcome: AiEditionChatPersistenceResolution,
+		) =>
 			requireNativeBridgeData<AiEditionChatOperationResult>({
 				domain: "aiEdition",
 				action: "chat.operation.resolvePersistence",
-				payload: { projectId, sessionId, operationId, outcome: "not-persisted" },
+				payload: { projectId, sessionId, operationId, outcome },
 			}),
 		chatUndoLastBatch: (projectId: string, sessionId: string) =>
 			requireNativeBridgeData<AiEditionChatResult>({

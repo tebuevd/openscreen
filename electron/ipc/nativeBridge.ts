@@ -3,6 +3,7 @@ import type {
 	AiEditionChatCommitResult,
 	AiEditionChatEvent,
 	AiEditionChatOperationStatus,
+	AiEditionChatPersistenceResolution,
 	AiEditionChatSessionUpdatedEvent,
 } from "../../src/native/contracts";
 import {
@@ -87,6 +88,7 @@ export interface NativeBridgeContext {
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		outcome: AiEditionChatPersistenceResolution,
 	) => import("../../src/native/contracts").AiEditionChatOperationResult;
 	getAiEditionChatOperationStatus: (
 		projectId: string,
@@ -709,6 +711,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.operationId,
+									request.payload.outcome,
 								),
 							);
 						case "chat.operation.status":

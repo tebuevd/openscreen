@@ -18,6 +18,7 @@ import type {
 	AiEditionChatEvent,
 	AiEditionChatMessage,
 	AiEditionChatOperationStatus,
+	AiEditionChatPersistenceResolution,
 	AiEditionChatRewindCommitResult,
 	AiEditionChatSessionUpdatedEvent,
 	AiEditionLlmConfig,
@@ -142,7 +143,7 @@ async function beginPersistenceBounded(
 				sessionId,
 				operationId,
 			);
-			if (status.state === "persisting" && status.expiresAt > Date.now()) return "started";
+			if (status.state === "persisting") return "started";
 			if (status.state === "committed") return "committed";
 			if (status.state === "aborted") return "aborted";
 		} catch {
@@ -1218,19 +1219,23 @@ function ChatStripPanel() {
 			}
 			return removeOptimisticMessage(stale);
 		};
-		const resolveNotPersisted = async (stale: boolean): Promise<boolean> => {
+		const resolvePersistence = async (
+			outcome: AiEditionChatPersistenceResolution,
+			stale: boolean,
+		): Promise<void> => {
 			if (operation.sessionId && operation.remoteId) {
 				try {
 					await nativeBridgeClient.aiEdition.chatResolvePersistence(
 						projectId,
 						operation.sessionId,
 						operation.remoteId,
+						outcome,
 					);
 				} catch {
-					// The bounded main-side evidence expires safely if this acknowledgement is lost.
+					// The non-expiring main-side fence remains safe if this acknowledgement is lost.
 				}
 			}
-			return removeOptimisticMessage(stale);
+			removeOptimisticMessage(stale);
 		};
 		const reloadCanonicalSession = async (): Promise<void> => {
 			if (!ownsUi() || !operation.sessionId) return;
@@ -1331,16 +1336,23 @@ function ChatStripPanel() {
 					try {
 						if (!persistenceAlreadyCommitted) {
 							const outcome = await applyAgentDocument(result.document, documentOperation);
-							if (outcome.success) {
-								// Disk now authoritatively contains the operation result, even if this panel detached.
-							} else if (await resolveNotPersisted(outcome.status === "stale")) {
-								if (outcome.status === "diverged") {
+							if (!outcome.success) {
+								await resolvePersistence(
+									outcome.status === "stale" ? "not-persisted" : "failed",
+									outcome.status === "stale",
+								);
+								if (outcome.status === "diverged" && ownsUi()) {
 									toast.error(t("chat.applyEditsFailed"), { description: outcome.error });
 								}
 								return;
 							}
+							if (!outcome.appliedToCurrent) {
+								await resolvePersistence("superseded", true);
+								return;
+							}
 						}
 					} catch (err) {
+						await resolvePersistence("failed", false);
 						if (ownsUi()) {
 							toast.error(t("chat.applyEditsFailed"), {
 								description: err instanceof Error ? err.message : String(err),
@@ -1504,19 +1516,21 @@ function ChatStripPanel() {
 				}
 				return ownsUi();
 			};
-			const resolveNotPersisted = async (): Promise<boolean> => {
+			const resolvePersistence = async (
+				outcome: AiEditionChatPersistenceResolution,
+			): Promise<void> => {
 				if (operation.remoteId) {
 					try {
 						await nativeBridgeClient.aiEdition.chatResolvePersistence(
 							projectId,
 							activeSessionId,
 							operation.remoteId,
+							outcome,
 						);
 					} catch {
-						// The bounded main-side evidence expires safely if this acknowledgement is lost.
+						// The non-expiring main-side fence remains safe if this acknowledgement is lost.
 					}
 				}
-				return ownsUi();
 			};
 			const reloadCanonicalSession = async (): Promise<void> => {
 				if (!ownsUi()) return;
@@ -1569,13 +1583,20 @@ function ChatStripPanel() {
 					try {
 						const outcome = await applyAgentDocument(prepared.document, documentOperation);
 						if (!outcome.success) {
-							if (await resolveNotPersisted()) {
+							await resolvePersistence(outcome.status === "stale" ? "not-persisted" : "failed");
+							if (ownsUi()) {
 								if (outcome.status === "stale") showStaleDocumentResult();
 								else toast.error(t("chat.rewindFailed"), { description: outcome.error });
 							}
 							return;
 						}
+						if (!outcome.appliedToCurrent) {
+							await resolvePersistence("superseded");
+							if (ownsUi()) showStaleDocumentResult();
+							return;
+						}
 					} catch (error) {
+						await resolvePersistence("failed");
 						if (ownsUi()) {
 							toast.error(t("chat.rewindFailed"), {
 								description: error instanceof Error ? error.message : String(error),

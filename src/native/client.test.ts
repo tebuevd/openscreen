@@ -28,7 +28,12 @@ describe("native chat operation client", () => {
 		await nativeBridgeClient.aiEdition.chatAbortRun("project", "session", "run-2");
 		await nativeBridgeClient.aiEdition.chatBeginPersistence("project", "session", "run-3");
 		await nativeBridgeClient.aiEdition.chatOperationStatus("project", "session", "run-4");
-		await nativeBridgeClient.aiEdition.chatResolvePersistence("project", "session", "run-5");
+		await nativeBridgeClient.aiEdition.chatResolvePersistence(
+			"project",
+			"session",
+			"run-5",
+			"superseded",
+		);
 
 		expect(invoke.mock.calls.map(([request]) => request)).toEqual([
 			expect.objectContaining({
@@ -63,7 +68,7 @@ describe("native chat operation client", () => {
 					projectId: "project",
 					sessionId: "session",
 					operationId: "run-5",
-					outcome: "not-persisted",
+					outcome: "superseded",
 				},
 			}),
 		]);

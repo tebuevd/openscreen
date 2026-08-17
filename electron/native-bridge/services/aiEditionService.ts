@@ -8,6 +8,7 @@ import type {
 	AiEditionChatMessage,
 	AiEditionChatOperationResult,
 	AiEditionChatOperationStatus,
+	AiEditionChatPersistenceResolution,
 	AiEditionChatResult,
 	AiEditionChatRewindCommitResult,
 	AiEditionChatRewindPrepareResult,
@@ -75,6 +76,7 @@ export interface AiEditionServiceOptions {
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		outcome: AiEditionChatPersistenceResolution,
 	) => AiEditionChatOperationResult;
 	getChatOperationStatus: (
 		projectId: string,
@@ -337,8 +339,9 @@ export class AiEditionService {
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		outcome: AiEditionChatPersistenceResolution,
 	): AiEditionChatOperationResult {
-		return this.options.resolveChatOperationPersistence(projectId, sessionId, operationId);
+		return this.options.resolveChatOperationPersistence(projectId, sessionId, operationId, outcome);
 	}
 
 	chatOperationStatus(

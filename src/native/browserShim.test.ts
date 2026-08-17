@@ -126,6 +126,7 @@ describe("browser chat operation shim", () => {
 				"foreign",
 				session.id,
 				"failed-persistence-run",
+				"failed",
 			),
 		).toMatchObject({ success: false });
 		expect(
@@ -133,6 +134,7 @@ describe("browser chat operation shim", () => {
 				"project",
 				session.id,
 				"failed-persistence-run",
+				"failed",
 			),
 		).toEqual({ success: true });
 		expect(
@@ -213,9 +215,10 @@ describe("browser chat operation shim", () => {
 		unsubscribe();
 	});
 
-	it("releases a hung persistence lock while retaining bounded late evidence", async () => {
+	it("keeps unresolved persistence fenced beyond 30 minutes without timer growth", async () => {
 		vi.useFakeTimers();
 		const session = await nativeBridgeClient.aiEdition.chatCreateSession("project");
+		const baselineTimerCount = vi.getTimerCount();
 		await nativeBridgeClient.aiEdition.chatRun(
 			"project",
 			session.id,
@@ -223,8 +226,10 @@ describe("browser chat operation shim", () => {
 			undefined,
 			"hung-run",
 		);
+		expect(vi.getTimerCount()).toBe(baselineTimerCount + 1);
 		await nativeBridgeClient.aiEdition.chatBeginPersistence("project", session.id, "hung-run");
-		await vi.advanceTimersByTimeAsync(10 * 60_000);
+		expect(vi.getTimerCount()).toBeLessThanOrEqual(baselineTimerCount);
+		await vi.advanceTimersByTimeAsync(31 * 60_000);
 
 		await expect(
 			nativeBridgeClient.aiEdition.chatRun(
@@ -234,19 +239,105 @@ describe("browser chat operation shim", () => {
 				undefined,
 				"replacement-run",
 			),
+		).resolves.toMatchObject({ success: false });
+		expect(
+			await nativeBridgeClient.aiEdition.chatOperationStatus("project", session.id, "hung-run"),
+		).toMatchObject({ state: "persisting" });
+		expect(
+			await nativeBridgeClient.aiEdition.chatRenameSession("project", session.id, "Blocked"),
+		).toBeNull();
+		expect(await nativeBridgeClient.aiEdition.chatDeleteSession("project", session.id)).toEqual({
+			success: false,
+		});
+		expect(vi.getTimerCount()).toBeLessThanOrEqual(baselineTimerCount);
+
+		expect(
+			await nativeBridgeClient.aiEdition.chatResolvePersistence(
+				"project",
+				session.id,
+				"hung-run",
+				"failed",
+			),
+		).toEqual({ success: true });
+		await expect(
+			nativeBridgeClient.aiEdition.chatRun(
+				"project",
+				session.id,
+				"after settlement",
+				undefined,
+				"replacement-after-settlement",
+			),
 		).resolves.toMatchObject({ success: true });
+		await nativeBridgeClient.aiEdition.chatAbortRun(
+			"project",
+			session.id,
+			"replacement-after-settlement",
+		);
+	});
+
+	it("rejects new browser work at active capacity without evicting existing operations", async () => {
+		const active: Array<{ projectId: string; sessionId: string; operationId: string }> = [];
+		for (let index = 0; index < 128; index++) {
+			const projectId = `browser-capacity-project-${index}`;
+			const session = await nativeBridgeClient.aiEdition.chatCreateSession(projectId);
+			const operationId = `browser-capacity-${index}`;
+			await expect(
+				nativeBridgeClient.aiEdition.chatRun(
+					projectId,
+					session.id,
+					`message ${index}`,
+					undefined,
+					operationId,
+				),
+			).resolves.toMatchObject({ success: true });
+			active.push({ projectId, sessionId: session.id, operationId });
+		}
+
+		const overflowProjectId = "browser-capacity-overflow-project";
+		const overflowSession = await nativeBridgeClient.aiEdition.chatCreateSession(overflowProjectId);
+		await expect(
+			nativeBridgeClient.aiEdition.chatRun(
+				overflowProjectId,
+				overflowSession.id,
+				"overflow",
+				undefined,
+				"browser-capacity-overflow",
+			),
+		).resolves.toEqual({ success: false, error: "Too many chat operations are active." });
 		expect(
-			await nativeBridgeClient.aiEdition.chatOperationStatus("project", session.id, "hung-run"),
-		).toMatchObject({ state: "late-persistence" });
-		await nativeBridgeClient.aiEdition.chatAbortRun("project", session.id, "replacement-run");
-		await vi.advanceTimersByTimeAsync(20 * 60_000);
-		expect(
-			await nativeBridgeClient.aiEdition.chatOperationStatus("project", session.id, "hung-run"),
-		).toMatchObject({ state: "aborted" });
-		await vi.advanceTimersByTimeAsync(10 * 60_000);
-		expect(
-			await nativeBridgeClient.aiEdition.chatOperationStatus("project", session.id, "hung-run"),
-		).toEqual({ state: "unknown", operationId: "hung-run" });
+			await nativeBridgeClient.aiEdition.chatOperationStatus(
+				active[0].projectId,
+				active[0].sessionId,
+				active[0].operationId,
+			),
+		).toMatchObject({ state: "prepared" });
+
+		await nativeBridgeClient.aiEdition.chatAbortRun(
+			active[0].projectId,
+			active[0].sessionId,
+			active[0].operationId,
+		);
+		await expect(
+			nativeBridgeClient.aiEdition.chatRun(
+				overflowProjectId,
+				overflowSession.id,
+				"accepted after settlement",
+				undefined,
+				"browser-capacity-after-settlement",
+			),
+		).resolves.toMatchObject({ success: true });
+		await nativeBridgeClient.aiEdition.chatAbortRun(
+			overflowProjectId,
+			overflowSession.id,
+			"browser-capacity-after-settlement",
+		);
+		for (const operation of active.slice(1)) {
+			await nativeBridgeClient.aiEdition.chatAbortRun(
+				operation.projectId,
+				operation.sessionId,
+				operation.operationId,
+			);
+		}
 	});
 
 	it("expires an abandoned prepared operation without renderer renewal", async () => {
@@ -312,6 +403,50 @@ describe("browser chat operation shim", () => {
 				"restart-run",
 			),
 		).toEqual(committed);
+	});
+
+	it("clears an active write fence when the browser backend restarts", async () => {
+		const session = await nativeBridgeClient.aiEdition.chatCreateSession("restart-fence-project");
+		await nativeBridgeClient.aiEdition.chatRun(
+			"restart-fence-project",
+			session.id,
+			"pending write",
+			undefined,
+			"restart-fence-run",
+		);
+		await nativeBridgeClient.aiEdition.chatBeginPersistence(
+			"restart-fence-project",
+			session.id,
+			"restart-fence-run",
+		);
+
+		// The browser shim is its own backend. Reinstalling it models a main-process restart:
+		// process-local fences disappear, and no browser write can survive that teardown.
+		// biome-ignore lint/suspicious/noExplicitAny: test-only browser backend restart
+		delete (window as any).electronAPI;
+		installBrowserShims();
+
+		expect(
+			await nativeBridgeClient.aiEdition.chatOperationStatus(
+				"restart-fence-project",
+				session.id,
+				"restart-fence-run",
+			),
+		).toEqual({ state: "unknown", operationId: "restart-fence-run" });
+		await expect(
+			nativeBridgeClient.aiEdition.chatRun(
+				"restart-fence-project",
+				session.id,
+				"replacement",
+				undefined,
+				"replacement-after-restart",
+			),
+		).resolves.toMatchObject({ success: true });
+		await nativeBridgeClient.aiEdition.chatAbortRun(
+			"restart-fence-project",
+			session.id,
+			"replacement-after-restart",
+		);
 	});
 
 	it("bounds browser commit tombstones without evicting the newest replay result", async () => {

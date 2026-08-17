@@ -6,7 +6,10 @@
 import { PROVIDER_DEFINITIONS } from "../../electron/ai-edition/provider-registry";
 import { axcutSchemaVersion, migrateRawDocumentToCurrent } from "../lib/ai-edition/schema";
 import { nativeBridgeClient as realClient } from "./client";
-import type { AiEditionChatSessionUpdatedEvent } from "./contracts";
+import type {
+	AiEditionChatPersistenceResolution,
+	AiEditionChatSessionUpdatedEvent,
+} from "./contracts";
 
 const BROWSER_CHAT_SESSION_UPDATED_EVENT = "openscreen:chat-session-updated";
 
@@ -306,11 +309,8 @@ function createShimBridgeClient() {
 	const chatStorageKey = "browser-shim-chat-v1";
 	const terminalOperationStorageKey = "browser-shim-chat-operations-v1";
 	const preparedOperationTtlMs = 5 * 60_000;
-	const persistenceLockTtlMs = 10 * 60_000;
-	const persistenceEvidenceTtlMs = 30 * 60_000;
 	const terminalOperationTtlMs = 10 * 60_000;
 	const maxActiveOperations = 128;
-	const maxLateOperations = 128;
 	const maxTerminalOperations = 256;
 	const sessionsByProject = new Map<string, Map<string, ShimSession>>();
 	type ShimOperation = {
@@ -320,7 +320,6 @@ function createShimBridgeClient() {
 		sessionId: string;
 		createdAt: number;
 		expiresAt: number;
-		persistenceEvidenceExpiresAt?: number;
 	};
 	type PendingShimChatRun = ShimOperation & {
 		state: "prepared" | "persisting";
@@ -338,7 +337,6 @@ function createShimBridgeClient() {
 	type AbortedShimChatRun = ShimOperation & { state: "aborted" };
 	type TerminalShimChatRun = CompletedShimChatRun | AbortedShimChatRun;
 	const pendingChatRuns = new Map<string, PendingShimChatRun>();
-	const lateChatRuns = new Map<string, PendingShimChatRun>();
 	const terminalChatRuns = new Map<string, TerminalShimChatRun>();
 	const operationExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	const operationBelongsToSession = (
@@ -353,7 +351,6 @@ function createShimBridgeClient() {
 	};
 	const deleteOperation = (operationId: string) => {
 		pendingChatRuns.delete(operationId);
-		lateChatRuns.delete(operationId);
 		terminalChatRuns.delete(operationId);
 		cancelOperationExpiry(operationId);
 	};
@@ -408,58 +405,26 @@ function createShimBridgeClient() {
 	};
 	const rememberAbortedRun = (operation: PendingShimChatRun) =>
 		rememberTerminalRun({ ...operation, state: "aborted", expiresAt: 0 });
-	const expireLateRun = (operation: PendingShimChatRun) => {
-		if (lateChatRuns.get(operation.operationId) !== operation) return;
-		lateChatRuns.delete(operation.operationId);
-		rememberAbortedRun(operation);
-	};
-	const enforceLateBound = () => {
-		while (lateChatRuns.size > maxLateOperations) {
-			const oldest = lateChatRuns.keys().next().value;
-			if (typeof oldest !== "string") break;
-			const operation = lateChatRuns.get(oldest);
-			if (!operation) break;
-			expireLateRun(operation);
-		}
-	};
-	const moveToLateEvidence = (operation: PendingShimChatRun) => {
-		if (pendingChatRuns.get(operation.operationId) !== operation) return;
-		pendingChatRuns.delete(operation.operationId);
-		cancelOperationExpiry(operation.operationId);
-		lateChatRuns.set(operation.operationId, operation);
-		enforceLateBound();
-		if (lateChatRuns.get(operation.operationId) !== operation) return;
-		scheduleOperationDeadline(operation, operation.persistenceEvidenceExpiresAt ?? Date.now(), () =>
-			expireLateRun(operation),
-		);
-	};
 	const expirePendingRun = (operation: PendingShimChatRun) => {
 		if (pendingChatRuns.get(operation.operationId) !== operation) return;
-		if (operation.state === "persisting") moveToLateEvidence(operation);
-		else rememberAbortedRun(operation);
+		if (operation.state === "persisting") return;
+		rememberAbortedRun(operation);
 	};
-	const addPendingRun = (operation: PendingShimChatRun) => {
+	const addPendingRun = (operation: PendingShimChatRun): boolean => {
+		pruneExpiredOperations();
+		if (pendingChatRuns.size >= maxActiveOperations) return false;
 		pendingChatRuns.set(operation.operationId, operation);
 		scheduleOperationDeadline(operation, Date.now() + preparedOperationTtlMs, () =>
 			expirePendingRun(operation),
 		);
-		while (pendingChatRuns.size > maxActiveOperations) {
-			const oldest = pendingChatRuns.keys().next().value;
-			if (typeof oldest !== "string") break;
-			const pending = pendingChatRuns.get(oldest);
-			if (!pending) break;
-			expirePendingRun(pending);
-		}
+		return true;
 	};
 	const pruneExpiredOperations = () => {
 		const now = Date.now();
 		let terminalChanged = false;
 		for (const operation of pendingChatRuns.values()) {
-			if (operation.expiresAt <= now) expirePendingRun(operation);
-		}
-		for (const operation of lateChatRuns.values()) {
-			if ((operation.persistenceEvidenceExpiresAt ?? operation.expiresAt) <= now) {
-				expireLateRun(operation);
+			if (operation.state !== "persisting" && operation.expiresAt <= now) {
+				expirePendingRun(operation);
 			}
 		}
 		for (const operation of terminalChatRuns.values()) {
@@ -689,9 +654,7 @@ function createShimBridgeClient() {
 				if (
 					sessionHasPendingOperation(projectId, s.id) ||
 					(operationId !== undefined &&
-						(pendingChatRuns.has(operationId) ||
-							lateChatRuns.has(operationId) ||
-							terminalChatRuns.has(operationId)))
+						(pendingChatRuns.has(operationId) || terminalChatRuns.has(operationId)))
 				) {
 					return Promise.resolve({
 						success: false,
@@ -727,7 +690,12 @@ function createShimBridgeClient() {
 						messages: stagedMessages,
 						expiresAt: 0,
 					};
-					addPendingRun(pending);
+					if (!addPendingRun(pending)) {
+						return Promise.resolve({
+							success: false,
+							error: "Too many chat operations are active.",
+						});
+					}
 				} else {
 					s.messages.push(...stagedMessages);
 					s.revision++;
@@ -749,7 +717,7 @@ function createShimBridgeClient() {
 							: { success: false as const, error: "Chat operation belongs to another session." },
 					);
 				}
-				const pending = pendingChatRuns.get(operationId) ?? lateChatRuns.get(operationId);
+				const pending = pendingChatRuns.get(operationId);
 				const session = sessionsByProject.get(projectId)?.get(sessionId);
 				if (
 					!pending ||
@@ -758,12 +726,6 @@ function createShimBridgeClient() {
 					session.revision !== pending.expectedRevision
 				) {
 					return Promise.resolve({ success: false, error: "Chat operation is stale." });
-				}
-				if (
-					lateChatRuns.get(operationId) === pending &&
-					sessionHasPendingOperation(projectId, sessionId)
-				) {
-					return Promise.resolve({ success: false, error: "Another operation owns this session." });
 				}
 				session.messages.push(...pending.messages);
 				session.revision++;
@@ -781,7 +743,6 @@ function createShimBridgeClient() {
 					state: "committed",
 					result,
 					expiresAt: 0,
-					persistenceEvidenceExpiresAt: pending.persistenceEvidenceExpiresAt,
 				});
 				persistChat();
 				window.dispatchEvent(
@@ -809,7 +770,7 @@ function createShimBridgeClient() {
 							: "Chat operation belongs to another session.",
 					});
 				}
-				const pending = pendingChatRuns.get(operationId) ?? lateChatRuns.get(operationId);
+				const pending = pendingChatRuns.get(operationId);
 				if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
 					return Promise.resolve({ success: false, error: "Chat operation is stale." });
 				}
@@ -831,19 +792,22 @@ function createShimBridgeClient() {
 								: "Operation is aborted.",
 					});
 				}
-				const pending = pendingChatRuns.get(operationId) ?? lateChatRuns.get(operationId);
+				const pending = pendingChatRuns.get(operationId);
 				if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
 					return Promise.resolve({ success: false, error: "Chat operation is stale." });
 				}
 				if (pending.state === "persisting") return Promise.resolve({ success: true });
 				pending.state = "persisting";
-				pending.persistenceEvidenceExpiresAt = Date.now() + persistenceEvidenceTtlMs;
-				scheduleOperationDeadline(pending, Date.now() + persistenceLockTtlMs, () =>
-					moveToLateEvidence(pending),
-				);
+				cancelOperationExpiry(operationId);
+				pending.expiresAt = Number.POSITIVE_INFINITY;
 				return Promise.resolve({ success: true });
 			},
-			chatResolvePersistence: (projectId: string, sessionId: string, operationId: string) => {
+			chatResolvePersistence: (
+				projectId: string,
+				sessionId: string,
+				operationId: string,
+				_outcome: AiEditionChatPersistenceResolution,
+			) => {
 				pruneExpiredOperations();
 				const terminal = terminalChatRuns.get(operationId);
 				if (terminal && operationBelongsToSession(terminal, projectId, sessionId)) {
@@ -853,7 +817,7 @@ function createShimBridgeClient() {
 							: { success: false, error: "Committed persistence cannot be aborted." },
 					);
 				}
-				const pending = pendingChatRuns.get(operationId) ?? lateChatRuns.get(operationId);
+				const pending = pendingChatRuns.get(operationId);
 				if (
 					!pending ||
 					pending.state !== "persisting" ||
@@ -882,17 +846,9 @@ function createShimBridgeClient() {
 							: { state: "aborted" as const, kind: "chat" as const, operationId },
 					);
 				}
-				const pending = pendingChatRuns.get(operationId) ?? lateChatRuns.get(operationId);
+				const pending = pendingChatRuns.get(operationId);
 				if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
 					return Promise.resolve({ state: "unknown" as const, operationId });
-				}
-				if (lateChatRuns.get(operationId) === pending) {
-					return Promise.resolve({
-						state: "late-persistence" as const,
-						kind: "chat" as const,
-						operationId,
-						expiresAt: pending.expiresAt,
-					});
 				}
 				return Promise.resolve(
 					pending.state === "persisting"
@@ -900,7 +856,6 @@ function createShimBridgeClient() {
 								state: "persisting" as const,
 								kind: "chat" as const,
 								operationId,
-								expiresAt: pending.expiresAt,
 							}
 						: { state: "prepared" as const, kind: "chat" as const, operationId },
 				);

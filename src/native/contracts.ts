@@ -322,6 +322,8 @@ export interface AiEditionChatResult {
 
 export type AiEditionChatOperationResult = { success: true } | { success: false; error: string };
 
+export type AiEditionChatPersistenceResolution = "not-persisted" | "superseded" | "failed";
+
 export type AiEditionChatCommitResult =
 	| {
 			success: true;
@@ -353,15 +355,9 @@ export type AiEditionChatRewindCommitResult =
 
 export type AiEditionChatOperationStatus =
 	| {
-			state: "running" | "prepared";
+			state: "running" | "prepared" | "persisting";
 			kind: "chat" | "rewind";
 			operationId: string;
-	  }
-	| {
-			state: "persisting" | "late-persistence";
-			kind: "chat" | "rewind";
-			operationId: string;
-			expiresAt: number;
 	  }
 	| {
 			state: "committed";
@@ -684,7 +680,7 @@ export type NativeBridgeRequest =
 				projectId: string;
 				sessionId: string;
 				operationId: string;
-				outcome: "not-persisted";
+				outcome: AiEditionChatPersistenceResolution;
 			};
 			requestId?: string;
 	  }

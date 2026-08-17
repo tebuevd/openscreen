@@ -350,37 +350,75 @@ describe("runChat tool loop", () => {
 		});
 	});
 
-	it("retains bounded late-persistence evidence after the session lock deadline", async () => {
+	it("keeps an unresolved write fenced beyond 30 minutes without timer growth", async () => {
 		vi.useFakeTimers();
 		invokeMock.mockImplementationOnce(async (args) => ({
 			text: "done",
 			document: args.document,
 			mutated: true,
 		}));
-		const projectId = "proj_late_persistence";
+		const projectId = "proj_unresolved_persistence";
 		const session = createSession(projectId);
 		await runChat(
 			projectId,
 			session.id,
-			"late save",
+			"unresolved save",
 			stubConfig(),
 			fixtureDocument(),
 			{},
 			{},
-			"run_late_persistence",
+			"run_unresolved_persistence",
 		);
-		beginChatOperationPersistence(projectId, session.id, "run_late_persistence");
+		beginChatOperationPersistence(projectId, session.id, "run_unresolved_persistence");
+		expect(vi.getTimerCount()).toBe(0);
 
-		await vi.advanceTimersByTimeAsync(11 * 60_000);
-		expect(getChatOperationStatus(projectId, session.id, "run_late_persistence")).toMatchObject({
-			state: "late-persistence",
+		await vi.advanceTimersByTimeAsync(31 * 60_000);
+		expect(
+			getChatOperationStatus(projectId, session.id, "run_unresolved_persistence"),
+		).toMatchObject({
+			state: "persisting",
 		});
-		expect(commitChatRun(projectId, session.id, "run_late_persistence")).toMatchObject({
+		expect(renameSession(projectId, session.id, "Must stay blocked")).toBeNull();
+		expect(deleteSession(projectId, session.id)).toBe(false);
+		for (let attempt = 0; attempt < 5; attempt++) {
+			await expect(
+				runChat(
+					projectId,
+					session.id,
+					"replacement",
+					stubConfig(),
+					fixtureDocument(),
+					{},
+					{},
+					`blocked_replacement_${attempt}`,
+				),
+			).resolves.toMatchObject({ success: false });
+		}
+		expect(vi.getTimerCount()).toBe(0);
+
+		// The original save can settle arbitrarily late; only that settlement path releases it.
+		expect(commitChatRun(projectId, session.id, "run_unresolved_persistence")).toMatchObject({
+			success: true,
+		});
+		await expect(
+			runChat(
+				projectId,
+				session.id,
+				"after settlement",
+				stubConfig(),
+				fixtureDocument(),
+				{},
+				{},
+				"replacement_after_settlement",
+			),
+		).resolves.toMatchObject({ success: true });
+		expect(abortChatRun(projectId, session.id, "replacement_after_settlement")).toEqual({
 			success: true,
 		});
 	});
 
 	it("resolves confirmed failed persistence and releases the session lock", async () => {
+		vi.useFakeTimers();
 		invokeMock.mockImplementationOnce(async (args) => ({
 			text: "done",
 			document: args.document,
@@ -401,12 +439,21 @@ describe("runChat tool loop", () => {
 		expect(beginChatOperationPersistence(projectId, session.id, "run_failed_persistence")).toEqual({
 			success: true,
 		});
+		expect(vi.getTimerCount()).toBe(0);
+		await vi.advanceTimersByTimeAsync(31 * 60_000);
+		expect(getChatOperationStatus(projectId, session.id, "run_failed_persistence")).toMatchObject({
+			state: "persisting",
+		});
 		expect(
-			resolveChatOperationPersistence(projectId, "foreign_session", "run_failed_persistence")
-				.success,
+			resolveChatOperationPersistence(
+				projectId,
+				"foreign_session",
+				"run_failed_persistence",
+				"failed",
+			).success,
 		).toBe(false);
 		expect(
-			resolveChatOperationPersistence(projectId, session.id, "run_failed_persistence"),
+			resolveChatOperationPersistence(projectId, session.id, "run_failed_persistence", "failed"),
 		).toEqual({
 			success: true,
 		});
@@ -430,56 +477,85 @@ describe("runChat tool loop", () => {
 		});
 	});
 
-	it("bounds a permanently pending save and eventually releases its lock and evidence", async () => {
-		vi.useFakeTimers();
-		invokeMock.mockImplementationOnce(async (args) => ({
+	it("rejects new work at active capacity without evicting persistence fences", async () => {
+		invokeMock.mockImplementation(async (args) => ({
 			text: "done",
 			document: args.document,
 			mutated: true,
 		}));
-		const projectId = "proj_hung_persistence";
-		const session = createSession(projectId);
-		await runChat(
-			projectId,
-			session.id,
-			"hung save",
-			stubConfig(),
-			fixtureDocument(),
-			{},
-			{},
-			"run_hung_persistence",
-		);
-		beginChatOperationPersistence(projectId, session.id, "run_hung_persistence");
+		const projectId = "proj_active_capacity";
+		const fenced: Array<{ sessionId: string; operationId: string }> = [];
+		for (let index = 0; index < 128; index++) {
+			const session = createSession(projectId);
+			const operationId = `capacity_fence_${index}`;
+			await expect(
+				runChat(
+					projectId,
+					session.id,
+					`edit ${index}`,
+					stubConfig(),
+					fixtureDocument(),
+					{},
+					{},
+					operationId,
+				),
+			).resolves.toMatchObject({ success: true });
+			expect(beginChatOperationPersistence(projectId, session.id, operationId)).toEqual({
+				success: true,
+			});
+			fenced.push({ sessionId: session.id, operationId });
+		}
 
-		await vi.advanceTimersByTimeAsync(10 * 60_000);
+		const overflowSession = createSession(projectId);
 		await expect(
 			runChat(
 				projectId,
-				session.id,
-				"replacement",
+				overflowSession.id,
+				"overflow",
 				stubConfig(),
 				fixtureDocument(),
 				{},
 				{},
-				"replacement_after_hung_save",
+				"capacity_overflow",
 			),
-		).resolves.toMatchObject({ success: true });
-		expect(abortChatRun(projectId, session.id, "replacement_after_hung_save")).toEqual({
-			success: true,
-		});
-		expect(getChatOperationStatus(projectId, session.id, "run_hung_persistence")).toMatchObject({
-			state: "late-persistence",
+		).resolves.toEqual({ success: false, error: "Too many chat operations are active." });
+		expect(
+			getChatOperationStatus(projectId, fenced[0].sessionId, fenced[0].operationId),
+		).toMatchObject({
+			state: "persisting",
 		});
 
-		await vi.advanceTimersByTimeAsync(20 * 60_000);
-		expect(getChatOperationStatus(projectId, session.id, "run_hung_persistence")).toMatchObject({
-			state: "aborted",
+		expect(
+			resolveChatOperationPersistence(
+				projectId,
+				fenced[0].sessionId,
+				fenced[0].operationId,
+				"superseded",
+			),
+		).toEqual({ success: true });
+		await expect(
+			runChat(
+				projectId,
+				overflowSession.id,
+				"accepted after settlement",
+				stubConfig(),
+				fixtureDocument(),
+				{},
+				{},
+				"capacity_after_settlement",
+			),
+		).resolves.toMatchObject({ success: true });
+		expect(abortChatRun(projectId, overflowSession.id, "capacity_after_settlement")).toEqual({
+			success: true,
 		});
-		await vi.advanceTimersByTimeAsync(10 * 60_000);
-		expect(getChatOperationStatus(projectId, session.id, "run_hung_persistence")).toEqual({
-			state: "unknown",
-			operationId: "run_hung_persistence",
-		});
+		for (const operation of fenced.slice(1)) {
+			resolveChatOperationPersistence(
+				projectId,
+				operation.sessionId,
+				operation.operationId,
+				"failed",
+			);
+		}
 	});
 
 	it("expires abandoned running and prepared operations without renderer renewal", async () => {
@@ -731,7 +807,12 @@ describe("runChat tool loop", () => {
 		expect(commit.success).toBe(false);
 		expect(selectSession("proj_rewind_revision", session.id)?.messages).toEqual(before.messages);
 		expect(
-			resolveChatOperationPersistence("proj_rewind_revision", session.id, prepared.operationId),
+			resolveChatOperationPersistence(
+				"proj_rewind_revision",
+				session.id,
+				prepared.operationId,
+				"failed",
+			),
 		).toEqual({ success: true });
 	});
 
@@ -898,5 +979,41 @@ describe("allowAgentEdits reaches the agent", () => {
 			fixtureDocument(),
 		);
 		expect(result.document).toBeDefined();
+	});
+});
+
+describe("chat service process lifecycle", () => {
+	it("drops process-local persistence fences when the main process restarts", async () => {
+		const beforeRestart = await import("./chat-service");
+		invokeMock.mockImplementationOnce(async (args) => ({
+			text: "done",
+			document: args.document,
+			mutated: true,
+		}));
+		const projectId = "proj_main_restart";
+		const session = beforeRestart.createSession(projectId);
+		await beforeRestart.runChat(
+			projectId,
+			session.id,
+			"pending write",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"main_restart_fence",
+		);
+		expect(
+			beforeRestart.beginChatOperationPersistence(projectId, session.id, "main_restart_fence"),
+		).toEqual({ success: true });
+		expect(
+			beforeRestart.getChatOperationStatus(projectId, session.id, "main_restart_fence"),
+		).toMatchObject({ state: "persisting" });
+
+		vi.resetModules();
+		const afterRestart = await import("./chat-service");
+		expect(
+			afterRestart.getChatOperationStatus(projectId, session.id, "main_restart_fence"),
+		).toEqual({ state: "unknown", operationId: "main_restart_fence" });
+		expect(afterRestart.selectSession(projectId, session.id)).toBeNull();
 	});
 });

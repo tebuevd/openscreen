@@ -490,6 +490,8 @@ describe("useProjectStore", () => {
 	});
 
 	it("reports a successful save as detached when the current document changes in flight", async () => {
+		const { clearHistory, undo } = await import("./undo");
+		clearHistory();
 		const pending = deferred<{ success: true; document: AxcutDocument }>();
 		bridgeMocks.save.mockReturnValue(pending.promise);
 		loadDocument();
@@ -504,6 +506,7 @@ describe("useProjectStore", () => {
 			...sampleDoc,
 			project: { ...sampleDoc.project, title: "Newer local edit" },
 		});
+		await Promise.resolve();
 
 		pending.resolve({ success: true, document: resultDocument });
 		await expect(applying).resolves.toEqual({
@@ -515,6 +518,9 @@ describe("useProjectStore", () => {
 			document: { project: { title: "Newer local edit" } },
 			dirty: true,
 		});
+		expect(undo()).toBe(true);
+		expect(useProjectStore.getState().document?.project.title).toBe("Test");
+		expect(undo()).toBe(false);
 	});
 
 	it("refuses a full-document result after the expected revision changes", async () => {

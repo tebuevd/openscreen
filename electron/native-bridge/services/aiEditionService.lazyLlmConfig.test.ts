@@ -44,7 +44,6 @@ function serviceWithCountingFactory(): { service: AiEditionService; builds: () =
 			state: "persisting" as const,
 			kind: "chat" as const,
 			operationId: "operation",
-			expiresAt: Date.now() + 60_000,
 		}),
 	} as unknown as AiEditionServiceOptions;
 	return { service: new AiEditionService(options), builds: () => builds };
@@ -70,7 +69,7 @@ describe("AiEditionService — LLM store resolution is deferred", () => {
 		expect(service.chatOperationStatus("project", "session", "operation")).toMatchObject({
 			state: "persisting",
 		});
-		expect(service.chatResolvePersistence("project", "session", "operation")).toEqual({
+		expect(service.chatResolvePersistence("project", "session", "operation", "failed")).toEqual({
 			success: true,
 		});
 		expect(builds()).toBe(0);
