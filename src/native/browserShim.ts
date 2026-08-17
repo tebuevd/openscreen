@@ -306,6 +306,7 @@ function createShimBridgeClient() {
 		createdAt: string;
 		messages: Array<{ id: string; role: "user" | "assistant"; content: string; createdAt: string }>;
 		revision: number;
+		pendingComposerRestoration?: { prompt: string; revision: number };
 	};
 	const chatStorageKey = "browser-shim-chat-v1";
 	const terminalOperationStorageKey = "browser-shim-chat-operations-v1";
@@ -709,6 +710,7 @@ function createShimBridgeClient() {
 					}
 				} else {
 					s.messages.push(...stagedMessages);
+					delete s.pendingComposerRestoration;
 					s.revision++;
 					persistChat();
 				}
@@ -739,6 +741,7 @@ function createShimBridgeClient() {
 					return Promise.resolve({ success: false, error: "Chat operation is stale." });
 				}
 				session.messages.push(...pending.messages);
+				delete session.pendingComposerRestoration;
 				session.revision++;
 				const result = {
 					success: true as const,
@@ -923,6 +926,7 @@ function createShimBridgeClient() {
 					createdAt: new Date().toISOString(),
 				};
 				s.messages.push(assistantMessage);
+				delete s.pendingComposerRestoration;
 				s.revision++;
 				persistChat();
 				return Promise.resolve({ success: true, assistantMessage });
@@ -944,6 +948,7 @@ function createShimBridgeClient() {
 				if (m) {
 					for (const s of m.values()) {
 						s.messages = [];
+						delete s.pendingComposerRestoration;
 						s.revision++;
 					}
 				}
@@ -972,7 +977,38 @@ function createShimBridgeClient() {
 			},
 			chatSelectSession: (projectId: string, sessionId: string) => {
 				const s = sessionsByProject.get(projectId)?.get(sessionId);
-				return Promise.resolve(s ? { ...s, messages: [...s.messages] } : null);
+				return Promise.resolve(
+					s
+						? {
+								...s,
+								messages: [...s.messages],
+								...(s.pendingComposerRestoration
+									? { pendingComposerRestoration: { ...s.pendingComposerRestoration } }
+									: {}),
+							}
+						: null,
+				);
+			},
+			chatAcknowledgeComposerRestoration: (
+				projectId: string,
+				sessionId: string,
+				revision: number,
+			) => {
+				const session = sessionsByProject.get(projectId)?.get(sessionId);
+				if (!session) {
+					return Promise.resolve({ success: false as const, error: "Chat session not found." });
+				}
+				const pending = session.pendingComposerRestoration;
+				if (!pending) return Promise.resolve({ success: true as const, acknowledged: false });
+				if (pending.revision !== revision) {
+					return Promise.resolve({
+						success: false as const,
+						error: "Composer restoration revision is no longer current.",
+					});
+				}
+				delete session.pendingComposerRestoration;
+				persistChat();
+				return Promise.resolve({ success: true as const, acknowledged: true });
 			},
 			chatRenameSession: (projectId: string, sessionId: string, title: string) => {
 				const s = sessionsByProject.get(projectId)?.get(sessionId);
@@ -981,6 +1017,7 @@ function createShimBridgeClient() {
 				const trimmed = title.trim();
 				if (trimmed && trimmed !== s.title) {
 					s.title = trimmed;
+					delete s.pendingComposerRestoration;
 					s.revision++;
 				}
 				persistChat();

@@ -353,6 +353,15 @@ export type AiEditionChatRewindCommitResult =
 	  }
 	| { success: false; error: string };
 
+export interface AiEditionChatComposerRestoration {
+	prompt: string;
+	revision: number;
+}
+
+export type AiEditionChatComposerRestorationAckResult =
+	| { success: true; acknowledged: boolean }
+	| { success: false; error: string };
+
 export type AiEditionChatOperationStatus =
 	| {
 			state: "running" | "prepared" | "persisting" | "reconciling";
@@ -403,6 +412,7 @@ export interface AiEditionChatSession {
 	createdAt: string;
 	messages: AiEditionChatMessage[];
 	revision: number;
+	pendingComposerRestoration?: AiEditionChatComposerRestoration;
 }
 
 export interface AiEditionChatBudget {
@@ -706,6 +716,12 @@ export type NativeBridgeRequest =
 			domain: "aiEdition";
 			action: "chat.selectSession";
 			payload: { projectId: string; sessionId: string };
+			requestId?: string;
+	  }
+	| {
+			domain: "aiEdition";
+			action: "chat.composerRestoration.acknowledge";
+			payload: { projectId: string; sessionId: string; revision: number };
 			requestId?: string;
 	  }
 	| {

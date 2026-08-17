@@ -19,6 +19,8 @@ import {
 } from "../../src/lib/ai-edition/schema";
 import type {
 	AiEditionChatCommitResult,
+	AiEditionChatComposerRestoration,
+	AiEditionChatComposerRestorationAckResult,
 	AiEditionChatMessage,
 	AiEditionChatOperationStatus,
 	AiEditionChatPersistenceResolution,
@@ -643,6 +645,7 @@ export interface ChatSession {
 	messages: AiEditionChatMessage[];
 	/** Monotonic identity for destructive message/checkpoint mutations. */
 	revision: number;
+	pendingComposerRestoration?: AiEditionChatComposerRestoration;
 	/** Main-process bookkeeping: the compaction boundary, not part of the
 	 *  transcript. See `modelMessages`. */
 	compaction?: SessionCompaction;
@@ -747,7 +750,26 @@ export function selectSession(projectId: string, sessionId: string): ChatSession
 		createdAt: s.createdAt,
 		messages: [...s.messages],
 		revision: s.revision,
+		...(s.pendingComposerRestoration
+			? { pendingComposerRestoration: { ...s.pendingComposerRestoration } }
+			: {}),
 	};
+}
+
+export function acknowledgeComposerRestoration(
+	projectId: string,
+	sessionId: string,
+	revision: number,
+): AiEditionChatComposerRestorationAckResult {
+	const session = sessionsByProject.get(projectId)?.get(sessionId);
+	if (!session) return { success: false, error: "Chat session not found." };
+	const pending = session.pendingComposerRestoration;
+	if (!pending) return { success: true, acknowledged: false };
+	if (pending.revision !== revision) {
+		return { success: false, error: "Composer restoration revision is no longer current." };
+	}
+	delete session.pendingComposerRestoration;
+	return { success: true, acknowledged: true };
 }
 
 export function renameSession(
@@ -762,6 +784,7 @@ export function renameSession(
 	const trimmed = title.trim();
 	if (trimmed && trimmed !== s.title) {
 		s.title = trimmed;
+		delete s.pendingComposerRestoration;
 		s.revision++;
 	}
 	return toSummary(s);
@@ -1067,6 +1090,7 @@ export function commitChatRun(
 		recordMessageCheckpoint(projectId, sessionId, pending.userMessage.id, pending.checkpoint);
 	}
 	session.messages.push(cloneMessage(pending.userMessage), cloneMessage(pending.assistantMessage));
+	delete session.pendingComposerRestoration;
 	session.revision++;
 	const result: Extract<AiEditionChatCommitResult, { success: true }> = {
 		success: true,
@@ -1263,6 +1287,10 @@ export function commitRewindToMessage(
 	}
 	dropCheckpointsFrom(projectId, sessionId, target.checkpointId);
 	session.revision++;
+	session.pendingComposerRestoration = {
+		prompt: prepared.prompt,
+		revision: session.revision,
+	};
 	const result: Extract<AiEditionChatRewindCommitResult, { success: true }> = {
 		success: true,
 		prompt: prepared.prompt,
@@ -1387,6 +1415,7 @@ export async function runTimelineOperation(
 			createdAt: new Date().toISOString(),
 		};
 		session.messages.push(assistantMessage);
+		delete session.pendingComposerRestoration;
 		session.revision++;
 	}
 
@@ -1625,6 +1654,7 @@ async function tryCompactSession(opts: {
 		return null;
 	}
 	session.compaction = { summary: summaryMessage, coveredCount: plan.coveredCount };
+	delete session.pendingComposerRestoration;
 	session.revision++;
 	return {
 		summaryMessageId: summaryMessage.id,

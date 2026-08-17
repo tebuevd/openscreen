@@ -44,6 +44,7 @@ import type {
 import {
 	abortChatRun,
 	abortRewindToMessage,
+	acknowledgeComposerRestoration,
 	beginChatOperationPersistence,
 	commitChatRun,
 	commitRewindToMessage,
@@ -4165,6 +4166,7 @@ export function registerIpcHandlers(
 		listAiEditionChatSessions: (projectId) => listSessions(projectId),
 		createAiEditionChatSession: (projectId, title) => createSession(projectId, title),
 		selectAiEditionChatSession: (projectId, sessionId) => selectSession(projectId, sessionId),
+		acknowledgeAiEditionComposerRestoration: acknowledgeComposerRestoration,
 		renameAiEditionChatSession: (projectId, sessionId, title) =>
 			renameSession(projectId, sessionId, title),
 		deleteAiEditionChatSession: (projectId, sessionId) => deleteSession(projectId, sessionId),

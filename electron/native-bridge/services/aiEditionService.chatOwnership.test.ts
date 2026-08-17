@@ -44,6 +44,10 @@ function serviceOptions(overrides: Partial<AiEditionServiceOptions> = {}): AiEdi
 			messageCount: 0,
 		})),
 		selectSession: vi.fn(() => null),
+		acknowledgeComposerRestoration: vi.fn(() => ({
+			success: true as const,
+			acknowledged: true,
+		})),
 		renameSession: vi.fn(() => null),
 		deleteSession: vi.fn(() => false),
 		...overrides,
@@ -64,6 +68,7 @@ describe("AiEditionService chat document ownership", () => {
 		service.chatPrepareRewind("project", "session", "message", owner);
 		service.chatCommitRewind("project", "session", "rewind", 3, owner);
 		service.chatAbortRewind("project", "session", "rewind", owner);
+		service.chatAcknowledgeComposerRestoration("project", "session", 4);
 
 		expect(options.runChat).toHaveBeenCalledWith(
 			"project",
@@ -108,6 +113,7 @@ describe("AiEditionService chat document ownership", () => {
 			"rewind",
 			owner,
 		);
+		expect(options.acknowledgeComposerRestoration).toHaveBeenCalledWith("project", "session", 4);
 	});
 
 	it("triggers reconciliation without blocking replacement status and session reads", async () => {

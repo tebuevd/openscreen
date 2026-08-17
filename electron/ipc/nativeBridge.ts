@@ -156,6 +156,11 @@ export interface NativeBridgeContext {
 		projectId: string,
 		sessionId: string,
 	) => import("../../src/native/contracts").AiEditionChatSession | null;
+	acknowledgeAiEditionComposerRestoration: (
+		projectId: string,
+		sessionId: string,
+		revision: number,
+	) => import("../../src/native/contracts").AiEditionChatComposerRestorationAckResult;
 	renameAiEditionChatSession: (
 		projectId: string,
 		sessionId: string,
@@ -311,6 +316,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		listSessions: context.listAiEditionChatSessions,
 		createSession: context.createAiEditionChatSession,
 		selectSession: context.selectAiEditionChatSession,
+		acknowledgeComposerRestoration: context.acknowledgeAiEditionComposerRestoration,
 		renameSession: context.renameAiEditionChatSession,
 		deleteSession: context.deleteAiEditionChatSession,
 	});
@@ -804,6 +810,15 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 								await aiEditionService.chatSelectSession(
 									request.payload.projectId,
 									request.payload.sessionId,
+								),
+							);
+						case "chat.composerRestoration.acknowledge":
+							return createSuccessResponse(
+								requestId,
+								aiEditionService.chatAcknowledgeComposerRestoration(
+									request.payload.projectId,
+									request.payload.sessionId,
+									request.payload.revision,
 								),
 							);
 						case "chat.renameSession":

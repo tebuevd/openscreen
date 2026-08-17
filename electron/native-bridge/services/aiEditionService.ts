@@ -5,6 +5,7 @@ import type {
 	AiEditionChatBudget,
 	AiEditionChatCommitResult,
 	AiEditionChatCompactResult,
+	AiEditionChatComposerRestorationAckResult,
 	AiEditionChatMessage,
 	AiEditionChatOperationResult,
 	AiEditionChatOperationStatus,
@@ -126,6 +127,11 @@ export interface AiEditionServiceOptions {
 	listSessions: (projectId: string) => AiEditionChatSessionSummary[];
 	createSession: (projectId: string, title?: string) => AiEditionChatSessionSummary;
 	selectSession: (projectId: string, sessionId: string) => AiEditionChatSession | null;
+	acknowledgeComposerRestoration: (
+		projectId: string,
+		sessionId: string,
+		revision: number,
+	) => AiEditionChatComposerRestorationAckResult;
 	renameSession: (
 		projectId: string,
 		sessionId: string,
@@ -455,6 +461,14 @@ export class AiEditionService {
 				console.warn("[ai-edition] could not request project reconciliation:", error),
 			);
 		return this.options.selectSession(projectId, sessionId);
+	}
+
+	chatAcknowledgeComposerRestoration(
+		projectId: string,
+		sessionId: string,
+		revision: number,
+	): AiEditionChatComposerRestorationAckResult {
+		return this.options.acknowledgeComposerRestoration(projectId, sessionId, revision);
 	}
 
 	chatRenameSession(

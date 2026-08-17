@@ -67,6 +67,59 @@ describe("browser chat operation shim", () => {
 		).toHaveLength(2);
 	});
 
+	it("replays and exactly acknowledges a persisted composer restoration", async () => {
+		localStorage.setItem(
+			"browser-shim-chat-v1",
+			JSON.stringify({
+				project: {
+					session: {
+						id: "session",
+						projectId: "project",
+						title: "Conversation",
+						createdAt: "2026-08-17T00:00:00.000Z",
+						messages: [],
+						revision: 7,
+						pendingComposerRestoration: { prompt: "restore me", revision: 7 },
+					},
+				},
+			}),
+		);
+		// biome-ignore lint/suspicious/noExplicitAny: test-only browser bridge reload
+		delete (window as any).electronAPI;
+		installBrowserShims();
+
+		expect(
+			await nativeBridgeClient.aiEdition.chatSelectSession("project", "session"),
+		).toMatchObject({
+			pendingComposerRestoration: { prompt: "restore me", revision: 7 },
+		});
+		expect(
+			await nativeBridgeClient.aiEdition.chatAcknowledgeComposerRestoration(
+				"project",
+				"session",
+				6,
+			),
+		).toMatchObject({ success: false });
+		expect(
+			await nativeBridgeClient.aiEdition.chatAcknowledgeComposerRestoration(
+				"project",
+				"session",
+				7,
+			),
+		).toEqual({ success: true, acknowledged: true });
+		expect(
+			await nativeBridgeClient.aiEdition.chatAcknowledgeComposerRestoration(
+				"project",
+				"session",
+				7,
+			),
+		).toEqual({ success: true, acknowledged: false });
+		expect(
+			(await nativeBridgeClient.aiEdition.chatSelectSession("project", "session"))
+				?.pendingComposerRestoration,
+		).toBeUndefined();
+	});
+
 	it("does not let foreign commit or abort calls consume another session's operation", async () => {
 		const session = await nativeBridgeClient.aiEdition.chatCreateSession("project");
 		await nativeBridgeClient.aiEdition.chatRun(

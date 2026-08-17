@@ -18,6 +18,7 @@ vi.mock("./deep-agent/service", () => ({
 import {
 	abortChatRun,
 	abortRewindToMessage,
+	acknowledgeComposerRestoration,
 	beginChatOperationPersistence,
 	type ChatDocumentAuthority,
 	commitChatRun,
@@ -324,9 +325,25 @@ describe("runChat tool loop", () => {
 			prepared.sessionRevision,
 		);
 		expect(committed.success).toBe(true);
+		if (!committed.success) return;
+		expect(selectSession("proj_rewind", session.id)).toMatchObject({
+			messages: expect.any(Array),
+			pendingComposerRestoration: {
+				prompt: "cut the silence",
+				revision: committed.sessionRevision,
+			},
+		});
+		expect(selectSession("proj_rewind", session.id)?.messages).toHaveLength(1);
 		expect(
-			(await import("./chat-service")).selectSession("proj_rewind", session.id)?.messages,
-		).toHaveLength(1);
+			acknowledgeComposerRestoration("proj_rewind", session.id, committed.sessionRevision - 1),
+		).toMatchObject({ success: false });
+		expect(
+			acknowledgeComposerRestoration("proj_rewind", session.id, committed.sessionRevision),
+		).toEqual({ success: true, acknowledged: true });
+		expect(
+			acknowledgeComposerRestoration("proj_rewind", session.id, committed.sessionRevision),
+		).toEqual({ success: true, acknowledged: false });
+		expect(selectSession("proj_rewind", session.id)?.pendingComposerRestoration).toBeUndefined();
 		expect(
 			commitRewindToMessage(
 				"proj_rewind",
@@ -346,6 +363,59 @@ describe("runChat tool loop", () => {
 				prepared.sessionRevision,
 			),
 		).toEqual(committed);
+		expect(selectSession("proj_rewind", session.id)?.pendingComposerRestoration).toBeUndefined();
+	});
+
+	it("does not let a stale or foreign acknowledgement clear a newer rewind prompt", async () => {
+		const projectId = "proj_rewind_ack_revision";
+		const document = projectDocument(projectId, "Rewind ack revision");
+		const session = createSession(projectId);
+		await runChat(projectId, session.id, "first restored prompt", stubConfig(), document);
+		const firstTarget = selectSession(projectId, session.id)!.messages[0];
+		const firstPrepared = prepareRewindToMessage(projectId, session.id, firstTarget.id);
+		expect(firstPrepared.success).toBe(true);
+		if (!firstPrepared.success) return;
+		beginChatOperationPersistence(projectId, session.id, firstPrepared.operationId);
+		const firstCommit = commitRewindToMessage(
+			projectId,
+			session.id,
+			firstPrepared.operationId,
+			firstPrepared.sessionRevision,
+		);
+		expect(firstCommit.success).toBe(true);
+		if (!firstCommit.success) return;
+
+		await runChat(projectId, session.id, "newer restored prompt", stubConfig(), document);
+		expect(selectSession(projectId, session.id)?.pendingComposerRestoration).toBeUndefined();
+		const secondTarget = [...selectSession(projectId, session.id)!.messages]
+			.reverse()
+			.find((message) => message.role === "user")!;
+		const secondPrepared = prepareRewindToMessage(projectId, session.id, secondTarget.id);
+		expect(secondPrepared.success).toBe(true);
+		if (!secondPrepared.success) return;
+		beginChatOperationPersistence(projectId, session.id, secondPrepared.operationId);
+		const secondCommit = commitRewindToMessage(
+			projectId,
+			session.id,
+			secondPrepared.operationId,
+			secondPrepared.sessionRevision,
+		);
+		expect(secondCommit.success).toBe(true);
+		if (!secondCommit.success) return;
+
+		expect(
+			acknowledgeComposerRestoration(projectId, session.id, firstCommit.sessionRevision),
+		).toMatchObject({ success: false });
+		expect(
+			acknowledgeComposerRestoration(projectId, "foreign-session", secondCommit.sessionRevision),
+		).toMatchObject({ success: false });
+		expect(selectSession(projectId, session.id)?.pendingComposerRestoration).toEqual({
+			prompt: "newer restored prompt",
+			revision: secondCommit.sessionRevision,
+		});
+		expect(
+			acknowledgeComposerRestoration(projectId, session.id, secondCommit.sessionRevision),
+		).toEqual({ success: true, acknowledged: true });
 	});
 
 	it("keeps persistence valid while renderer timers are suspended beyond five minutes", async () => {
@@ -887,6 +957,8 @@ describe("runChat tool loop", () => {
 		).toEqual({
 			success: true,
 		});
+		const updates: unknown[] = [];
+		const unsubscribe = subscribeChatSessionUpdates((update) => updates.push(update));
 
 		await handleChatOperationOwnerTeardown(owner, {
 			getProject: vi.fn(async () => prepared.document as AxcutDocument),
@@ -896,7 +968,24 @@ describe("runChat tool loop", () => {
 			state: "committed",
 			kind: "rewind",
 		});
-		expect(selectSession(projectId, session.id)?.messages).toEqual(prepared.messages);
+		const restoredSession = selectSession(projectId, session.id);
+		expect(restoredSession?.messages).toEqual(prepared.messages);
+		expect(restoredSession?.pendingComposerRestoration).toEqual({
+			prompt: prepared.prompt,
+			revision: restoredSession?.revision,
+		});
+		expect(updates).toEqual([
+			expect.objectContaining({
+				projectId,
+				sessionId: session.id,
+				kind: "rewind",
+				prompt: prepared.prompt,
+			}),
+		]);
+		expect(
+			acknowledgeComposerRestoration(projectId, session.id, restoredSession!.revision),
+		).toEqual({ success: true, acknowledged: true });
+		unsubscribe();
 	});
 
 	it("expires abandoned running and prepared operations without renderer renewal", async () => {

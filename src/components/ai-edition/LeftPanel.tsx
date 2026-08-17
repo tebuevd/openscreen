@@ -887,6 +887,7 @@ function ChatStripPanel() {
 	activeSessionIdRef.current = activeSessionId;
 	const sessionRevisionRef = useRef(new Map<string, number>());
 	const appliedSessionUpdatesRef = useRef(new Set<string>());
+	const appliedComposerRestorationsRef = useRef(new Map<string, number>());
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	// ponytail: live reasoning trace for the in-flight turn. Reset at send()
 	// start; deltas append through the chat-event subscription; once the run
@@ -962,6 +963,36 @@ function ChatStripPanel() {
 		void refreshLlm();
 	}, [refreshLlm]);
 
+	const applyComposerRestoration = useCallback(
+		(projectId: string, sessionId: string, revision: number, prompt: string) => {
+			const current = useProjectStore.getState();
+			if (
+				current.projectId !== projectId ||
+				activeSessionIdRef.current !== sessionId ||
+				sessionRevisionRef.current.get(sessionId) !== revision
+			) {
+				return;
+			}
+			const key = `${projectId}::${sessionId}`;
+			if (appliedComposerRestorationsRef.current.get(key) === revision) return;
+			appliedComposerRestorationsRef.current.set(key, revision);
+			setInput(prompt);
+			void nativeBridgeClient.aiEdition
+				.chatAcknowledgeComposerRestoration(projectId, sessionId, revision)
+				.then((result) => {
+					if (!result.success && appliedComposerRestorationsRef.current.get(key) === revision) {
+						appliedComposerRestorationsRef.current.delete(key);
+					}
+				})
+				.catch(() => {
+					if (appliedComposerRestorationsRef.current.get(key) === revision) {
+						appliedComposerRestorationsRef.current.delete(key);
+					}
+				});
+		},
+		[],
+	);
+
 	// ponytail: subscribe to streamed chat events so the reasoning trace (and
 	// any future streaming text deltas) lands live instead of arriving all at
 	// once when chatRun resolves. We only act on `thinking` here — text deltas
@@ -1010,10 +1041,12 @@ function ChatStripPanel() {
 							: session,
 					),
 				);
-				if (event.kind === "rewind" && event.prompt !== undefined) setInput(event.prompt);
+				if (event.kind === "rewind" && event.prompt !== undefined) {
+					applyComposerRestoration(event.projectId, event.sessionId, event.revision, event.prompt);
+				}
 			},
 		);
-	}, [projectId, documentGeneration]);
+	}, [projectId, documentGeneration, applyComposerRestoration]);
 
 	useEffect(() => {
 		mountedRef.current = true;
@@ -1053,6 +1086,7 @@ function ChatStripPanel() {
 		thinkingRunSessionRef.current = null;
 		sessionRevisionRef.current.clear();
 		appliedSessionUpdatesRef.current.clear();
+		appliedComposerRestorationsRef.current.clear();
 		thinkingTextRef.current = "";
 		setThinkingText("");
 		if (!projectId) {
@@ -1091,6 +1125,15 @@ function ChatStripPanel() {
 					if (session.revision < knownRevision) return;
 					sessionRevisionRef.current.set(activeSessionId, session.revision);
 					setMessages(toDisplayMessages(session.messages));
+					const restoration = session.pendingComposerRestoration;
+					if (restoration?.revision === session.revision) {
+						applyComposerRestoration(
+							projectId,
+							activeSessionId,
+							restoration.revision,
+							restoration.prompt,
+						);
+					}
 				} else {
 					setMessages([]);
 				}
@@ -1101,7 +1144,7 @@ function ChatStripPanel() {
 		return () => {
 			cancelled = true;
 		};
-	}, [projectId, documentGeneration, activeSessionId]);
+	}, [projectId, documentGeneration, activeSessionId, applyComposerRestoration]);
 
 	useEffect(() => {
 		scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" });
@@ -1634,7 +1677,12 @@ function ChatStripPanel() {
 					sessionRevisionRef.current.set(activeSessionId, resolution.result.sessionRevision);
 					rememberAppliedSessionUpdate(appliedSessionUpdatesRef.current, prepared.operationId);
 					setMessages(toDisplayMessages(resolution.result.messages));
-					setInput(resolution.result.prompt);
+					applyComposerRestoration(
+						projectId,
+						activeSessionId,
+						resolution.result.sessionRevision,
+						resolution.result.prompt,
+					);
 					toast.success(t("chat.rewoundSuccess"));
 				}
 			} catch (err) {
@@ -1655,7 +1703,16 @@ function ChatStripPanel() {
 				}
 			}
 		},
-		[projectId, activeSessionId, busy, rewindBusy, applyAgentDocument, showStaleDocumentResult, t],
+		[
+			projectId,
+			activeSessionId,
+			busy,
+			rewindBusy,
+			applyAgentDocument,
+			applyComposerRestoration,
+			showStaleDocumentResult,
+			t,
+		],
 	);
 
 	useEffect(() => {
