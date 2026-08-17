@@ -1017,7 +1017,7 @@ export function useTimeline() {
 	// on user edits. Also persists the duration back onto the asset so
 	// subsequent inserts use the cached value without re-probing.
 	const probeAndCorrectClip = useCallback(
-		async (identity: InsertClipProbeIdentity, insertionSave: Promise<void>) => {
+		async (identity: InsertClipProbeIdentity, insertionSave: Promise<unknown>) => {
 			const { projectId, documentGeneration, assetId, clipId, originalPath } = identity;
 			const attemptKey = JSON.stringify([documentGeneration, projectId, assetId, clipId]);
 			const previousAttempt = insertClipProbeAttemptsRef.current.get(attemptKey);

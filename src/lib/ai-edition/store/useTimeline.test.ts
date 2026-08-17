@@ -875,7 +875,7 @@ describe("useTimeline backfills missing source dimensions on load", () => {
 		renderTimeline();
 		await waitFor(() => expect(probeVideoDimensionsMock).toHaveBeenCalledTimes(1));
 
-		let unrelatedSave!: Promise<void>;
+		let unrelatedSave!: Promise<unknown>;
 		act(() => {
 			const current = useProjectStore.getState().document!;
 			unrelatedSave = useProjectStore.getState().saveDocument({
@@ -918,7 +918,7 @@ describe("useTimeline backfills missing source dimensions on load", () => {
 		renderTimeline();
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
 
-		let laterSave!: Promise<void>;
+		let laterSave!: Promise<unknown>;
 		act(() => {
 			const current = useProjectStore.getState().document!;
 			laterSave = useProjectStore.getState().saveDocument({

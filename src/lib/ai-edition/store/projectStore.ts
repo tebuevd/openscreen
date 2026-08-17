@@ -30,6 +30,31 @@ export type DocumentResultApplyOutcome =
 	| { success: false; status: "stale" }
 	| { success: false; status: "diverged"; error: string };
 
+// Every resolved outcome represents a validated disk write. A detached write is
+// not enough for destructive navigation because a newer generation/revision remains in memory.
+export type DocumentSaveOutcome =
+	| {
+			status: "saved";
+			appliedToCurrent: true;
+			projectId: string;
+			documentGeneration: number;
+			revision: number;
+	  }
+	| {
+			status: "persisted-detached";
+			appliedToCurrent: false;
+			projectId: string;
+			documentGeneration: number;
+			revision: number;
+	  };
+
+export class DocumentSaveError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "DocumentSaveError";
+	}
+}
+
 // Monotonic identity for one loaded document instance. A project can be opened,
 // replaced, then opened again with the same id; project id alone cannot distinguish them.
 let nextDocumentGeneration = 0;
@@ -61,6 +86,17 @@ async function persistDocument(document: AxcutDocument): Promise<AxcutDocument> 
 	return parseDocument(result.document);
 }
 
+function assertMatchingSaveResponse(intended: AxcutDocument, persisted: AxcutDocument): void {
+	if (persisted.project.id !== intended.project.id) {
+		throw new DocumentSaveError(
+			`Saved project response belongs to ${persisted.project.id}, expected ${intended.project.id}`,
+		);
+	}
+	if (!documentsHaveEquivalentSaveContent(persisted, intended)) {
+		throw new DocumentSaveError("Saved project response differs from the requested document");
+	}
+}
+
 export interface ProjectState {
 	projectId: string | null;
 	document: AxcutDocument | null;
@@ -88,7 +124,8 @@ export interface ProjectState {
 	refresh: () => Promise<void>;
 	addAsset: (path: string, label?: string) => Promise<AxcutAsset | null>;
 	removeAsset: (assetId: string) => Promise<void>;
-	saveDocument: (document: AxcutDocument) => Promise<void>;
+	saveDocument: (document: AxcutDocument) => Promise<DocumentSaveOutcome>;
+	saveRecoveryDocument: () => Promise<Extract<DocumentSaveOutcome, { appliedToCurrent: true }>>;
 	saveDocumentUpdate: (
 		documentGeneration: number,
 		update: (document: AxcutDocument) => AxcutDocument | null,
@@ -526,12 +563,17 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	async saveDocument(document) {
 		const state = get();
 		const documentGeneration = state.documentGeneration;
+		if (!state.projectId || !state.document) {
+			throw new DocumentSaveError("No project document is loaded");
+		}
+		if (state.status !== "ready") {
+			throw new DocumentSaveError(`Cannot save a project while its status is ${state.status}`);
+		}
 		if (
-			state.status !== "ready" ||
 			state.projectId !== document.project.id ||
-			state.document?.project.id !== document.project.id
+			state.document.project.id !== document.project.id
 		) {
-			return;
+			throw new DocumentSaveError("Cannot save a document that is not the active project");
 		}
 
 		// Publish direct snapshot mutations before waiting. Callers that already used
@@ -540,7 +582,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			set({ document, revision: state.revision + 1, dirty: true });
 		}
 
-		await enqueueSave(documentGeneration, async () => {
+		return enqueueSave(documentGeneration, async () => {
 			const before = get();
 			if (
 				before.documentGeneration !== documentGeneration ||
@@ -548,24 +590,108 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				before.projectId !== document.project.id ||
 				!before.document
 			) {
-				return;
+				throw new DocumentSaveError("The project changed before its save could start");
 			}
 			const revision = before.revision;
-			const parsed = await persistDocument(before.document);
+			const intended = parseDocument(structuredClone(before.document));
+			const parsed = await persistDocument(intended);
+			assertMatchingSaveResponse(intended, parsed);
 			const current = get();
 			if (
 				current.documentGeneration !== documentGeneration ||
 				current.projectId !== document.project.id ||
-				current.revision !== revision
+				current.revision !== revision ||
+				current.status !== "ready" ||
+				!current.document ||
+				!documentsHaveEquivalentSaveContent(current.document, intended)
 			) {
-				return;
+				return {
+					status: "persisted-detached",
+					appliedToCurrent: false,
+					projectId: intended.project.id,
+					documentGeneration,
+					revision,
+				};
 			}
+			const savedRevision = revision + 1;
 			set({
 				document: parsed,
-				revision: revision + 1,
+				revision: savedRevision,
+				error: null,
 				dirty: false,
 				lastSavedAt: new Date(),
 			});
+			return {
+				status: "saved",
+				appliedToCurrent: true,
+				projectId: intended.project.id,
+				documentGeneration,
+				revision: savedRevision,
+			};
+		});
+	},
+
+	async saveRecoveryDocument() {
+		const state = get();
+		if (!state.projectId || !state.document) {
+			throw new DocumentSaveError("No recovery document is loaded");
+		}
+		if (state.status !== "error" || !state.dirty) {
+			throw new DocumentSaveError("The active project is not a dirty recovery document");
+		}
+		if (state.document.project.id !== state.projectId) {
+			throw new DocumentSaveError("The recovery document is not the active project");
+		}
+
+		const projectId = state.projectId;
+		const documentGeneration = state.documentGeneration;
+		const revision = state.revision;
+		const intended = parseDocument(structuredClone(state.document));
+		return enqueueSave(documentGeneration, async () => {
+			const before = get();
+			if (
+				before.documentGeneration !== documentGeneration ||
+				before.revision !== revision ||
+				before.projectId !== projectId ||
+				before.status !== "error" ||
+				!before.dirty ||
+				!before.document ||
+				!documentsHaveEquivalentSaveContent(before.document, intended)
+			) {
+				throw new DocumentSaveError("The recovery document changed before its save could start");
+			}
+
+			const parsed = await persistDocument(intended);
+			assertMatchingSaveResponse(intended, parsed);
+			const current = get();
+			if (
+				current.documentGeneration !== documentGeneration ||
+				current.revision !== revision ||
+				current.projectId !== projectId ||
+				current.status !== "error" ||
+				!current.dirty ||
+				!current.document ||
+				!documentsHaveEquivalentSaveContent(current.document, intended)
+			) {
+				throw new DocumentSaveError("The recovery document changed while it was being saved");
+			}
+
+			const savedRevision = revision + 1;
+			set({
+				document: parsed,
+				revision: savedRevision,
+				status: "ready",
+				error: null,
+				dirty: false,
+				lastSavedAt: new Date(),
+			});
+			return {
+				status: "saved",
+				appliedToCurrent: true,
+				projectId,
+				documentGeneration,
+				revision: savedRevision,
+			};
 		});
 	},
 

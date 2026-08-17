@@ -50,6 +50,15 @@ function loadDocument(document: AxcutDocument) {
 	});
 }
 
+function loadRecoveryDocument(document: AxcutDocument) {
+	loadDocument(document);
+	useProjectStore.setState({
+		status: "error",
+		error: "Lifecycle reconciliation failed",
+		dirty: true,
+	});
+}
+
 function connectDocumentService(service: DocumentService) {
 	bridgeMocks.get.mockImplementation(async (projectId: string) => {
 		try {
@@ -288,6 +297,131 @@ describe("project lifecycle failure reconciliation", () => {
 		});
 		expect(useProjectStore.getState().error).toContain("delete failed");
 		expect(useProjectStore.getState().error).toContain("read failed");
+	});
+
+	it("explicitly saves a dirty recovery document and makes the response authoritative", async () => {
+		const local = createEmptyDocument({ projectId: "proj_recovery_save", title: "Local recovery" });
+		const persisted = {
+			...local,
+			project: { ...local.project, updatedAt: "2026-08-17T12:00:00.000Z" },
+		};
+		loadRecoveryDocument(local);
+		const before = useProjectStore.getState();
+		bridgeMocks.save.mockResolvedValue({ success: true, document: persisted });
+
+		await expect(useProjectStore.getState().saveRecoveryDocument()).resolves.toEqual({
+			status: "saved",
+			appliedToCurrent: true,
+			projectId: local.project.id,
+			documentGeneration: before.documentGeneration,
+			revision: before.revision + 1,
+		});
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(bridgeMocks.save).toHaveBeenCalledWith(local);
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: local.project.id,
+			document: persisted,
+			documentGeneration: before.documentGeneration,
+			revision: before.revision + 1,
+			status: "ready",
+			error: null,
+			dirty: false,
+		});
+	});
+
+	it.each([
+		{
+			name: "a rejected save",
+			response: { success: false, error: "disk full" },
+		},
+		{
+			name: "an ambiguous response",
+			response: { success: true },
+		},
+		{
+			name: "a different authoritative response",
+			response: {
+				success: true,
+				document: createEmptyDocument({
+					projectId: "proj_recovery_failure",
+					title: "Different document",
+				}),
+			},
+		},
+	])("preserves recovery data after $name", async ({ response }) => {
+		const local = createEmptyDocument({
+			projectId: "proj_recovery_failure",
+			title: "Only recovery copy",
+		});
+		loadRecoveryDocument(local);
+		bridgeMocks.save.mockResolvedValue(response);
+
+		await expect(useProjectStore.getState().saveRecoveryDocument()).rejects.toThrow();
+
+		expect(bridgeMocks.save).toHaveBeenCalledWith(local);
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: local.project.id,
+			document: local,
+			status: "error",
+			error: "Lifecycle reconciliation failed",
+			dirty: true,
+		});
+	});
+
+	it("preserves a concurrent edit while a recovery save is pending", async () => {
+		const local = createEmptyDocument({ projectId: "proj_recovery_edit", title: "Recovery" });
+		const pending = deferred<{ success: true; document: AxcutDocument }>();
+		loadRecoveryDocument(local);
+		bridgeMocks.save.mockReturnValue(pending.promise);
+
+		const saving = useProjectStore.getState().saveRecoveryDocument();
+		const refused = expect(saving).rejects.toThrow("changed while it was being saved");
+		await vi.waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(local));
+		const edited = {
+			...local,
+			project: { ...local.project, title: "Newer recovery edit" },
+		};
+		useProjectStore.getState().setDocument(edited);
+		pending.resolve({ success: true, document: local });
+
+		await refused;
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: local.project.id,
+			document: edited,
+			status: "error",
+			error: "Lifecycle reconciliation failed",
+			dirty: true,
+		});
+	});
+
+	it("does not install a recovery response over a same-id import", async () => {
+		const local = createEmptyDocument({ projectId: "proj_recovery_import", title: "Recovery" });
+		const imported = {
+			...local,
+			project: { ...local.project, title: "Imported replacement" },
+		};
+		const recoveryResponse = deferred<{ success: true; document: AxcutDocument }>();
+		loadRecoveryDocument(local);
+		bridgeMocks.save
+			.mockReturnValueOnce(recoveryResponse.promise)
+			.mockResolvedValueOnce({ success: true, document: imported });
+
+		const recoverySave = useProjectStore.getState().saveRecoveryDocument();
+		const refused = expect(recoverySave).rejects.toThrow("changed while it was being saved");
+		await vi.waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(local));
+		await expect(useProjectStore.getState().importProject(imported)).resolves.toBe(true);
+		recoveryResponse.resolve({ success: true, document: local });
+
+		await refused;
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(2);
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: local.project.id,
+			document: imported,
+			status: "ready",
+			error: null,
+			dirty: false,
+		});
 	});
 
 	it("ignores stale recovery after another project opens", async () => {

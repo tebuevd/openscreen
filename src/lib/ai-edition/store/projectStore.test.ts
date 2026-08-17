@@ -175,6 +175,24 @@ describe("useProjectStore", () => {
 		expect(state.error).toBe("not found");
 	});
 
+	it("rejects ordinary saves instead of resolving when no write can start", async () => {
+		await expect(useProjectStore.getState().saveDocument(sampleDoc)).rejects.toThrow(
+			"No project document is loaded",
+		);
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+
+		loadDocument();
+		useProjectStore.setState({ status: "loading" });
+		await expect(useProjectStore.getState().saveDocument(sampleDoc)).rejects.toThrow(
+			"status is loading",
+		);
+		useProjectStore.setState({ status: "error", error: "reconciliation failed", dirty: true });
+		await expect(useProjectStore.getState().saveDocument(sampleDoc)).rejects.toThrow(
+			"status is error",
+		);
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+	});
+
 	it("makes a same-id import authoritative over saves queued by the old generation", async () => {
 		const oldSave = deferred<{ success: true; document: AxcutDocument }>();
 		const importSave = deferred<{ success: true; document: AxcutDocument }>();
@@ -195,6 +213,9 @@ describe("useProjectStore", () => {
 			...useProjectStore.getState().document!,
 			project: { ...sampleDoc.project, title: "Old queued save" },
 		});
+		const queuedRefusal = expect(queuedSaving).rejects.toThrow(
+			"changed before its save could start",
+		);
 		const imported: AxcutDocument = {
 			...sampleDoc,
 			project: { ...sampleDoc.project, title: "Imported A" },
@@ -208,7 +229,7 @@ describe("useProjectStore", () => {
 
 		oldSave.resolve({ success: true, document: snapshots[0] });
 		await firstSaving;
-		await queuedSaving;
+		await queuedRefusal;
 		expect(bridgeMocks.save).toHaveBeenCalledTimes(2);
 
 		importSave.resolve({ success: true, document: imported });
@@ -288,6 +309,9 @@ describe("useProjectStore", () => {
 			...useProjectStore.getState().document!,
 			project: { ...sampleDoc.project, title: "Must not recreate" },
 		});
+		const queuedRefusal = expect(queuedSaving).rejects.toThrow(
+			"changed before its save could start",
+		);
 
 		const deletion = useProjectStore.getState().deleteProject("proj_test");
 		expect(bridgeMocks.delete).toHaveBeenCalledWith("proj_test");
@@ -296,7 +320,7 @@ describe("useProjectStore", () => {
 
 		oldSave.resolve({ success: true, document: snapshot! });
 		await firstSaving;
-		await queuedSaving;
+		await queuedRefusal;
 		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
 
 		deleting.resolve({ success: true });
@@ -378,7 +402,10 @@ describe("useProjectStore", () => {
 		});
 
 		firstSave.resolve({ success: true, document: snapshots[0] });
-		await firstPromise;
+		await expect(firstPromise).resolves.toMatchObject({
+			status: "persisted-detached",
+			appliedToCurrent: false,
+		});
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(2));
 		expect(snapshots[1].project.title).toBe("Second edit");
 		expect(useProjectStore.getState()).toMatchObject({
@@ -387,7 +414,10 @@ describe("useProjectStore", () => {
 		});
 
 		secondSave.resolve({ success: true, document: snapshots[1] });
-		await secondPromise;
+		await expect(secondPromise).resolves.toMatchObject({
+			status: "saved",
+			appliedToCurrent: true,
+		});
 		expect(useProjectStore.getState()).toMatchObject({
 			document: { project: { title: "Second edit" } },
 			dirty: false,

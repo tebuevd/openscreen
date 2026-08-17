@@ -13,7 +13,7 @@ import {
 	replaceTimeline as replaceTimelineOp,
 } from "@/lib/ai-edition/document/timeline";
 import { type AxcutClip, documentSchema } from "@/lib/ai-edition/schema";
-import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
+import { DocumentSaveError, useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import {
 	useAssetTranscriptions,
 	useAutoTranscription,
@@ -84,6 +84,41 @@ function NativePlaybackSync({
 	// is measured against. resolveNativePosition needs both (see timelineMap).
 	useNativePlaybackSync(playing, currentTimeSec, visibleClips, clips);
 	return null;
+}
+
+export async function saveCurrentProjectFromUserIntent(): Promise<void> {
+	const state = useProjectStore.getState();
+	if (!state.document) throw new DocumentSaveError("No project document is loaded");
+
+	const outcome =
+		state.status === "error"
+			? await state.saveRecoveryDocument()
+			: await state.saveDocument(state.document);
+	if (!outcome.appliedToCurrent) {
+		throw new DocumentSaveError("The project changed while it was being saved");
+	}
+
+	const current = useProjectStore.getState();
+	if (
+		current.documentGeneration !== outcome.documentGeneration ||
+		current.revision !== outcome.revision ||
+		current.projectId !== outcome.projectId ||
+		current.document?.project.id !== outcome.projectId ||
+		current.status !== "ready" ||
+		current.dirty
+	) {
+		throw new DocumentSaveError("The current project was not authoritatively saved");
+	}
+}
+
+export async function saveCurrentProjectBeforeClose(): Promise<boolean> {
+	try {
+		await saveCurrentProjectFromUserIntent();
+		return true;
+	} catch {
+		toast.error("Failed to save before closing");
+		return false;
+	}
 }
 
 export function NewEditorShell() {
@@ -302,25 +337,15 @@ export function NewEditorShell() {
 		});
 
 		// 3. Handle request-save-before-close from Electron
-		const unsubSaveBeforeClose = window.electronAPI.onRequestSaveBeforeClose(async () => {
-			const doc = useProjectStore.getState().document;
-			if (doc) {
-				try {
-					await saveDocument(doc);
-					return true;
-				} catch {
-					toast.error("Failed to save before closing");
-					return false;
-				}
-			}
-			return true;
-		});
+		const unsubSaveBeforeClose = window.electronAPI.onRequestSaveBeforeClose(
+			saveCurrentProjectBeforeClose,
+		);
 
 		return () => {
 			unsubCloseConfirm?.();
 			unsubSaveBeforeClose?.();
 		};
-	}, [promptUnsaved, saveDocument]);
+	}, [promptUnsaved]);
 
 	const videoSources = useMemo(() => {
 		if (!document) return [];
@@ -368,7 +393,9 @@ export function NewEditorShell() {
 					[{ startSec: 0, endSec: known }],
 					"Auto-created full-duration clip",
 				);
-				void state.saveDocument(next);
+				void state.saveDocument(next).catch((error) => {
+					console.warn("[editor] could not save the probed timeline duration:", error);
+				});
 				return;
 			}
 			// Hand the probed duration to the pure document layer: it patches only the
@@ -379,7 +406,9 @@ export function NewEditorShell() {
 			// nothing is waiting, so there is nothing to guard here.
 			const next = applyProbedDuration(doc, assetId, known);
 			if (next !== doc) {
-				void state.saveDocument(next);
+				void state.saveDocument(next).catch((error) => {
+					console.warn("[editor] could not save the probed media duration:", error);
+				});
 			}
 		},
 		[setSourceDuration],
@@ -611,17 +640,15 @@ export function NewEditorShell() {
 	);
 
 	const handleSave = useCallback(async () => {
-		const doc = useProjectStore.getState().document;
-		if (!doc) return;
 		try {
-			await saveDocument(doc);
+			await saveCurrentProjectFromUserIntent();
 			toast.success("Project saved");
 		} catch (err) {
 			toast.error("Save failed", {
 				description: err instanceof Error ? err.message : String(err),
 			});
 		}
-	}, [saveDocument]);
+	}, []);
 
 	// Native File menu (electron/main.ts) → v4 actions. The menu is shown via
 	// Menu.setApplicationMenu and dispatches these IPC events; the old editor
@@ -674,14 +701,11 @@ export function NewEditorShell() {
 					return;
 				}
 				if (choice === "save") {
-					const doc = useProjectStore.getState().document;
-					if (doc) {
-						try {
-							await saveDocument(doc);
-						} catch {
-							resolve("cancel");
-							return;
-						}
+					try {
+						await saveCurrentProjectFromUserIntent();
+					} catch {
+						resolve("cancel");
+						return;
 					}
 				}
 				if (action === "record") {
@@ -692,7 +716,7 @@ export function NewEditorShell() {
 				resolve(choice);
 			})();
 		},
-		[saveDocument, unsavedPrompt],
+		[unsavedPrompt],
 	);
 
 	const handleNewRecording = useCallback(async () => {
@@ -839,13 +863,10 @@ export function NewEditorShell() {
 					const choice = await promptUnsaved("new");
 					if (choice === "cancel") return;
 					if (choice === "save") {
-						const doc = useProjectStore.getState().document;
-						if (doc) {
-							try {
-								await saveDocument(doc);
-							} catch {
-								return;
-							}
+						try {
+							await saveCurrentProjectFromUserIntent();
+						} catch {
+							return;
 						}
 					}
 					setNewProjectOpen(true);
@@ -858,13 +879,10 @@ export function NewEditorShell() {
 					const choice = await promptUnsaved("open");
 					if (choice === "cancel") return;
 					if (choice === "save") {
-						const doc = useProjectStore.getState().document;
-						if (doc) {
-							try {
-								await saveDocument(doc);
-							} catch {
-								return;
-							}
+						try {
+							await saveCurrentProjectFromUserIntent();
+						} catch {
+							return;
 						}
 					}
 					setOpenProjectOpen(true);
@@ -1019,7 +1037,6 @@ export function NewEditorShell() {
 		pasteRegion,
 		tl,
 		promptUnsaved,
-		saveDocument,
 		copiedClipId,
 		openShortcutsConfig,
 		shortcuts,
