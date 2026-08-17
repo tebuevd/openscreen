@@ -113,12 +113,8 @@ func emit(_ fields: [String: Any]) {
 	}
 }
 
-func emitError(code: String, message: String) {
-	emit([
-		"event": "error",
-		"code": code,
-		"message": message,
-	])
+func emitError(code: HelperErrorCode, message: String) {
+	emit(helperErrorPayload(code: code, message: message))
 }
 
 @available(macOS 13.0, *)
@@ -312,9 +308,12 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	}
 
 	func stream(_ stream: SCStream, didStopWithError error: Error) {
-		emitError(code: "capture-stopped-with-error", message: "\(error)")
 		Task {
-			await stop()
+			await CaptureFailureFinalization.run(
+				message: "\(error)",
+				report: { code, message in emitError(code: code, message: message) },
+				finalize: { await self.stop() }
+			)
 		}
 	}
 
@@ -387,21 +386,17 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	/// HRESULT and escalates; this is the macOS half of the same contract -- report
 	/// once, at the append that actually failed, carrying the live writer.error.
 	///
-	/// Deliberately not the code finishWriter() emits, and the difference is load
-	/// bearing. That one is the terminal result of stopping, and the Electron side
-	/// settles its stop on exactly one of `recording-stopped` or `writer-failed`.
-	/// Give both sites the same code behind this one-shot guard and a writer that
-	/// died mid-capture emits nothing at all at stop, so the stop promise never
-	/// settles and every failure becomes the "Saving..." hang instead of an error.
-	/// This event answers "when did the writer die"; that one answers "did stopping
-	/// work". Two questions, two codes.
+	/// Deliberately not the code finishWriter() emits. Both errors are terminal, but
+	/// this one records when the writer died while `writer-failed` records the final
+	/// stop outcome. Keeping both codes preserves that timing without hiding either
+	/// failure behind this one-shot guard.
 	private func reportWriterFailure(_ stage: String) {
 		guard !didReportWriterFailure, let writer else {
 			return
 		}
 		didReportWriterFailure = true
 		emitError(
-			code: "writer-failed-during-capture",
+			code: .writerFailedDuringCapture,
 			message: "\(stage): "
 				+ (writer.error.map { "\($0)" }
 					?? "AVAssetWriter status \(writer.status.rawValue)"),
@@ -728,7 +723,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			])
 		} else {
 			emitError(
-				code: "writer-failed",
+				code: .writerFailed,
 				message: writer.error.map { "\($0)" } ?? "AVAssetWriter failed with status \(writer.status.rawValue)."
 			)
 		}
@@ -908,10 +903,10 @@ struct OpenScreenScreenCaptureKitHelper {
 
 			await stopTask.value
 		} catch let error as HelperError {
-			emitError(code: "helper-error", message: error.description)
+			emitError(code: .helperError, message: error.description)
 			exit(1)
 		} catch {
-			emitError(code: "helper-error", message: "\(error)")
+			emitError(code: .helperError, message: "\(error)")
 			exit(1)
 		}
 	}

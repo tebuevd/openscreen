@@ -1,15 +1,18 @@
 import type { ChildProcessWithoutNullStreams } from "node:child_process";
 import { EventEmitter } from "node:events";
 import fs from "node:fs/promises";
+import type {
+	NativeMacHelperErrorEvent,
+	NativeMacHelperRecordingStoppedEvent,
+} from "../../src/lib/nativeMacRecording";
 
 type NativeMacHelperEvent = Record<string, unknown>;
 type NativeMacHelperEventListener = (event: NativeMacHelperEvent) => void;
 type WarningReporter = (message: string, ...details: unknown[]) => void;
 
-type NativeMacRecordingStoppedEvent = {
-	event: "recording-stopped";
-	screenPath: string;
-};
+type NativeMacCaptureTerminalEvent =
+	| NativeMacHelperRecordingStoppedEvent
+	| NativeMacHelperErrorEvent;
 
 export const NATIVE_MAC_CAPTURE_KILL_GRACE_MS = 1_000;
 export const NATIVE_MAC_CAPTURE_STOP_TIMEOUT_MS = 30_000;
@@ -44,6 +47,30 @@ function tryParseHelperEvent(line: string): NativeMacHelperEvent | null {
 	}
 }
 
+function parseHelperErrorEvent(event: NativeMacHelperEvent): NativeMacHelperErrorEvent | null {
+	if (
+		event.event !== "error" ||
+		typeof event.code !== "string" ||
+		typeof event.message !== "string" ||
+		typeof event.terminal !== "boolean"
+	) {
+		return null;
+	}
+	return {
+		event: "error",
+		code: event.code,
+		message: event.message,
+		terminal: event.terminal,
+	};
+}
+
+function helperErrorFromEvent(event: NativeMacHelperEvent, context = "") {
+	const helperError = parseHelperErrorEvent(event);
+	return new Error(
+		`${helperError?.message ?? String(event.message ?? event.code ?? "Native macOS capture failed")}${context}`,
+	);
+}
+
 /**
  * Owns one helper's output for its full lifetime. A failed helper can keep its
  * pipes alive without ever writing into the next helper's buffer or event bus.
@@ -54,7 +81,8 @@ export class NativeMacCaptureOutput {
 	private stdoutLineBuffer = "";
 	private stderrLineBuffer = "";
 	private outputBuffer = "";
-	private terminalEvent: NativeMacRecordingStoppedEvent | null = null;
+	private terminalEvent: NativeMacCaptureTerminalEvent | null = null;
+	private readonly nonterminalErrorEvents: NativeMacHelperErrorEvent[] = [];
 	private isolated = false;
 	private disposed = false;
 
@@ -108,7 +136,15 @@ export class NativeMacCaptureOutput {
 	}
 
 	get recordingStoppedEvent() {
+		return this.terminalEvent?.event === "recording-stopped" ? this.terminalEvent : null;
+	}
+
+	get stopTerminalEvent() {
 		return this.terminalEvent;
+	}
+
+	get nonterminalErrors() {
+		return [...this.nonterminalErrorEvents];
 	}
 
 	onEvent(listener: NativeMacHelperEventListener) {
@@ -126,6 +162,7 @@ export class NativeMacCaptureOutput {
 		this.stderrLineBuffer = "";
 		this.eventHistory.length = 0;
 		this.terminalEvent = null;
+		this.nonterminalErrorEvents.length = 0;
 		this.eventEmitter.removeAllListeners();
 	}
 
@@ -156,16 +193,25 @@ export class NativeMacCaptureOutput {
 		for (const line of lines) {
 			const event = tryParseHelperEvent(line.trim());
 			if (!event) continue;
-			if (
-				stream === "stdout" &&
-				event.event === "recording-stopped" &&
-				typeof event.screenPath === "string" &&
-				event.screenPath === this.targetPath
-			) {
-				this.terminalEvent = {
-					event: "recording-stopped",
-					screenPath: event.screenPath,
-				};
+			if (stream === "stdout") {
+				const helperError = parseHelperErrorEvent(event);
+				if (helperError && !helperError.terminal) {
+					this.nonterminalErrorEvents.push(helperError);
+				}
+				if (this.terminalEvent === null) {
+					if (
+						event.event === "recording-stopped" &&
+						typeof event.screenPath === "string" &&
+						event.screenPath === this.targetPath
+					) {
+						this.terminalEvent = {
+							event: "recording-stopped",
+							screenPath: event.screenPath,
+						};
+					} else if (helperError?.terminal) {
+						this.terminalEvent = helperError;
+					}
+				}
 			}
 			this.eventHistory.push(event);
 			this.eventEmitter.emit("helper-event", event);
@@ -192,6 +238,14 @@ async function validateFinalizedCaptureFile(filePath: string) {
 			`Native macOS capture reported completion, but the output file is empty: ${filePath}`,
 		);
 	}
+}
+
+function nonterminalErrorContext(output: NativeMacCaptureOutput) {
+	if (output.nonterminalErrors.length === 0) return "";
+	const details = output.nonterminalErrors
+		.map((event) => `${event.code}: ${event.message}`)
+		.join("; ");
+	return ` Nonterminal diagnostics: ${details}.`;
 }
 
 function hasExited(proc: ChildProcessWithoutNullStreams) {
@@ -249,10 +303,14 @@ function requestNativeMacCaptureStop(options: {
 			cleanup();
 			reject(toError(error));
 		};
-		const finishFromTerminalEvent = () => {
+		const settleFromTerminalEvent = () => {
 			if (settled || validatingTerminalEvent) return validatingTerminalEvent;
-			const terminalEvent = output.recordingStoppedEvent;
+			const terminalEvent = output.stopTerminalEvent;
 			if (!terminalEvent) return false;
+			if (terminalEvent.event === "error") {
+				fail(helperErrorFromEvent(terminalEvent, nonterminalErrorContext(output)));
+				return true;
+			}
 
 			validatingTerminalEvent = true;
 			void validateFinalizedCaptureFile(terminalEvent.screenPath).then(
@@ -264,7 +322,7 @@ function requestNativeMacCaptureStop(options: {
 		const inspect = (event: NativeMacHelperEvent) => {
 			if (validatingTerminalEvent) return;
 			if (event.event === "recording-stopped") {
-				if (!finishFromTerminalEvent()) {
+				if (!settleFromTerminalEvent()) {
 					fail(
 						new Error(
 							`Native macOS capture returned a terminal event for an unexpected output path; expected ${targetPath}.`,
@@ -274,25 +332,29 @@ function requestNativeMacCaptureStop(options: {
 				return;
 			}
 			if (event.event === "error") {
-				fail(new Error(String(event.message ?? event.code ?? "Native macOS capture failed")));
+				const helperError = parseHelperErrorEvent(event);
+				if (helperError && !helperError.terminal) return;
+				if (!settleFromTerminalEvent()) {
+					fail(helperErrorFromEvent(event, nonterminalErrorContext(output)));
+				}
 			}
 		};
 		const settleFromTerminalState = () => {
 			if (!hasExited(proc)) return false;
-			if (finishFromTerminalEvent()) return true;
+			if (settleFromTerminalEvent()) return true;
 			fail(
 				new Error(
-					`Native macOS capture exited without an authoritative recording-stopped event (code=${proc.exitCode ?? "unknown"}, signal=${proc.signalCode ?? "none"}). Output: ${output.output.trim()}`,
+					`Native macOS capture exited without an authoritative recording-stopped event (code=${proc.exitCode ?? "unknown"}, signal=${proc.signalCode ?? "none"}).${nonterminalErrorContext(output)} Output: ${output.output.trim()}`,
 				),
 			);
 			return true;
 		};
 		const onOutput = (event: NativeMacHelperEvent) => inspect(event);
 		const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
-			if (finishFromTerminalEvent()) return;
+			if (settleFromTerminalEvent()) return;
 			fail(
 				new Error(
-					`Native macOS capture exited without an authoritative recording-stopped event (code=${code ?? "unknown"}, signal=${signal ?? "none"}). Output: ${output.output.trim()}`,
+					`Native macOS capture exited without an authoritative recording-stopped event (code=${code ?? "unknown"}, signal=${signal ?? "none"}).${nonterminalErrorContext(output)} Output: ${output.output.trim()}`,
 				),
 			);
 		};
@@ -309,7 +371,7 @@ function requestNativeMacCaptureStop(options: {
 					new Error(
 						`Timed out waiting for native macOS capture to stop. Output path: ${
 							targetPath ?? "unknown"
-						}. Output: ${output.output.trim()}`,
+						}.${nonterminalErrorContext(output)} Output: ${output.output.trim()}`,
 					),
 				),
 			timeoutMs,
@@ -322,7 +384,7 @@ function requestNativeMacCaptureStop(options: {
 			inspect(event);
 			if (settled || validatingTerminalEvent) return;
 		}
-		if (finishFromTerminalEvent()) return;
+		if (settleFromTerminalEvent()) return;
 
 		// The retained terminal event and process state cover output/close races around registration.
 		if (settleFromTerminalState()) return;

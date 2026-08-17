@@ -86,6 +86,7 @@ export type NativeMacHelperErrorEvent = {
 	event: "error";
 	code: string;
 	message: string;
+	terminal: boolean;
 };
 
 export type NativeMacHelperEvent =

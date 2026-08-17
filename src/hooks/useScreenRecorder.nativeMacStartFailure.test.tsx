@@ -72,10 +72,14 @@ function stubElectronAPI(overrides: Record<string, unknown> = {}) {
 		isNativeMacCaptureAvailable: vi.fn(async () => ({ success: true, available: true })),
 		startNativeMacRecording: vi.fn(async () => ({ success: true, recordingId: 42 })),
 		stopNativeMacRecording: vi.fn(async () => ({ success: true, discarded: true })),
+		attachNativeMacWebcamRecording: vi.fn(async () => ({ success: false })),
 		requestNativeMacCursorAccess: vi.fn(async () => ({ granted: true })),
 		showCountdownOverlay: vi.fn(async () => true),
 		setCountdownOverlayValue: vi.fn(async () => true),
 		hideCountdownOverlay: vi.fn(async () => true),
+		setCurrentRecordingSession: vi.fn(async () => undefined),
+		setCurrentVideoPath: vi.fn(async () => undefined),
+		switchToEditor: vi.fn(async () => undefined),
 	};
 	window.electronAPI = { ...api, ...overrides } as unknown as ElectronAPI;
 }
@@ -201,5 +205,62 @@ describe("useScreenRecorder native macOS start failure", () => {
 		expect(view.result.current.canPauseRecording).toBe(false);
 
 		view.unmount();
+	});
+});
+
+describe("useScreenRecorder native macOS stop finalization", () => {
+	it("keeps and attaches the webcam sidecar after recovered screen finalization", async () => {
+		const screenVideoPath = "/recordings/recording-42.mp4";
+		const session = {
+			screenVideoPath,
+			webcamVideoPath: "/recordings/recording-42-webcam.webm",
+			createdAt: 42,
+			cursorCaptureMode: "editable-overlay",
+		};
+		api.stopNativeMacRecording.mockResolvedValue({
+			success: true,
+			path: screenVideoPath,
+			session: { screenVideoPath, createdAt: 42, cursorCaptureMode: "editable-overlay" },
+		});
+		api.attachNativeMacWebcamRecording.mockResolvedValue({ success: true, session });
+		const view = renderHook(() => useScreenRecorder());
+		await enableWebcam(view);
+
+		await act(async () => {
+			await view.result.current.startRecordingImmediately();
+		});
+		expect(view.result.current.recording).toBe(true);
+		await act(async () => {
+			view.result.current.toggleRecording();
+		});
+		await waitFor(() => expect(api.switchToEditor).toHaveBeenCalledTimes(1));
+
+		expect(api.attachNativeMacWebcamRecording).toHaveBeenCalledTimes(1);
+		expect(fakeHandles[0].stop).toHaveBeenCalledTimes(1);
+		expect(fakeHandles[0].discard).not.toHaveBeenCalled();
+		expect(api.setCurrentRecordingSession).toHaveBeenCalledWith(session);
+		expect(view.result.current.recording).toBe(false);
+	});
+
+	it("discards the webcam sidecar after terminal screen finalization failure", async () => {
+		api.stopNativeMacRecording.mockResolvedValue({
+			success: false,
+			error: "AVAssetWriter could not finalize",
+		});
+		const view = renderHook(() => useScreenRecorder());
+		await enableWebcam(view);
+
+		await act(async () => {
+			await view.result.current.startRecordingImmediately();
+		});
+		await act(async () => {
+			view.result.current.toggleRecording();
+		});
+		await waitFor(() => expect(fakeHandles[0].discard).toHaveBeenCalledTimes(1));
+
+		expect(fakeHandles[0].stop).toHaveBeenCalledTimes(1);
+		expect(api.attachNativeMacWebcamRecording).not.toHaveBeenCalled();
+		expect(api.switchToEditor).not.toHaveBeenCalled();
+		expect(view.result.current.recording).toBe(false);
 	});
 });
