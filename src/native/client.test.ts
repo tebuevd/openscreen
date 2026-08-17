@@ -26,6 +26,7 @@ describe("native chat operation client", () => {
 		);
 		await nativeBridgeClient.aiEdition.chatCommitRun("project", "session", "run-1");
 		await nativeBridgeClient.aiEdition.chatAbortRun("project", "session", "run-2");
+		await nativeBridgeClient.aiEdition.chatRenewOperation("project", "session", "run-3");
 
 		expect(invoke.mock.calls.map(([request]) => request)).toEqual([
 			expect.objectContaining({
@@ -45,6 +46,10 @@ describe("native chat operation client", () => {
 			expect.objectContaining({
 				action: "chat.run.abort",
 				payload: { projectId: "project", sessionId: "session", operationId: "run-2" },
+			}),
+			expect.objectContaining({
+				action: "chat.operation.renew",
+				payload: { projectId: "project", sessionId: "session", operationId: "run-3" },
 			}),
 		]);
 	});

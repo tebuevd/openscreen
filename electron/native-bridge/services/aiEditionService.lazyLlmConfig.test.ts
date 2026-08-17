@@ -35,6 +35,10 @@ function serviceWithCountingFactory(): { service: AiEditionService; builds: () =
 			builds += 1;
 			return store;
 		},
+		renewChatOperation: (projectId: string, sessionId: string, operationId: string) =>
+			projectId === "project" && sessionId === "session" && operationId === "operation"
+				? { success: true as const }
+				: { success: false as const, error: "foreign operation" },
 	} as unknown as AiEditionServiceOptions;
 	return { service: new AiEditionService(options), builds: () => builds };
 }
@@ -48,6 +52,14 @@ describe("AiEditionService — LLM store resolution is deferred", () => {
 	it("does not build the store for work that has nothing to do with the LLM", async () => {
 		const { service, builds } = serviceWithCountingFactory();
 		await service.listProjects();
+		expect(builds()).toBe(0);
+	});
+
+	it("routes operation lease renewal without resolving the LLM store", () => {
+		const { service, builds } = serviceWithCountingFactory();
+		expect(service.chatRenewOperation("project", "session", "operation")).toEqual({
+			success: true,
+		});
 		expect(builds()).toBe(0);
 	});
 

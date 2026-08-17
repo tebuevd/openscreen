@@ -73,6 +73,11 @@ export interface NativeBridgeContext {
 		sessionId: string,
 		operationId: string,
 	) => import("../../src/native/contracts").AiEditionChatOperationResult;
+	renewAiEditionChatOperation: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => import("../../src/native/contracts").AiEditionChatOperationResult;
 	undoAiEditionToolBatch: (
 		projectId: string,
 		sessionId: string,
@@ -259,6 +264,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		runChat: context.runAiEditionChat,
 		commitChatRun: context.commitAiEditionChatRun,
 		abortChatRun: context.abortAiEditionChatRun,
+		renewChatOperation: context.renewAiEditionChatOperation,
 		undoLastToolBatch: context.undoAiEditionToolBatch,
 		prepareRewindToMessage: context.prepareRewindToMessage,
 		commitRewindToMessage: context.commitRewindToMessage,
@@ -649,6 +655,15 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 							return createSuccessResponse(
 								requestId,
 								aiEditionService.chatAbortRun(
+									request.payload.projectId,
+									request.payload.sessionId,
+									request.payload.operationId,
+								),
+							);
+						case "chat.operation.renew":
+							return createSuccessResponse(
+								requestId,
+								aiEditionService.chatRenewOperation(
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.operationId,

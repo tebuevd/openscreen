@@ -20,6 +20,7 @@ const bridgeMocks = vi.hoisted(() => ({
 	chatRun: vi.fn(),
 	chatCommitRun: vi.fn(),
 	chatAbortRun: vi.fn(),
+	chatRenewOperation: vi.fn(),
 	chatPrepareRewind: vi.fn(),
 	chatCommitRewind: vi.fn(),
 	chatAbortRewind: vi.fn(),
@@ -100,7 +101,7 @@ function loadDocument(document: AxcutDocument = sampleDoc) {
 	});
 }
 
-function chatResult(document: AxcutDocument) {
+function chatResult(document: AxcutDocument, userMessageCheckpointId = "canonical_user_1") {
 	return {
 		success: true,
 		assistantMessage: {
@@ -110,6 +111,7 @@ function chatResult(document: AxcutDocument) {
 			createdAt: "2026-08-16T10:00:01.000Z",
 		},
 		document,
+		userMessageCheckpointId,
 	};
 }
 
@@ -150,7 +152,7 @@ function renderPanel() {
 
 async function startPendingChat<T>(pending: Promise<T>) {
 	bridgeMocks.chatRun.mockReturnValue(pending);
-	renderPanel();
+	const view = renderPanel();
 	await waitFor(() => expect(bridgeMocks.chatSelectSession).toHaveBeenCalled());
 	fireEvent.change(screen.getByPlaceholderText("Describe the edit you want."), {
 		target: { value: "Improve this edit" },
@@ -158,6 +160,7 @@ async function startPendingChat<T>(pending: Promise<T>) {
 	fireEvent.click(screen.getByRole("button", { name: "Send" }));
 	await waitFor(() => expect(bridgeMocks.chatRun).toHaveBeenCalledTimes(1));
 	expect(screen.getByText("Thinking…")).toBeInTheDocument();
+	return view;
 }
 
 async function startPendingRewind<T>(pending: Promise<T>) {
@@ -169,11 +172,12 @@ async function startPendingRewind<T>(pending: Promise<T>) {
 		messages: rewindMessages,
 	});
 	bridgeMocks.chatPrepareRewind.mockReturnValue(pending);
-	renderPanel();
+	const view = renderPanel();
 	const trigger = await screen.findByRole("button", { name: "Rewind to this message" });
 	fireEvent.click(trigger);
 	fireEvent.click(screen.getByRole("button", { name: "Rewind" }));
 	await waitFor(() => expect(bridgeMocks.chatPrepareRewind).toHaveBeenCalledTimes(1));
+	return view;
 }
 
 describe("LeftPanel async document results", () => {
@@ -189,6 +193,7 @@ describe("LeftPanel async document results", () => {
 		}));
 		bridgeMocks.chatCommitRun.mockResolvedValue({ success: true });
 		bridgeMocks.chatAbortRun.mockResolvedValue({ success: true });
+		bridgeMocks.chatRenewOperation.mockResolvedValue({ success: true });
 		bridgeMocks.chatAbortRewind.mockResolvedValue({ success: true });
 		bridgeMocks.chatDeleteSession.mockResolvedValue({ success: true });
 		bridgeMocks.llmGetSnapshot.mockResolvedValue({
@@ -400,6 +405,77 @@ describe("LeftPanel async document results", () => {
 		expect(toastMocks.error).not.toHaveBeenCalled();
 	});
 
+	it("commits chat history when a lost save response reconciles to the intended document", async () => {
+		const resultDocument = withTitle(sampleDoc, "Reconciled chat edit");
+		bridgeMocks.save.mockRejectedValue(new Error("response lost"));
+		bridgeMocks.get.mockResolvedValue({
+			success: true,
+			document: {
+				...resultDocument,
+				project: { ...resultDocument.project, updatedAt: "2026-08-16T10:05:00.000Z" },
+			},
+		});
+		const run = deferred<ReturnType<typeof chatResult>>();
+		await startPendingChat(run.promise);
+
+		await act(async () => {
+			run.resolve(chatResult(resultDocument));
+			await run.promise;
+		});
+
+		await waitFor(() => expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(1));
+		expect(bridgeMocks.chatAbortRun).not.toHaveBeenCalled();
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Reconciled chat edit" } },
+			dirty: false,
+		});
+		expect(screen.getByText("The edit is ready.")).toBeInTheDocument();
+		expect(toastMocks.error).not.toHaveBeenCalled();
+	});
+
+	it("retries an ambiguous chat history commit without duplicating the visible turn", async () => {
+		bridgeMocks.chatCommitRun
+			.mockRejectedValueOnce(new Error("commit reply lost"))
+			.mockResolvedValue({ success: true });
+		const run = deferred<ReturnType<typeof chatResult>>();
+		await startPendingChat(run.promise);
+
+		await act(async () => {
+			run.resolve(chatResult(withTitle(sampleDoc, "Committed edit")));
+			await run.promise;
+		});
+
+		await waitFor(() => expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(2));
+		expect(screen.getAllByText("The edit is ready.")).toHaveLength(1);
+		expect(bridgeMocks.chatAbortRun).not.toHaveBeenCalled();
+		expect(toastMocks.error).not.toHaveBeenCalled();
+	});
+
+	it("maps the optimistic user message to its canonical checkpoint before session reload", async () => {
+		const run = deferred<ReturnType<typeof chatResult>>();
+		await startPendingChat(run.promise);
+		await act(async () => {
+			run.resolve(chatResult(withTitle(sampleDoc, "Canonical edit"), "canonical_checkpoint"));
+			await run.promise;
+		});
+		await waitFor(() => expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(1));
+		bridgeMocks.chatPrepareRewind.mockResolvedValue({
+			success: false,
+			error: "stop after identity",
+		});
+
+		fireEvent.click(screen.getByRole("button", { name: "Rewind to this message" }));
+		fireEvent.click(screen.getByRole("button", { name: "Rewind" }));
+
+		await waitFor(() =>
+			expect(bridgeMocks.chatPrepareRewind).toHaveBeenCalledWith(
+				"proj_a",
+				"session_1",
+				"canonical_checkpoint",
+			),
+		);
+	});
+
 	it("clears loading without changing or saving the document when chat rejects", async () => {
 		const run = deferred<ReturnType<typeof chatResult>>();
 		await startPendingChat(run.promise);
@@ -472,20 +548,44 @@ describe("LeftPanel async document results", () => {
 		);
 	});
 
-	it("reconciles an authoritative rewind after a lost response without committing chat history", async () => {
+	it("commits rewind history when a lost save response reconciles to the intended document", async () => {
 		const prepared = preparedRewind();
 		bridgeMocks.save.mockRejectedValue(new Error("response lost"));
 		bridgeMocks.get.mockResolvedValue({ success: true, document: prepared.document });
+		bridgeMocks.chatCommitRewind.mockResolvedValue({
+			success: true,
+			messages: prepared.messages,
+			prompt: prepared.prompt,
+		});
 		await startPendingRewind(Promise.resolve(prepared));
 
-		await waitFor(() => expect(bridgeMocks.chatAbortRewind).toHaveBeenCalledTimes(1));
-		expect(bridgeMocks.chatCommitRewind).not.toHaveBeenCalled();
+		await waitFor(() => expect(bridgeMocks.chatCommitRewind).toHaveBeenCalledTimes(1));
+		expect(bridgeMocks.chatAbortRewind).not.toHaveBeenCalled();
 		expect(useProjectStore.getState()).toMatchObject({
 			document: { project: { title: "Rewound document" } },
 			dirty: false,
 		});
+		expect(screen.queryByText("Applied the old edit.")).not.toBeInTheDocument();
+		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("Try this edit");
+	});
+
+	it("adopts a differing authoritative save and aborts rewind history", async () => {
+		const authoritative = withTitle(sampleDoc, "Different authoritative document");
+		bridgeMocks.save.mockRejectedValue(new Error("response lost"));
+		bridgeMocks.get.mockResolvedValue({ success: true, document: authoritative });
+		await startPendingRewind(Promise.resolve(preparedRewind()));
+
+		await waitFor(() => expect(bridgeMocks.chatAbortRewind).toHaveBeenCalledTimes(1));
+		expect(bridgeMocks.chatCommitRewind).not.toHaveBeenCalled();
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Different authoritative document" } },
+			dirty: false,
+		});
 		expect(screen.getByText("Applied the old edit.")).toBeInTheDocument();
-		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("");
+		expect(toastMocks.error).toHaveBeenCalledWith(
+			"Rewind failed",
+			expect.objectContaining({ description: "response lost" }),
+		);
 	});
 
 	it("applies, persists, and commits a prepared rewind exactly once", async () => {
@@ -510,6 +610,137 @@ describe("LeftPanel async document results", () => {
 		expect(useProjectStore.getState().document?.project.title).toBe("Rewound document");
 		expect(screen.queryByText("Applied the old edit.")).not.toBeInTheDocument();
 		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("Try this edit");
+	});
+
+	it("retries an ambiguous rewind history commit and applies its canonical result once", async () => {
+		const prepared = preparedRewind();
+		bridgeMocks.chatCommitRewind
+			.mockRejectedValueOnce(new Error("commit reply lost"))
+			.mockResolvedValue({
+				success: true,
+				messages: prepared.messages,
+				prompt: prepared.prompt,
+			});
+		await startPendingRewind(Promise.resolve(prepared));
+
+		await waitFor(() => expect(bridgeMocks.chatCommitRewind).toHaveBeenCalledTimes(2));
+		expect(bridgeMocks.chatAbortRewind).not.toHaveBeenCalled();
+		expect(screen.queryByText("Applied the old edit.")).not.toBeInTheDocument();
+		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("Try this edit");
+	});
+
+	it("invalidates an unmounted rewind preparation and aborts it when the reply arrives", async () => {
+		const preparing = deferred<ReturnType<typeof preparedRewind>>();
+		const view = await startPendingRewind(preparing.promise);
+		view.unmount();
+
+		await act(async () => {
+			preparing.resolve(preparedRewind("rewind_after_unmount"));
+			await preparing.promise;
+		});
+
+		await waitFor(() =>
+			expect(bridgeMocks.chatAbortRewind).toHaveBeenCalledWith(
+				"proj_a",
+				"session_1",
+				"rewind_after_unmount",
+			),
+		);
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+		expect(bridgeMocks.chatCommitRewind).not.toHaveBeenCalled();
+		expect(toastMocks.error).not.toHaveBeenCalled();
+	});
+
+	it("finishes rewind commit after unmount once document persistence has started", async () => {
+		const prepared = preparedRewind("rewind_persisting_unmount");
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.chatCommitRewind.mockResolvedValue({
+			success: true,
+			messages: prepared.messages,
+			prompt: prepared.prompt,
+		});
+		const view = await startPendingRewind(Promise.resolve(prepared));
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		view.unmount();
+		expect(bridgeMocks.chatAbortRewind).not.toHaveBeenCalled();
+
+		await act(async () => {
+			saving.resolve({ success: true, document: prepared.document });
+			await saving.promise;
+		});
+
+		await waitFor(() => expect(bridgeMocks.chatCommitRewind).toHaveBeenCalledTimes(1));
+		expect(bridgeMocks.chatAbortRewind).not.toHaveBeenCalled();
+		expect(toastMocks.success).not.toHaveBeenCalled();
+	});
+
+	it("cleans up a session created after the sending panel unmounts", async () => {
+		const creating = deferred<{
+			id: string;
+			projectId: string;
+			title: string;
+			createdAt: string;
+			messageCount: number;
+		}>();
+		bridgeMocks.chatListSessions.mockResolvedValue([]);
+		bridgeMocks.chatCreateSession.mockReturnValue(creating.promise);
+		const view = renderPanel();
+		await waitFor(() => expect(bridgeMocks.chatListSessions).toHaveBeenCalled());
+		fireEvent.change(screen.getByPlaceholderText("Describe the edit you want."), {
+			target: { value: "Improve this edit" },
+		});
+		fireEvent.click(screen.getByRole("button", { name: "Send" }));
+		await waitFor(() => expect(bridgeMocks.chatCreateSession).toHaveBeenCalledTimes(1));
+		view.unmount();
+
+		creating.resolve({
+			id: "session_after_unmount",
+			projectId: "proj_a",
+			title: "Conversation",
+			createdAt: "2026-08-16T10:00:00.000Z",
+			messageCount: 0,
+		});
+		await creating.promise;
+
+		await waitFor(() =>
+			expect(bridgeMocks.chatDeleteSession).toHaveBeenCalledWith("proj_a", "session_after_unmount"),
+		);
+		expect(bridgeMocks.chatRun).not.toHaveBeenCalled();
+		expect(toastMocks.error).not.toHaveBeenCalled();
+	});
+
+	it("reserves an async new-session action against overlapping chat send", async () => {
+		const creating = deferred<{
+			id: string;
+			projectId: string;
+			title: string;
+			createdAt: string;
+			messageCount: number;
+		}>();
+		bridgeMocks.chatCreateSession.mockReturnValue(creating.promise);
+		renderPanel();
+		await waitFor(() => expect(bridgeMocks.chatSelectSession).toHaveBeenCalled());
+		fireEvent.click(screen.getByRole("button", { name: "New conversation" }));
+		await waitFor(() => expect(bridgeMocks.chatCreateSession).toHaveBeenCalledTimes(1));
+		fireEvent.change(screen.getByPlaceholderText("Describe the edit you want."), {
+			target: { value: "Must wait" },
+		});
+		fireEvent.click(screen.getByRole("button", { name: "Send" }));
+		expect(bridgeMocks.chatRun).not.toHaveBeenCalled();
+
+		creating.resolve({
+			id: "new_session",
+			projectId: "proj_a",
+			title: "Conversation 2",
+			createdAt: "2026-08-16T10:00:00.000Z",
+			messageCount: 0,
+		});
+		await creating.promise;
+		await waitFor(() =>
+			expect(bridgeMocks.chatSelectSession).toHaveBeenCalledWith("proj_a", "new_session"),
+		);
+		expect(bridgeMocks.chatRun).not.toHaveBeenCalled();
 	});
 
 	it("blocks overlapping rewind and chat handlers while rewind preparation is pending", async () => {
@@ -548,6 +779,32 @@ describe("LeftPanel async document results", () => {
 		for (const rewind of screen.getAllByRole("button", { name: "Rewind to this message" })) {
 			expect(rewind).toBeDisabled();
 		}
+		await act(async () => {
+			run.reject(new Error("cancelled"));
+			await run.promise.catch(() => undefined);
+		});
+	});
+
+	it("renews the owner-bound lease while a chat operation is active", async () => {
+		let heartbeat: (() => void) | null = null;
+		const realSetInterval = globalThis.setInterval;
+		vi.spyOn(globalThis, "setInterval").mockImplementation((handler, timeout, ...args) => {
+			if (timeout === 60_000 && typeof handler === "function") {
+				heartbeat = () => handler(...args);
+				return 987_654 as unknown as ReturnType<typeof setInterval>;
+			}
+			return realSetInterval(handler, timeout, ...args);
+		});
+		const run = deferred<ReturnType<typeof chatResult>>();
+		await startPendingChat(run.promise);
+		const operationId = bridgeMocks.chatRun.mock.calls[0][4] as string;
+
+		await act(async () => {
+			heartbeat?.();
+			await Promise.resolve();
+		});
+		expect(bridgeMocks.chatRenewOperation).toHaveBeenCalledWith("proj_a", "session_1", operationId);
+
 		await act(async () => {
 			run.reject(new Error("cancelled"));
 			await run.promise.catch(() => undefined);

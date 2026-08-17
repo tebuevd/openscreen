@@ -64,6 +64,11 @@ export interface AiEditionServiceOptions {
 		sessionId: string,
 		operationId: string,
 	) => AiEditionChatOperationResult;
+	renewChatOperation: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => AiEditionChatOperationResult;
 	prepareRewindToMessage: (
 		projectId: string,
 		sessionId: string,
@@ -306,6 +311,14 @@ export class AiEditionService {
 		operationId: string,
 	): AiEditionChatOperationResult {
 		return this.options.abortChatRun(projectId, sessionId, operationId);
+	}
+
+	chatRenewOperation(
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	): AiEditionChatOperationResult {
+		return this.options.renewChatOperation(projectId, sessionId, operationId);
 	}
 
 	chatUndoLastBatch(_projectId: string, _sessionId: string): AiEditionChatResult {

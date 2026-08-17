@@ -254,6 +254,12 @@ export const nativeBridgeClient = {
 				action: "chat.run.abort",
 				payload: { projectId, sessionId, operationId },
 			}),
+		chatRenewOperation: (projectId: string, sessionId: string, operationId: string) =>
+			requireNativeBridgeData<AiEditionChatOperationResult>({
+				domain: "aiEdition",
+				action: "chat.operation.renew",
+				payload: { projectId, sessionId, operationId },
+			}),
 		chatUndoLastBatch: (projectId: string, sessionId: string) =>
 			requireNativeBridgeData<AiEditionChatResult>({
 				domain: "aiEdition",

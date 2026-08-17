@@ -4,7 +4,7 @@
 // tests mock `invokeOpenScreenAgent` directly — that's the seam chat-service
 // crosses to drive the agentic turn.
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
 	type AxcutDocument,
 	createEmptyDocument,
@@ -21,13 +21,24 @@ import {
 	commitChatRun,
 	commitRewindToMessage,
 	createSession,
+	deleteSession,
 	prepareRewindToMessage,
+	renameSession,
+	renewChatOperation,
 	runChat,
 } from "./chat-service";
 import { invokeOpenScreenAgent } from "./deep-agent/service";
 import type { LlmConfigStore } from "./llm-config-store";
 
 const invokeMock = vi.mocked(invokeOpenScreenAgent);
+
+function deferred<T>() {
+	let resolve!: (value: T) => void;
+	const promise = new Promise<T>((next) => {
+		resolve = next;
+	});
+	return { promise, resolve };
+}
 
 function fixtureDocument(): AxcutDocument {
 	const base = createEmptyDocument({ title: "Test", projectId: "proj_loop" });
@@ -111,6 +122,10 @@ beforeEach(() => {
 	});
 });
 
+afterEach(() => {
+	vi.useRealTimers();
+});
+
 // ponytail: tool chain driven by a generator — each `next()` call resolves to
 // the next sink event (text delta / toolStart / toolEnd / error). The
 // generator yields `null` to end the loop.
@@ -183,7 +198,9 @@ describe("runChat tool loop", () => {
 			success: true,
 		});
 		expect(selectSession("proj_staged_chat", session.id)?.messages).toHaveLength(2);
-		expect(commitChatRun("proj_staged_chat", session.id, "run_commit").success).toBe(false);
+		expect(commitChatRun("proj_staged_chat", session.id, "run_commit")).toEqual({
+			success: true,
+		});
 	});
 
 	it("executes tool calls, chains turns, and returns the mutated document", async () => {
@@ -259,10 +276,190 @@ describe("runChat tool loop", () => {
 		expect(
 			commitRewindToMessage(
 				"proj_rewind",
-				session.id,
+				"foreign_session",
 				prepared.operationId,
 				prepared.sessionRevision,
 			).success,
+		).toBe(false);
+		expect(
+			abortRewindToMessage("proj_rewind", "foreign_session", prepared.operationId).success,
+		).toBe(false);
+		expect(
+			commitRewindToMessage(
+				"proj_rewind",
+				session.id,
+				prepared.operationId,
+				prepared.sessionRevision,
+			),
+		).toEqual(committed);
+	});
+
+	it("keeps owner-renewed running and prepared operations alive beyond five minutes", async () => {
+		vi.useFakeTimers();
+		const agent = deferred<{ text: string; document: AxcutDocument; mutated: boolean }>();
+		invokeMock.mockReturnValueOnce(agent.promise);
+		const session = createSession("proj_long_lease");
+		const running = runChat(
+			"proj_long_lease",
+			session.id,
+			"long edit",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"run_long_lease",
+		);
+
+		await vi.advanceTimersByTimeAsync(4 * 60_000);
+		expect(renewChatOperation("proj_long_lease", session.id, "run_long_lease")).toEqual({
+			success: true,
+		});
+		await vi.advanceTimersByTimeAsync(2 * 60_000);
+		agent.resolve({ text: "done", document: fixtureDocument(), mutated: false });
+		await expect(running).resolves.toMatchObject({ success: true });
+
+		await vi.advanceTimersByTimeAsync(4 * 60_000);
+		expect(renewChatOperation("proj_long_lease", session.id, "run_long_lease")).toEqual({
+			success: true,
+		});
+		await vi.advanceTimersByTimeAsync(2 * 60_000);
+		expect(commitChatRun("proj_long_lease", session.id, "run_long_lease")).toEqual({
+			success: true,
+		});
+	});
+
+	it("expires an abandoned running operation when its owner stops renewing", async () => {
+		vi.useFakeTimers();
+		const agent = deferred<{ text: string; document: AxcutDocument; mutated: boolean }>();
+		invokeMock.mockReturnValueOnce(agent.promise);
+		const session = createSession("proj_abandoned_lease");
+		const running = runChat(
+			"proj_abandoned_lease",
+			session.id,
+			"abandoned edit",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"run_abandoned_lease",
+		);
+
+		expect(
+			renewChatOperation("proj_abandoned_lease", "foreign_session", "run_abandoned_lease").success,
+		).toBe(false);
+		await vi.advanceTimersByTimeAsync(5 * 60_000);
+		agent.resolve({ text: "late", document: fixtureDocument(), mutated: false });
+		await expect(running).resolves.toMatchObject({
+			success: false,
+			error: "Chat run was abandoned.",
+		});
+	});
+
+	it("expires an abandoned prepared operation and releases its session lock", async () => {
+		vi.useFakeTimers();
+		const projectId = "proj_abandoned_prepared";
+		const session = createSession(projectId);
+		await runChat(
+			projectId,
+			session.id,
+			"prepared edit",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"run_abandoned_prepared",
+		);
+
+		await vi.advanceTimersByTimeAsync(5 * 60_000);
+		expect(commitChatRun(projectId, session.id, "run_abandoned_prepared").success).toBe(false);
+		await expect(
+			runChat(
+				projectId,
+				session.id,
+				"replacement edit",
+				stubConfig(),
+				fixtureDocument(),
+				{},
+				{},
+				"run_after_expiry",
+			),
+		).resolves.toMatchObject({ success: true });
+		expect(abortChatRun(projectId, session.id, "run_after_expiry")).toEqual({ success: true });
+	});
+
+	it("does not let foreign commit or abort calls consume pending or completed operations", async () => {
+		const session = createSession("proj_foreign_operation");
+		await runChat(
+			"proj_foreign_operation",
+			session.id,
+			"edit",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"run_foreign_operation",
+		);
+
+		expect(
+			abortChatRun("proj_foreign_operation", "foreign_session", "run_foreign_operation").success,
+		).toBe(false);
+		expect(renameSession("proj_foreign_operation", session.id, "Blocked rename")).toBeNull();
+		expect(deleteSession("proj_foreign_operation", session.id)).toBe(false);
+		expect(commitChatRun("proj_foreign_operation", session.id, "run_foreign_operation")).toEqual({
+			success: true,
+		});
+		expect(
+			commitChatRun("proj_foreign_operation", "foreign_session", "run_foreign_operation").success,
+		).toBe(false);
+		expect(
+			abortChatRun("proj_foreign_operation", "foreign_session", "run_foreign_operation").success,
+		).toBe(false);
+		expect(commitChatRun("proj_foreign_operation", session.id, "run_foreign_operation")).toEqual({
+			success: true,
+		});
+		expect(
+			abortChatRun("proj_foreign_operation", session.id, "run_foreign_operation").success,
+		).toBe(false);
+	});
+
+	it("bounds completed tombstones and expires retained commit results", async () => {
+		const projectId = "proj_tombstone_bound";
+		const session = createSession(projectId);
+		for (let index = 0; index <= 256; index++) {
+			const operationId = `bounded_run_${index}`;
+			await runChat(
+				projectId,
+				session.id,
+				`edit ${index}`,
+				stubConfig(),
+				fixtureDocument(),
+				{},
+				{},
+				operationId,
+			);
+			expect(commitChatRun(projectId, session.id, operationId).success).toBe(true);
+		}
+		expect(commitChatRun(projectId, session.id, "bounded_run_0").success).toBe(false);
+		expect(commitChatRun(projectId, session.id, "bounded_run_256").success).toBe(true);
+
+		vi.useFakeTimers();
+		const expiringSession = createSession("proj_tombstone_expiry");
+		await runChat(
+			"proj_tombstone_expiry",
+			expiringSession.id,
+			"edit",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"expiring_tombstone",
+		);
+		expect(
+			commitChatRun("proj_tombstone_expiry", expiringSession.id, "expiring_tombstone").success,
+		).toBe(true);
+		await vi.advanceTimersByTimeAsync(10 * 60_000);
+		expect(
+			commitChatRun("proj_tombstone_expiry", expiringSession.id, "expiring_tombstone").success,
 		).toBe(false);
 	});
 

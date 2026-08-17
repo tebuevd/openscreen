@@ -60,6 +60,56 @@ function createPanelOperationId(prefix: string): string {
 	return `${prefix}_${id ?? `${Date.now()}_${Math.random().toString(16).slice(2)}`}`;
 }
 
+type PanelOperationPhase = "starting" | "running" | "persisting" | "committing" | "settled";
+
+interface PanelOperation {
+	localId: string;
+	kind: "chat" | "rewind";
+	projectId: string;
+	sessionId: string | null;
+	remoteId: string | null;
+	phase: PanelOperationPhase;
+	cancelled: boolean;
+	uiAttached: boolean;
+	abortRequested: boolean;
+	stopHeartbeat: () => void;
+}
+
+function operationMustFinish(operation: PanelOperation): boolean {
+	return operation.phase === "persisting" || operation.phase === "committing";
+}
+
+function startOperationHeartbeat(
+	projectId: string,
+	sessionId: string,
+	operationId: string,
+): () => void {
+	const timeout = setInterval(() => {
+		void nativeBridgeClient.aiEdition
+			.chatRenewOperation(projectId, sessionId, operationId)
+			.catch(() => undefined);
+	}, 60_000);
+	return () => clearInterval(timeout);
+}
+
+async function retryAmbiguousCommit<T>(commit: () => Promise<T>): Promise<T> {
+	try {
+		return await commit();
+	} catch {
+		return commit();
+	}
+}
+
+function requestOperationAbort(operation: PanelOperation): void {
+	if (!operation.sessionId || !operation.remoteId || operation.abortRequested) return;
+	operation.abortRequested = true;
+	const abort =
+		operation.kind === "chat"
+			? nativeBridgeClient.aiEdition.chatAbortRun
+			: nativeBridgeClient.aiEdition.chatAbortRewind;
+	void abort(operation.projectId, operation.sessionId, operation.remoteId).catch(() => undefined);
+}
+
 function MediaList({
 	assets,
 	onOpenTranscript,
@@ -739,17 +789,14 @@ function ChatStripPanel() {
 	const [input, setInput] = useState("");
 	const [busy, setBusy] = useState(false);
 	const [rewindBusy, setRewindBusy] = useState(false);
+	const [compactNowPending, setCompactNowPending] = useState(false);
 	const [rewindFor, setRewindFor] = useState<{
 		messageId: string;
 		anchor: { left: number; bottom: number } | null;
 	} | null>(null);
-	const activeOperationRef = useRef<{
-		localId: string;
-		kind: "chat" | "rewind";
-		projectId: string;
-		sessionId: string | null;
-		remoteId: string | null;
-	} | null>(null);
+	const mountedRef = useRef(true);
+	const activeOperationRef = useRef<PanelOperation | null>(null);
+	const sessionActionRef = useRef<object | null>(null);
 	const [llmConfig, setLlmConfig] = useState<AiEditionLlmConfig | null>(null);
 	const [settingsOpen, setSettingsOpen] = useState(false);
 	const [chatsOpen, setChatsOpen] = useState(false);
@@ -814,7 +861,8 @@ function ChatStripPanel() {
 				if (
 					current.projectId !== pid ||
 					current.documentGeneration !== generation ||
-					activeOperationRef.current
+					activeOperationRef.current ||
+					sessionActionRef.current
 				) {
 					return;
 				}
@@ -855,40 +903,42 @@ function ChatStripPanel() {
 		return unsubChatEvent;
 	}, []);
 
-	useEffect(
-		() => () => {
+	useEffect(() => {
+		mountedRef.current = true;
+		return () => {
+			mountedRef.current = false;
+			sessionActionRef.current = null;
+			thinkingRunSessionRef.current = null;
 			const operation = activeOperationRef.current;
-			if (!operation?.sessionId || !operation.remoteId) return;
-			const abort =
-				operation.kind === "chat"
-					? nativeBridgeClient.aiEdition.chatAbortRun
-					: nativeBridgeClient.aiEdition.chatAbortRewind;
-			void abort(operation.projectId, operation.sessionId, operation.remoteId).catch(
-				() => undefined,
-			);
-		},
-		[],
-	);
+			activeOperationRef.current = null;
+			if (!operation) return;
+			operation.uiAttached = false;
+			if (!operationMustFinish(operation)) {
+				operation.cancelled = true;
+				operation.stopHeartbeat();
+				requestOperationAbort(operation);
+			}
+		};
+	}, []);
 
 	useEffect(() => {
 		const operation = activeOperationRef.current;
 		if (operation) {
 			activeOperationRef.current = null;
+			operation.uiAttached = false;
+			if (!operationMustFinish(operation)) {
+				operation.cancelled = true;
+				operation.stopHeartbeat();
+				requestOperationAbort(operation);
+			}
 			toast.error(t("chat.applyEditsFailed"), {
 				description: t("chat.documentChangedDuringOperation"),
 			});
-			if (operation.sessionId && operation.remoteId) {
-				const abort =
-					operation.kind === "chat"
-						? nativeBridgeClient.aiEdition.chatAbortRun
-						: nativeBridgeClient.aiEdition.chatAbortRewind;
-				void abort(operation.projectId, operation.sessionId, operation.remoteId).catch(
-					() => undefined,
-				);
-			}
 		}
+		sessionActionRef.current = null;
 		setBusy(false);
 		setRewindBusy(false);
+		setCompactNowPending(false);
 		setRewindFor(null);
 		thinkingRunSessionRef.current = null;
 		setThinkingText("");
@@ -917,6 +967,7 @@ function ChatStripPanel() {
 				if (
 					cancelled ||
 					activeOperationRef.current ||
+					sessionActionRef.current ||
 					current.projectId !== projectId ||
 					current.documentGeneration !== documentGeneration
 				) {
@@ -964,7 +1015,16 @@ function ChatStripPanel() {
 
 	const send = async (overrideText?: string) => {
 		const text = (overrideText ?? input).trim();
-		if (!projectId || !text || busy || rewindBusy || activeOperationRef.current) return;
+		if (
+			!projectId ||
+			!text ||
+			busy ||
+			rewindBusy ||
+			activeOperationRef.current ||
+			sessionActionRef.current
+		) {
+			return;
+		}
 		// ponytail: nothing to talk to. Bounce to the settings modal instead of
 		// firing a doomed request. The composer is disabled in this state too,
 		// but Auto-enhance calls send() directly and Enter can slip through.
@@ -983,13 +1043,19 @@ function ChatStripPanel() {
 		const documentSnapshot =
 			launchState.document?.project.id === projectId ? launchState.document : undefined;
 		const localOperationId = createPanelOperationId("chat");
-		activeOperationRef.current = {
+		const operation: PanelOperation = {
 			localId: localOperationId,
 			kind: "chat",
 			projectId,
 			sessionId: activeSessionId,
 			remoteId: null,
+			phase: "starting",
+			cancelled: false,
+			uiAttached: true,
+			abortRequested: false,
+			stopHeartbeat: () => undefined,
 		};
+		activeOperationRef.current = operation;
 		setInput("");
 		setBusy(true);
 		// ponytail: prepare the live reasoning-trace accumulator. Late events
@@ -1012,6 +1078,9 @@ function ChatStripPanel() {
 				checkpointId: optimisticUserId,
 			},
 		]);
+		let canonicalUserId: string | null = null;
+		const ownsUi = () =>
+			mountedRef.current && operation.uiAttached && activeOperationRef.current === operation;
 		const documentStillMatches = (applied: boolean) => {
 			const current = useProjectStore.getState();
 			return (
@@ -1020,14 +1089,23 @@ function ChatStripPanel() {
 				current.revision === documentOperation.revision + (applied ? 1 : 0)
 			);
 		};
-		const discardRun = async (sessionId: string, stale: boolean): Promise<boolean> => {
-			try {
-				await nativeBridgeClient.aiEdition.chatAbortRun(projectId, sessionId, localOperationId);
-			} catch {
-				// Expiry or an already-aborted operation needs no second error.
+		const discardRun = async (stale: boolean): Promise<boolean> => {
+			if (operation.sessionId && operation.remoteId && !operation.abortRequested) {
+				operation.abortRequested = true;
+				try {
+					await nativeBridgeClient.aiEdition.chatAbortRun(
+						projectId,
+						operation.sessionId,
+						operation.remoteId,
+					);
+				} catch {
+					// Expiry or an already-aborted operation needs no second error.
+				}
 			}
-			if (activeOperationRef.current?.localId !== localOperationId) return false;
-			setMessages((prev) => prev.filter((message) => message.id !== optimisticUserId));
+			if (!ownsUi()) return false;
+			setMessages((prev) =>
+				prev.filter((message) => message.id !== optimisticUserId && message.id !== canonicalUserId),
+			);
 			if (stale) showStaleDocumentResult();
 			return true;
 		};
@@ -1038,7 +1116,7 @@ function ChatStripPanel() {
 			let sessionId = activeSessionId;
 			if (!sessionId) {
 				const created = await nativeBridgeClient.aiEdition.chatCreateSession(projectId);
-				if (activeOperationRef.current?.localId !== localOperationId) {
+				if (operation.cancelled || !ownsUi()) {
 					void nativeBridgeClient.aiEdition
 						.chatDeleteSession(projectId, created.id)
 						.catch(() => undefined);
@@ -1048,47 +1126,68 @@ function ChatStripPanel() {
 					void nativeBridgeClient.aiEdition
 						.chatDeleteSession(projectId, created.id)
 						.catch(() => undefined);
-					setMessages((prev) => prev.filter((message) => message.id !== optimisticUserId));
-					showStaleDocumentResult();
+					if (ownsUi()) {
+						setMessages((prev) => prev.filter((message) => message.id !== optimisticUserId));
+						showStaleDocumentResult();
+					}
 					return;
 				}
 				sessionId = created.id;
 				setSessions((prev) => [...prev, created]);
 				setActiveSessionId(sessionId);
 			}
-			const activeOperation = activeOperationRef.current;
-			if (!activeOperation || activeOperation.localId !== localOperationId) return;
-			activeOperation.sessionId = sessionId;
-			activeOperation.remoteId = localOperationId;
+			if (operation.cancelled || !ownsUi()) return;
+			operation.sessionId = sessionId;
+			operation.remoteId = localOperationId;
+			operation.phase = "running";
 			// ponytail: start collecting the live reasoning trace for THIS run —
 			// the subscription only appends deltas whose sessionId matches.
 			thinkingRunSessionRef.current = sessionId;
 			// Send exactly the document version represented by documentOperation so a later result
 			// can only replace the same unchanged version.
-			const result = await nativeBridgeClient.aiEdition.chatRun(
+			const runPromise = nativeBridgeClient.aiEdition.chatRun(
 				projectId,
 				sessionId,
 				text,
 				documentSnapshot,
 				localOperationId,
 			);
-			if (activeOperationRef.current?.localId !== localOperationId) {
+			operation.stopHeartbeat = startOperationHeartbeat(projectId, sessionId, localOperationId);
+			const result = await runPromise;
+			if (operation.cancelled || !ownsUi()) {
+				await discardRun(false);
 				return;
 			}
 			const assistant = result.assistantMessage;
 			if (result.success && assistant) {
+				canonicalUserId = result.userMessageCheckpointId ?? null;
+				setMessages((prev) =>
+					prev.map((message) =>
+						message.id === optimisticUserId
+							? {
+									...message,
+									id: canonicalUserId ?? optimisticUserId,
+									checkpointId: canonicalUserId,
+								}
+							: message,
+					),
+				);
 				let appliedDocument = false;
 				if (result.document) {
+					operation.phase = "persisting";
 					try {
-						const applied = await applyAgentDocument(result.document, documentOperation);
-						if (activeOperationRef.current?.localId !== localOperationId) return;
-						if (!applied) {
-							await discardRun(sessionId, true);
+						const outcome = await applyAgentDocument(result.document, documentOperation);
+						if (!outcome.success) {
+							if (await discardRun(outcome.status === "stale")) {
+								if (outcome.status === "diverged") {
+									toast.error(t("chat.applyEditsFailed"), { description: outcome.error });
+								}
+							}
 							return;
 						}
 						appliedDocument = true;
 					} catch (err) {
-						if (await discardRun(sessionId, false)) {
+						if (await discardRun(false)) {
 							toast.error(t("chat.applyEditsFailed"), {
 								description: err instanceof Error ? err.message : String(err),
 							});
@@ -1097,24 +1196,20 @@ function ChatStripPanel() {
 					}
 				}
 				if (!documentStillMatches(appliedDocument)) {
-					await discardRun(sessionId, true);
+					await discardRun(true);
 					return;
 				}
-				const committed = await nativeBridgeClient.aiEdition.chatCommitRun(
-					projectId,
-					sessionId,
-					localOperationId,
+				operation.phase = "committing";
+				const committed = await retryAmbiguousCommit(() =>
+					nativeBridgeClient.aiEdition.chatCommitRun(projectId, sessionId, localOperationId),
 				);
 				if (!committed.success) {
-					if (await discardRun(sessionId, false)) {
+					if (await discardRun(false)) {
 						toast.error(t("chat.chatFailed"), { description: committed.error });
 					}
 					return;
 				}
-				if (
-					activeOperationRef.current?.localId !== localOperationId ||
-					!documentStillMatches(appliedDocument)
-				) {
+				if (!ownsUi() || !documentStillMatches(appliedDocument)) {
 					return;
 				}
 				setMessages((prev) => [
@@ -1133,20 +1228,20 @@ function ChatStripPanel() {
 				]);
 				void refreshSessions(projectId, documentOperation.documentGeneration);
 			} else {
-				if (await discardRun(sessionId, false)) {
+				if (await discardRun(false)) {
 					toast.error(result.error ?? t("chat.chatFailed"));
 				}
 			}
 		} catch (err) {
-			if (activeOperationRef.current?.localId !== localOperationId) return;
-			const sessionId = activeOperationRef.current?.sessionId;
-			if (sessionId && !(await discardRun(sessionId, false))) return;
-			if (activeOperationRef.current?.localId !== localOperationId) return;
+			if (operation.sessionId && !(await discardRun(false))) return;
+			if (!ownsUi()) return;
 			toast.error(t("chat.chatFailed"), {
 				description: err instanceof Error ? err.message : String(err),
 			});
 		} finally {
-			if (activeOperationRef.current?.localId === localOperationId) {
+			operation.stopHeartbeat();
+			operation.phase = "settled";
+			if (ownsUi()) {
 				activeOperationRef.current = null;
 				setBusy(false);
 				// ponytail: stop accepting thinking deltas and drop the in-flight
@@ -1171,7 +1266,16 @@ function ChatStripPanel() {
 	const consumePrompt = useChatPromptBus((s) => s.consume);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: send() is intentionally not a dep (recreated each render); consume() clears `pending` so this fires once per queued prompt.
 	useEffect(() => {
-		if (!pendingPrompt || !projectId || busy || rewindBusy || activeOperationRef.current) return;
+		if (
+			!pendingPrompt ||
+			!projectId ||
+			busy ||
+			rewindBusy ||
+			activeOperationRef.current ||
+			sessionActionRef.current
+		) {
+			return;
+		}
 		consumePrompt();
 		if (canChat) toast.success(tTimeline("toolbar.aiEnhanceRequested"));
 		void send(pendingPrompt);
@@ -1182,7 +1286,14 @@ function ChatStripPanel() {
 	// snapshot taken right before the user hit Send. axcut parity.
 	const confirmRewind = useCallback(
 		async (messageId: string) => {
-			if (!projectId || !activeSessionId || busy || rewindBusy || activeOperationRef.current) {
+			if (
+				!projectId ||
+				!activeSessionId ||
+				busy ||
+				rewindBusy ||
+				activeOperationRef.current ||
+				sessionActionRef.current
+			) {
 				return;
 			}
 			const launchState = useProjectStore.getState();
@@ -1193,28 +1304,36 @@ function ChatStripPanel() {
 				revision: launchState.revision,
 			};
 			const localOperationId = createPanelOperationId("rewind");
-			activeOperationRef.current = {
+			const operation: PanelOperation = {
 				localId: localOperationId,
 				kind: "rewind",
 				projectId,
 				sessionId: activeSessionId,
 				remoteId: null,
+				phase: "starting",
+				cancelled: false,
+				uiAttached: true,
+				abortRequested: false,
+				stopHeartbeat: () => undefined,
 			};
+			activeOperationRef.current = operation;
 			setRewindBusy(true);
-			let preparedOperationId: string | null = null;
-			const operationStillActive = () => activeOperationRef.current?.localId === localOperationId;
+			const ownsUi = () =>
+				mountedRef.current && operation.uiAttached && activeOperationRef.current === operation;
 			const abortPrepared = async (): Promise<boolean> => {
-				if (!preparedOperationId) return operationStillActive();
-				try {
-					await nativeBridgeClient.aiEdition.chatAbortRewind(
-						projectId,
-						activeSessionId,
-						preparedOperationId,
-					);
-				} catch {
-					// Expiry or an already-aborted preparation needs no second error.
+				if (operation.remoteId && !operation.abortRequested) {
+					operation.abortRequested = true;
+					try {
+						await nativeBridgeClient.aiEdition.chatAbortRewind(
+							projectId,
+							activeSessionId,
+							operation.remoteId,
+						);
+					} catch {
+						// Expiry or an already-aborted preparation needs no second error.
+					}
 				}
-				return operationStillActive();
+				return ownsUi();
 			};
 			try {
 				const prepared = await nativeBridgeClient.aiEdition.chatPrepareRewind(
@@ -1223,27 +1342,32 @@ function ChatStripPanel() {
 					messageId,
 				);
 				if (!prepared.success) {
-					if (!operationStillActive()) return;
+					if (!ownsUi()) return;
 					toast.error(prepared.error ?? t("chat.rewindFailed"));
 					return;
 				}
-				preparedOperationId = prepared.operationId;
-				const activeOperation = activeOperationRef.current;
-				if (!activeOperation || activeOperation.localId !== localOperationId) {
+				operation.remoteId = prepared.operationId;
+				if (operation.cancelled || !ownsUi()) {
 					await abortPrepared();
 					return;
 				}
-				activeOperation.remoteId = prepared.operationId;
+				operation.phase = "persisting";
+				operation.stopHeartbeat = startOperationHeartbeat(
+					projectId,
+					activeSessionId,
+					prepared.operationId,
+				);
 
-				const applied = await applyAgentDocument(prepared.document, documentOperation);
-				if (activeOperationRef.current?.localId !== localOperationId) return;
-				if (!applied) {
-					if (await abortPrepared()) showStaleDocumentResult();
+				const outcome = await applyAgentDocument(prepared.document, documentOperation);
+				if (!outcome.success) {
+					if (await abortPrepared()) {
+						if (outcome.status === "stale") showStaleDocumentResult();
+						else toast.error(t("chat.rewindFailed"), { description: outcome.error });
+					}
 					return;
 				}
 				const current = useProjectStore.getState();
 				if (
-					activeOperationRef.current?.localId !== localOperationId ||
 					current.projectId !== documentOperation.projectId ||
 					current.documentGeneration !== documentOperation.documentGeneration ||
 					current.revision !== documentOperation.revision + 1
@@ -1251,13 +1375,15 @@ function ChatStripPanel() {
 					if (await abortPrepared()) showStaleDocumentResult();
 					return;
 				}
-				const committed = await nativeBridgeClient.aiEdition.chatCommitRewind(
-					projectId,
-					activeSessionId,
-					prepared.operationId,
-					prepared.sessionRevision,
+				operation.phase = "committing";
+				const committed = await retryAmbiguousCommit(() =>
+					nativeBridgeClient.aiEdition.chatCommitRewind(
+						projectId,
+						activeSessionId,
+						prepared.operationId,
+						prepared.sessionRevision,
+					),
 				);
-				if (!operationStillActive()) return;
 				if (!committed.success) {
 					if (await abortPrepared()) {
 						toast.error(committed.error ?? t("chat.rewindFailed"));
@@ -1266,7 +1392,7 @@ function ChatStripPanel() {
 				}
 				const afterCommit = useProjectStore.getState();
 				if (
-					activeOperationRef.current?.localId !== localOperationId ||
+					!ownsUi() ||
 					afterCommit.projectId !== documentOperation.projectId ||
 					afterCommit.documentGeneration !== documentOperation.documentGeneration ||
 					afterCommit.revision !== documentOperation.revision + 1
@@ -1286,13 +1412,14 @@ function ChatStripPanel() {
 				setInput(committed.prompt);
 				toast.success(t("chat.rewoundSuccess"));
 			} catch (err) {
-				if (activeOperationRef.current?.localId !== localOperationId) return;
 				if (!(await abortPrepared())) return;
 				toast.error(t("chat.rewindFailed"), {
 					description: err instanceof Error ? err.message : String(err),
 				});
 			} finally {
-				if (activeOperationRef.current?.localId === localOperationId) {
+				operation.stopHeartbeat();
+				operation.phase = "settled";
+				if (ownsUi()) {
 					activeOperationRef.current = null;
 					setRewindBusy(false);
 					setRewindFor(null);
@@ -1405,12 +1532,32 @@ function ChatStripPanel() {
 	// change so the % tracks the live history.
 	const budget = computeBudget(messages);
 
-	const [compactNowPending, setCompactNowPending] = useState(false);
 	const compactNow = useCallback(async () => {
-		if (!projectId || !activeSessionId || compactNowPending || activeOperationRef.current) return;
+		if (
+			!projectId ||
+			!activeSessionId ||
+			compactNowPending ||
+			activeOperationRef.current ||
+			sessionActionRef.current
+		) {
+			return;
+		}
+		const token = {};
+		const generation = useProjectStore.getState().documentGeneration;
+		sessionActionRef.current = token;
+		const ownsUi = () => {
+			const current = useProjectStore.getState();
+			return (
+				mountedRef.current &&
+				sessionActionRef.current === token &&
+				current.projectId === projectId &&
+				current.documentGeneration === generation
+			);
+		};
 		setCompactNowPending(true);
 		try {
 			const result = await nativeBridgeClient.aiEdition.chatCompact(projectId, activeSessionId);
+			if (!ownsUi()) return;
 			if (!result) {
 				toast.info(t("chat.notEnoughHistory"));
 				return;
@@ -1427,48 +1574,88 @@ function ChatStripPanel() {
 			);
 			toast.success(t("chat.compactedSuccess"));
 		} catch (err) {
+			if (!ownsUi()) return;
 			toast.error(t("chat.compactFailed"), {
 				description: err instanceof Error ? err.message : String(err),
 			});
 		} finally {
-			setCompactNowPending(false);
+			if (sessionActionRef.current === token) {
+				sessionActionRef.current = null;
+				if (mountedRef.current) setCompactNowPending(false);
+			}
 		}
 	}, [projectId, activeSessionId, compactNowPending, t]);
 
 	const newChat = useCallback(async () => {
-		if (!projectId || activeOperationRef.current) return;
+		if (!projectId || activeOperationRef.current || sessionActionRef.current) return;
+		const token = {};
+		const generation = useProjectStore.getState().documentGeneration;
+		sessionActionRef.current = token;
+		const ownsUi = () => {
+			const current = useProjectStore.getState();
+			return (
+				mountedRef.current &&
+				sessionActionRef.current === token &&
+				current.projectId === projectId &&
+				current.documentGeneration === generation
+			);
+		};
 		try {
 			const created = await nativeBridgeClient.aiEdition.chatCreateSession(projectId);
+			if (!ownsUi()) {
+				void nativeBridgeClient.aiEdition
+					.chatDeleteSession(projectId, created.id)
+					.catch(() => undefined);
+				return;
+			}
 			setSessions((prev) => [...prev, created]);
 			setActiveSessionId(created.id);
 			setMessages([]);
 		} catch (err) {
+			if (!ownsUi()) return;
 			toast.error(t("chat.createSessionFailed"), {
 				description: err instanceof Error ? err.message : String(err),
 			});
+		} finally {
+			if (sessionActionRef.current === token) sessionActionRef.current = null;
 		}
 	}, [projectId, t]);
 
 	const selectSession = useCallback((id: string) => {
-		if (activeOperationRef.current) return;
+		if (activeOperationRef.current || sessionActionRef.current) return;
 		setActiveSessionId(id);
 	}, []);
 
 	const handleDelete = useCallback(
 		async (id: string) => {
-			if (!projectId || activeOperationRef.current) return;
+			if (!projectId || activeOperationRef.current || sessionActionRef.current) return;
+			const token = {};
+			const generation = useProjectStore.getState().documentGeneration;
+			sessionActionRef.current = token;
+			const ownsUi = () => {
+				const current = useProjectStore.getState();
+				return (
+					mountedRef.current &&
+					sessionActionRef.current === token &&
+					current.projectId === projectId &&
+					current.documentGeneration === generation
+				);
+			};
 			try {
 				const res = await nativeBridgeClient.aiEdition.chatDeleteSession(projectId, id);
-				if (!res.success) return;
+				if (!ownsUi() || !res.success) return;
 				setSessions((prev) => prev.filter((s) => s.id !== id));
 				if (activeSessionId === id) {
 					setActiveSessionId(null);
 					setMessages([]);
 				}
 			} catch (err) {
+				if (!ownsUi()) return;
 				toast.error(t("chat.deleteSessionFailed"), {
 					description: err instanceof Error ? err.message : String(err),
 				});
+			} finally {
+				if (sessionActionRef.current === token) sessionActionRef.current = null;
 			}
 		},
 		[projectId, activeSessionId, t],
@@ -1476,22 +1663,37 @@ function ChatStripPanel() {
 
 	const handleRename = useCallback(
 		async (id: string, title: string) => {
-			if (!projectId || activeOperationRef.current) return;
+			if (!projectId || activeOperationRef.current || sessionActionRef.current) return;
 			const trimmed = title.trim();
 			if (!trimmed) return;
+			const token = {};
+			const generation = useProjectStore.getState().documentGeneration;
+			sessionActionRef.current = token;
+			const ownsUi = () => {
+				const current = useProjectStore.getState();
+				return (
+					mountedRef.current &&
+					sessionActionRef.current === token &&
+					current.projectId === projectId &&
+					current.documentGeneration === generation
+				);
+			};
 			try {
 				const updated = await nativeBridgeClient.aiEdition.chatRenameSession(
 					projectId,
 					id,
 					trimmed,
 				);
-				if (updated) {
+				if (ownsUi() && updated) {
 					setSessions((prev) => prev.map((s) => (s.id === id ? updated : s)));
 				}
 			} catch (err) {
+				if (!ownsUi()) return;
 				toast.error(t("chat.renameSessionFailed"), {
 					description: err instanceof Error ? err.message : String(err),
 				});
+			} finally {
+				if (sessionActionRef.current === token) sessionActionRef.current = null;
 			}
 		},
 		[projectId, t],

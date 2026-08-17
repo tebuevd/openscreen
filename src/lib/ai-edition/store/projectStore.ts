@@ -20,6 +20,11 @@ export interface DocumentOperationToken {
 	readonly revision: number;
 }
 
+export type DocumentResultApplyOutcome =
+	| { success: true; status: "applied" | "reconciled" }
+	| { success: false; status: "stale" }
+	| { success: false; status: "diverged"; error: string };
+
 // Monotonic identity for one loaded document instance. A project can be opened,
 // replaced, then opened again with the same id; project id alone cannot distinguish them.
 let nextDocumentGeneration = 0;
@@ -87,7 +92,7 @@ export interface ProjectState {
 	applyDocumentResult: (
 		expected: DocumentOperationToken,
 		document: AxcutDocument,
-	) => Promise<boolean>;
+	) => Promise<DocumentResultApplyOutcome>;
 	setDocument: (document: AxcutDocument) => void;
 	replaceTimeline: (intervals: Interval[], reason: string) => Promise<void>;
 	restoreFullTimeline: () => Promise<void>;
@@ -100,6 +105,13 @@ export interface ProjectState {
 
 function parseDocument(value: unknown): AxcutDocument {
 	return documentSchema.parse(value);
+}
+
+function serializeSaveContent(document: AxcutDocument): string {
+	return JSON.stringify({
+		...document,
+		project: { ...document.project, updatedAt: "" },
+	});
 }
 
 function mergeAddedAsset(
@@ -609,7 +621,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				before.status !== "ready" ||
 				before.document?.project.id !== expected.projectId
 			) {
-				return false;
+				return { success: false, status: "stale" };
 			}
 
 			const parsed = parseDocument(document);
@@ -630,40 +642,63 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 					const result = await nativeBridgeClient.aiEdition.get(expected.projectId);
 					const authoritative =
 						result.success && result.document ? parseDocument(result.document) : null;
+					if (!authoritative || authoritative.project.id !== expected.projectId) {
+						throw new Error("Authoritative project document is unavailable");
+					}
 					const current = get();
 					if (
-						authoritative?.project.id === expected.projectId &&
-						current.documentGeneration === expected.documentGeneration &&
-						current.projectId === expected.projectId &&
-						current.revision === expected.revision
+						current.documentGeneration !== expected.documentGeneration ||
+						current.projectId !== expected.projectId ||
+						current.revision !== expected.revision
 					) {
-						const beforeJson = JSON.stringify(before.document);
-						const authoritativeJson = JSON.stringify(authoritative);
-						if (authoritativeJson !== beforeJson) {
-							const { clearHistory, pushHistory } = await import("./undo");
-							const latest = get();
-							const operationStillCurrent =
-								latest.documentGeneration === expected.documentGeneration &&
-								latest.projectId === expected.projectId &&
-								latest.revision === expected.revision;
-							if (operationStillCurrent) {
-								if (authoritativeJson === JSON.stringify(parsed)) {
-									pushHistory({
-										projectId: expected.projectId,
-										doc: structuredClone(before.document),
-									});
-								} else {
-									clearHistory();
-								}
-								set({
-									document: authoritative,
-									revision: expected.revision + 1,
-									dirty: false,
-									lastSavedAt: new Date(),
-								});
-							}
-						}
+						return { success: false, status: "stale" };
 					}
+
+					const beforeJson = JSON.stringify(before.document);
+					const authoritativeJson = JSON.stringify(authoritative);
+					const message = error instanceof Error ? error.message : String(error);
+					if (serializeSaveContent(authoritative) === serializeSaveContent(parsed)) {
+						const { pushHistory } = await import("./undo");
+						const latest = get();
+						if (
+							latest.documentGeneration !== expected.documentGeneration ||
+							latest.projectId !== expected.projectId ||
+							latest.revision !== expected.revision
+						) {
+							return { success: false, status: "stale" };
+						}
+						pushHistory({
+							projectId: expected.projectId,
+							doc: structuredClone(before.document),
+						});
+						set({
+							document: authoritative,
+							revision: expected.revision + 1,
+							dirty: false,
+							lastSavedAt: new Date(),
+						});
+						return { success: true, status: "reconciled" };
+					}
+
+					if (authoritativeJson !== beforeJson) {
+						const { clearHistory } = await import("./undo");
+						const latest = get();
+						if (
+							latest.documentGeneration !== expected.documentGeneration ||
+							latest.projectId !== expected.projectId ||
+							latest.revision !== expected.revision
+						) {
+							return { success: false, status: "stale" };
+						}
+						clearHistory();
+						set({
+							document: authoritative,
+							revision: expected.revision + 1,
+							dirty: false,
+							lastSavedAt: new Date(),
+						});
+					}
+					return { success: false, status: "diverged", error: message };
 				} catch (reconciliationError) {
 					console.warn(
 						"[project] could not reconcile an ambiguous document-result save:",
@@ -680,7 +715,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				current.projectId !== expected.projectId ||
 				current.revision !== expected.revision
 			) {
-				return false;
+				return { success: false, status: "stale" };
 			}
 			pushHistory({ projectId: expected.projectId, doc: structuredClone(before.document) });
 			set({
@@ -689,7 +724,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				dirty: false,
 				lastSavedAt: new Date(),
 			});
-			return true;
+			return { success: true, status: "applied" };
 		});
 	},
 

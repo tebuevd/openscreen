@@ -53,6 +53,7 @@ import {
 	listSessions,
 	prepareRewindToMessage,
 	renameSession,
+	renewChatOperation,
 	runChat,
 	selectSession,
 } from "../ai-edition/chat-service";
@@ -4137,6 +4138,7 @@ export function registerIpcHandlers(
 			),
 		commitAiEditionChatRun: commitChatRun,
 		abortAiEditionChatRun: abortChatRun,
+		renewAiEditionChatOperation: renewChatOperation,
 		undoAiEditionToolBatch: (_projectId, _sessionId) => ({
 			success: false,
 			error: "Per-tool-batch undo retired in favor of per-message rewind.",

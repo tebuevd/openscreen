@@ -476,7 +476,7 @@ describe("useProjectStore", () => {
 
 		await expect(
 			useProjectStore.getState().applyDocumentResult(expected, resultDocument),
-		).resolves.toBe(true);
+		).resolves.toEqual({ success: true, status: "applied" });
 
 		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
 		expect(bridgeMocks.save).toHaveBeenCalledWith(resultDocument);
@@ -501,7 +501,7 @@ describe("useProjectStore", () => {
 				...sampleDoc,
 				project: { ...sampleDoc.project, title: "Stale agent result" },
 			}),
-		).resolves.toBe(false);
+		).resolves.toEqual({ success: false, status: "stale" });
 
 		expect(bridgeMocks.save).not.toHaveBeenCalled();
 		expect(useProjectStore.getState()).toMatchObject({
@@ -525,7 +525,7 @@ describe("useProjectStore", () => {
 				...sampleDoc,
 				project: { ...sampleDoc.project, title: "Old generation result" },
 			}),
-		).resolves.toBe(false);
+		).resolves.toEqual({ success: false, status: "stale" });
 
 		expect(bridgeMocks.save).not.toHaveBeenCalled();
 		expect(useProjectStore.getState().document).toBe(reopened);
@@ -558,7 +558,7 @@ describe("useProjectStore", () => {
 
 		firstSave.resolve({ success: true, document: snapshots[0] });
 		await firstSaving;
-		await expect(applying).resolves.toBe(false);
+		await expect(applying).resolves.toEqual({ success: false, status: "stale" });
 
 		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
 		expect(useProjectStore.getState()).toMatchObject({
@@ -579,7 +579,7 @@ describe("useProjectStore", () => {
 				...sampleDoc,
 				project: { ...sampleDoc.project, title: "Rejected result" },
 			}),
-		).rejects.toThrow("disk full");
+		).resolves.toEqual({ success: false, status: "diverged", error: "disk full" });
 
 		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
 		expect(bridgeMocks.get).toHaveBeenCalledWith("proj_test");
@@ -595,12 +595,18 @@ describe("useProjectStore", () => {
 			project: { ...sampleDoc.project, title: "Committed despite lost response" },
 		};
 		bridgeMocks.save.mockRejectedValue(new Error("response lost"));
-		bridgeMocks.get.mockResolvedValue({ success: true, document: resultDocument });
+		bridgeMocks.get.mockResolvedValue({
+			success: true,
+			document: {
+				...resultDocument,
+				project: { ...resultDocument.project, updatedAt: "2026-08-16T10:05:00.000Z" },
+			},
+		});
 		loadDocument();
 
 		await expect(
 			useProjectStore.getState().applyDocumentResult(operationToken(), resultDocument),
-		).rejects.toThrow("response lost");
+		).resolves.toEqual({ success: true, status: "reconciled" });
 
 		expect(useProjectStore.getState()).toMatchObject({
 			document: { project: { title: "Committed despite lost response" } },
@@ -608,6 +614,33 @@ describe("useProjectStore", () => {
 		});
 		expect(undo()).toBe(true);
 		expect(useProjectStore.getState().document?.project.title).toBe("Test");
+	});
+
+	it("adopts a differing authoritative document and clears incompatible undo history", async () => {
+		const { clearHistory, pushHistory, undo } = await import("./undo");
+		clearHistory();
+		const intended = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Intended result" },
+		};
+		const authoritative = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "External authoritative result" },
+		};
+		bridgeMocks.save.mockRejectedValue(new Error("response lost"));
+		bridgeMocks.get.mockResolvedValue({ success: true, document: authoritative });
+		loadDocument();
+		pushHistory({ projectId: "proj_test", doc: structuredClone(sampleDoc) });
+
+		await expect(
+			useProjectStore.getState().applyDocumentResult(operationToken(), intended),
+		).resolves.toEqual({ success: false, status: "diverged", error: "response lost" });
+
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "External authoritative result" } },
+			dirty: false,
+		});
+		expect(undo()).toBe(false);
 	});
 
 	it("merges a delayed add response without clearing a newer dirty edit", async () => {
