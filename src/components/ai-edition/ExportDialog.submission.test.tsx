@@ -415,15 +415,45 @@ describe("ExportDialog submission", () => {
 
 	it("hydrates shared scene geometry without changing GIF sizing", async () => {
 		probeVideoDimensionsMock.mockResolvedValue({ width: 1080, height: 1920 });
+		bridgeMocks.pickExportSavePath.mockResolvedValueOnce({
+			success: true,
+			path: "/tmp/export.gif",
+		});
 		renderDialog(makeDocument(undefined, "9:16"));
 		fireEvent.click(screen.getByRole("button", { name: "GIF" }));
 		fireEvent.click(screen.getByRole("button", { name: "Export GIF" }));
 
 		await waitFor(() => expect(nativeMocks.exportGifNative).toHaveBeenCalledOnce());
 		const call = nativeMocks.exportGifNative.mock.calls[0];
+		expect(call?.[1]).toBe("/tmp/export.gif");
 		expect(call?.[3]).toEqual({ width: 404, height: 720, fps: 15, loopCount: 0 });
 		expect(submittedScene(call).output).toEqual({ width: 404, height: 720, fps: null });
 		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
+		expect(await screen.findByText("/tmp/export.gif")).toBeInTheDocument();
+	});
+
+	it.each([
+		"mp4",
+		"gif",
+	])("surfaces a failed %s transaction without reporting a saved path", async (format) => {
+		if (format === "gif") {
+			bridgeMocks.pickExportSavePath.mockResolvedValueOnce({
+				success: true,
+				path: "/tmp/failed.gif",
+			});
+			nativeMocks.exportGifNative.mockRejectedValueOnce(new Error("atomic install failed"));
+		} else {
+			nativeMocks.exportMultiNative.mockRejectedValueOnce(new Error("atomic install failed"));
+		}
+		renderDialog(makeDocument(video(1920, 1080)));
+		if (format === "gif") fireEvent.click(screen.getByRole("button", { name: "GIF" }));
+
+		fireEvent.click(screen.getByRole("button", { name: `Export ${format.toUpperCase()}` }));
+
+		expect(await screen.findByRole("alert")).toHaveTextContent("atomic install failed");
+		expect(
+			screen.queryByText(format === "gif" ? "/tmp/failed.gif" : "/tmp/export.mp4"),
+		).not.toBeInTheDocument();
 	});
 
 	it("does not continue when a source probe resolves after close", async () => {

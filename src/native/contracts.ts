@@ -167,8 +167,11 @@ export interface CompositorExportResult {
 /** Native render kept in a main-process transaction for a later post-processing commit. */
 export interface CompositorStagedExportResult {
 	transactionId: string;
-	temporaryPath: string;
 	stats: CompositorExportResult;
+}
+
+export interface CompositorStagedExportData {
+	data: ArrayBuffer;
 }
 
 export interface CompositorExportCommitResult {
@@ -746,6 +749,12 @@ export type NativeBridgeRequest =
 				params: CompositorExportParams;
 				additionalInputPaths: string[];
 			};
+			requestId?: string;
+	  }
+	| {
+			domain: "compositor";
+			action: "readStagedExport";
+			payload: { transactionId: string };
 			requestId?: string;
 	  }
 	| {

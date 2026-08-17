@@ -23,8 +23,10 @@ import type {
 	NativeFramePacket,
 	RemuxStats,
 } from "../../native/compositor-view/addon";
+import type { ExportTransactionOwner } from "./exportDestinationTransaction";
 import {
 	ExportDestinationTransactionManager,
+	normalizeLocalFilePath,
 	sharedExportDestinationTransactions,
 } from "./exportDestinationTransaction";
 
@@ -194,40 +196,59 @@ function validateClipInput(value: unknown, label: string): ClipInput {
 }
 
 function isEmbeddedAssetPath(value: string): boolean {
-	return /^(data|blob|https?):/i.test(value);
+	if (!value.startsWith("data:")) return false;
+	const comma = value.indexOf(",", 5);
+	return comma >= 0 && value.slice(5, comma).includes("base64");
 }
 
-/** Collect only schema fields the compositor opens, never arbitrary recursively nested paths. */
-export function collectNativeExportSourcePaths(
+interface NormalizedNativeExportInputs {
+	clips: ClipInput[];
+	sceneJson?: string;
+	sourcePaths: string[];
+	additionalInputPaths: string[];
+}
+
+/** Normalize exactly the schema fields native opens; never recursively scan arbitrary JSON. */
+export function normalizeNativeExportInputs(
 	clips: unknown,
 	sceneJson?: string,
 	additionalInputPaths: unknown = [],
-): string[] {
+): NormalizedNativeExportInputs {
 	if (!Array.isArray(clips)) throw new TypeError("Native export clips must be an array.");
 	if (!Array.isArray(additionalInputPaths)) {
 		throw new TypeError("Additional export input paths must be an array.");
 	}
 
 	const sourcePaths = new Set<string>();
-	const addFilePath = (value: unknown, label: string, required = false) => {
+	const normalizeLocal = (value: unknown, label: string, required = false): string => {
 		if (typeof value !== "string" || (required && !value.trim())) {
 			throw new TypeError(`${label} must be a${required ? " non-empty" : ""} string.`);
 		}
-		if (value.trim() && !isEmbeddedAssetPath(value)) sourcePaths.add(value);
+		if (!value.trim()) return "";
+		const normalized = normalizeLocalFilePath(value, label);
+		sourcePaths.add(normalized);
+		return normalized;
 	};
-	const addClip = (value: unknown, label: string) => {
+	const normalizeAsset = (value: unknown, label: string): string => {
+		if (typeof value !== "string") throw new TypeError(`${label} must be a string.`);
+		if (!value.trim() || isEmbeddedAssetPath(value)) return value;
+		return normalizeLocal(value, label);
+	};
+	const normalizeClip = (value: unknown, label: string): ClipInput => {
 		const clip = validateClipInput(value, label);
-		addFilePath(clip.screenPath, `${label}.screenPath`, true);
-		addFilePath(clip.webcamPath, `${label}.webcamPath`);
+		const screenPath = normalizeLocal(clip.screenPath, `${label}.screenPath`, true);
+		const webcamPath = normalizeLocal(clip.webcamPath, `${label}.webcamPath`);
 		// Cursor telemetry is opened from this deterministic sidecar when it exists.
-		sourcePaths.add(`${clip.screenPath}.cursor.json`);
+		sourcePaths.add(`${screenPath}.cursor.json`);
+		return { ...clip, screenPath, webcamPath };
 	};
 
-	clips.forEach((clip, index) => addClip(clip, `clips[${index}]`));
-	additionalInputPaths.forEach((inputPath, index) =>
-		addFilePath(inputPath, `additionalInputPaths[${index}]`, true),
+	const normalizedClips = clips.map((clip, index) => normalizeClip(clip, `clips[${index}]`));
+	const normalizedAdditionalInputPaths = additionalInputPaths.map((inputPath, index) =>
+		normalizeLocal(inputPath, `additionalInputPaths[${index}]`, true),
 	);
 
+	let normalizedSceneJson = sceneJson;
 	if (sceneJson !== undefined) {
 		let parsed: unknown;
 		try {
@@ -239,12 +260,12 @@ export function collectNativeExportSourcePaths(
 		if (!Array.isArray(scene.clips)) {
 			throw new TypeError("Native export scene clips must be an array.");
 		}
-		scene.clips.forEach((clip, index) => addClip(clip, `scene.clips[${index}]`));
+		scene.clips = scene.clips.map((clip, index) => normalizeClip(clip, `scene.clips[${index}]`));
 
 		if (scene.background !== undefined) {
 			const background = asRecord(scene.background, "scene.background");
 			if (background.kind === "image") {
-				addFilePath(background.path, "scene.background.path");
+				background.path = normalizeAsset(background.path, "scene.background.path");
 			}
 		}
 
@@ -255,7 +276,10 @@ export function collectNativeExportSourcePaths(
 			for (const [index, value] of scene.annotations.entries()) {
 				const annotation = asRecord(value, `scene.annotations[${index}]`);
 				if (annotation.kind === "image" && annotation.imagePath !== undefined) {
-					addFilePath(annotation.imagePath, `scene.annotations[${index}].imagePath`);
+					annotation.imagePath = normalizeAsset(
+						annotation.imagePath,
+						`scene.annotations[${index}].imagePath`,
+					);
 				}
 			}
 		}
@@ -266,18 +290,31 @@ export function collectNativeExportSourcePaths(
 				const sprites = asRecord(cursor.cursorSprites, "scene.cursor.cursorSprites");
 				for (const [name, value] of Object.entries(sprites)) {
 					const sprite = asRecord(value, `scene.cursor.cursorSprites.${name}`);
-					addFilePath(sprite.path, `scene.cursor.cursorSprites.${name}.path`);
+					sprite.path = normalizeAsset(sprite.path, `scene.cursor.cursorSprites.${name}.path`);
 				}
 			}
 		}
+		normalizedSceneJson = JSON.stringify(scene);
 	}
 
-	return [...sourcePaths];
+	return {
+		clips: normalizedClips,
+		sceneJson: normalizedSceneJson,
+		sourcePaths: [...sourcePaths],
+		additionalInputPaths: normalizedAdditionalInputPaths,
+	};
+}
+
+export function collectNativeExportSourcePaths(
+	clips: unknown,
+	sceneJson?: string,
+	additionalInputPaths: unknown = [],
+): string[] {
+	return normalizeNativeExportInputs(clips, sceneJson, additionalInputPaths).sourcePaths;
 }
 
 export interface StagedCompositorExport<TStats> {
 	transactionId: string;
-	temporaryPath: string;
 	stats: TStats;
 }
 
@@ -503,6 +540,7 @@ function tryLoadAddon(candidates: string[]): CompositorViewAddon | null {
 export class CompositorViewService {
 	private readonly options: CompositorViewServiceOptions;
 	private readonly exportDestinationTransactions: ExportDestinationTransactionManager;
+	private readonly internalExportOwner: ExportTransactionOwner = {};
 	private readonly rects = new Map<number, CompositorViewRect>();
 	private addon: CompositorViewAddon | null = null;
 	private loadAttempted = false;
@@ -682,17 +720,29 @@ export class CompositorViewService {
 		sceneJson: string | undefined,
 		params: ExportParamsInput,
 		onProgress?: (frames: number) => void,
+		owner: ExportTransactionOwner = this.internalExportOwner,
 	): Promise<ExportStats | null> {
 		const validatedParams = validateExportParamsInput(params);
 		const target = outPath ?? path.join(app.getPath("temp"), "openscreen-native-export.mp4");
 		const resolvedSceneJson = sceneJson ? resolveSceneAssetPaths(sceneJson) : undefined;
-		const sourcePaths = collectNativeExportSourcePaths(clips, resolvedSceneJson);
+		const inputs = normalizeNativeExportInputs(clips, resolvedSceneJson);
 		const addon = this.ensureAddon();
 		if (!addon) {
 			return null;
 		}
-		return this.exportDestinationTransactions.run(target, ".mp4", sourcePaths, (temporaryPath) =>
-			addon.exportMulti(clips, temporaryPath, resolvedSceneJson, validatedParams, onProgress),
+		return this.exportDestinationTransactions.run(
+			owner,
+			target,
+			".mp4",
+			inputs.sourcePaths,
+			(temporaryPath) =>
+				addon.exportMulti(
+					inputs.clips,
+					temporaryPath,
+					inputs.sceneJson,
+					validatedParams,
+					onProgress,
+				),
 		);
 	}
 
@@ -704,58 +754,69 @@ export class CompositorViewService {
 		params: ExportParamsInput,
 		additionalInputPaths: string[],
 		onProgress?: (frames: number) => void,
+		owner: ExportTransactionOwner = this.internalExportOwner,
 	): Promise<StagedCompositorExport<ExportStats> | null> {
 		const validatedParams = validateExportParamsInput(params);
 		const resolvedSceneJson = sceneJson ? resolveSceneAssetPaths(sceneJson) : undefined;
-		const sourcePaths = collectNativeExportSourcePaths(
-			clips,
-			resolvedSceneJson,
-			additionalInputPaths,
-		);
+		const inputs = normalizeNativeExportInputs(clips, resolvedSceneJson, additionalInputPaths);
 		const addon = this.ensureAddon();
 		if (!addon) return null;
 
-		const transaction = await this.exportDestinationTransactions.begin(
-			outPath,
-			".mp4",
-			sourcePaths,
+		const transaction = await this.exportDestinationTransactions.begin({
+			owner,
+			requestedPath: outPath,
+			extension: ".mp4",
+			sourcePaths: inputs.sourcePaths,
+			requiresPostprocess: true,
+		});
+		const stats = await this.exportDestinationTransactions.render(
+			owner,
+			transaction.id,
+			(temporaryPath) =>
+				addon.exportMulti(
+					inputs.clips,
+					temporaryPath,
+					inputs.sceneJson,
+					validatedParams,
+					onProgress,
+				),
 		);
-		try {
-			const stats = await addon.exportMulti(
-				clips,
-				transaction.temporaryPath,
-				resolvedSceneJson,
-				validatedParams,
-				onProgress,
-			);
-			await this.exportDestinationTransactions.validate(transaction.id);
-			return {
-				transactionId: transaction.id,
-				temporaryPath: transaction.temporaryPath,
-				stats,
-			};
-		} catch (error) {
-			await this.exportDestinationTransactions.abort(transaction.id);
-			throw error;
-		}
+		return { transactionId: transaction.id, stats };
 	}
 
-	async replaceStagedExport(transactionId: string, data: ArrayBuffer): Promise<void> {
+	async readStagedExport(
+		owner: ExportTransactionOwner,
+		transactionId: string,
+	): Promise<ArrayBuffer> {
+		const data = await this.exportDestinationTransactions.readRenderedOutput(owner, transactionId);
+		return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) as ArrayBuffer;
+	}
+
+	async replaceStagedExport(
+		owner: ExportTransactionOwner,
+		transactionId: string,
+		data: ArrayBuffer,
+	): Promise<void> {
 		if (!(data instanceof ArrayBuffer)) {
 			throw new TypeError("Staged export data must be an ArrayBuffer.");
 		}
-		await this.exportDestinationTransactions.replaceTemporaryOutput(
+		await this.exportDestinationTransactions.replaceWithPostprocessedOutput(
+			owner,
 			transactionId,
 			new Uint8Array(data),
 		);
 	}
 
-	commitStagedExport(transactionId: string): Promise<string> {
-		return this.exportDestinationTransactions.commit(transactionId);
+	commitStagedExport(owner: ExportTransactionOwner, transactionId: string): Promise<string> {
+		return this.exportDestinationTransactions.commit(owner, transactionId);
 	}
 
-	abortStagedExport(transactionId: string): Promise<void> {
-		return this.exportDestinationTransactions.abort(transactionId);
+	abortStagedExport(owner: ExportTransactionOwner, transactionId: string): Promise<void> {
+		return this.exportDestinationTransactions.abort(owner, transactionId);
+	}
+
+	abortOwnerExports(owner: ExportTransactionOwner): Promise<void> {
+		return this.exportDestinationTransactions.abortOwner(owner);
 	}
 
 	/** Native GIF export. Same inputs as `exportMulti` — one clip list, one scene —
@@ -771,16 +832,22 @@ export class CompositorViewService {
 		sceneJson?: string,
 		params?: GifParamsInput,
 		onProgress?: (frames: number) => void,
+		owner: ExportTransactionOwner = this.internalExportOwner,
 	): Promise<GifExportStats | null> {
 		const target = outPath ?? path.join(app.getPath("temp"), "openscreen-native-export.gif");
 		const resolvedSceneJson = sceneJson ? resolveSceneAssetPaths(sceneJson) : undefined;
-		const sourcePaths = collectNativeExportSourcePaths(clips, resolvedSceneJson);
+		const inputs = normalizeNativeExportInputs(clips, resolvedSceneJson);
 		const addon = this.ensureAddon();
 		if (!addon) {
 			return null;
 		}
-		return this.exportDestinationTransactions.run(target, ".gif", sourcePaths, (temporaryPath) =>
-			addon.exportGif(clips, temporaryPath, resolvedSceneJson, params, onProgress),
+		return this.exportDestinationTransactions.run(
+			owner,
+			target,
+			".gif",
+			inputs.sourcePaths,
+			(temporaryPath) =>
+				addon.exportGif(inputs.clips, temporaryPath, inputs.sceneJson, params, onProgress),
 		);
 	}
 

@@ -39,6 +39,7 @@ import {
 	exportMultiNative,
 	exportMultiNativeStaged,
 	nativeBridgeClient,
+	readStagedNativeExport,
 	replaceStagedNativeExport,
 } from "@/native";
 import { buildSceneDescription } from "@/native/sceneDescription";
@@ -316,17 +317,14 @@ export async function runExport(request: CliExportRequest): Promise<CliDoneResul
 				]);
 				transactionId = staged.transactionId;
 				window.electronAPI.cliProgress({ percentage: 100, phase: "mixing-voiceover" });
-				const [videoResponse, audioResponse] = await Promise.all([
-					fetch(toFileUrl(staged.temporaryPath)),
+				const [videoData, audioResponse] = await Promise.all([
+					readStagedNativeExport(transactionId),
 					fetch(toFileUrl(request.audioPath)),
 				]);
-				if (!videoResponse.ok) {
-					throw new Error("Failed to read the staged video back for voiceover mixing");
-				}
 				if (!audioResponse.ok) {
 					throw new Error(`Failed to read voiceover file: ${request.audioPath}`);
 				}
-				const mixed = await mixVoiceoverIntoVideo(await videoResponse.blob(), {
+				const mixed = await mixVoiceoverIntoVideo(new Blob([videoData], { type: "video/mp4" }), {
 					voiceoverData: await audioResponse.arrayBuffer(),
 					mode: request.audioMode,
 					offsetSec: request.audioOffsetSec,

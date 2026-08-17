@@ -10,6 +10,7 @@ const nativeMocks = vi.hoisted(() => ({
 	exportMultiNativeStaged: vi.fn(),
 	loadProjectFileFromPath: vi.fn(),
 	getTelemetry: vi.fn(),
+	readStagedNativeExport: vi.fn(),
 	replaceStagedNativeExport: vi.fn(),
 }));
 const voiceoverMocks = vi.hoisted(() => ({ mixVoiceoverIntoVideo: vi.fn() }));
@@ -24,6 +25,7 @@ vi.mock("@/native", () => ({
 		project: { loadProjectFileFromPath: nativeMocks.loadProjectFileFromPath },
 		cursor: { getTelemetry: nativeMocks.getTelemetry },
 	},
+	readStagedNativeExport: nativeMocks.readStagedNativeExport,
 	replaceStagedNativeExport: nativeMocks.replaceStagedNativeExport,
 }));
 
@@ -92,9 +94,11 @@ describe("CLI MP4 export submission", () => {
 		});
 		nativeMocks.exportMultiNativeStaged.mockResolvedValue({
 			transactionId: "transaction-1",
-			temporaryPath: "/tmp/.export-stage.mp4",
 			stats: { frames: 60, wallS: 1, fps: 60, videoDurationS: 1 },
 		});
+		nativeMocks.readStagedNativeExport.mockResolvedValue(
+			new TextEncoder().encode("native output").buffer,
+		);
 		nativeMocks.replaceStagedNativeExport.mockResolvedValue({ ok: true });
 		nativeMocks.commitStagedNativeExport.mockResolvedValue({ outputPath: "/tmp/export.mp4" });
 		nativeMocks.abortStagedNativeExport.mockResolvedValue({ ok: true });
@@ -161,11 +165,7 @@ describe("CLI MP4 export submission", () => {
 		let destinationBytes = "old destination";
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async (url: string) =>
-				url.includes("voiceover")
-					? ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) } as Response)
-					: ({ ok: true, blob: async () => new Blob(["native output"]) } as Response),
-			),
+			vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }) as Response),
 		);
 		voiceoverMocks.mixVoiceoverIntoVideo.mockRejectedValueOnce(new Error("voiceover failed"));
 		nativeMocks.commitStagedNativeExport.mockImplementation(async () => {
@@ -188,11 +188,10 @@ describe("CLI MP4 export submission", () => {
 		let destinationBytes = "old destination";
 		vi.stubGlobal(
 			"fetch",
-			vi.fn(async (url: string) =>
-				url.includes("voiceover")
-					? ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) } as Response)
-					: ({ ok: true, blob: async () => new Blob([stagedBytes]) } as Response),
-			),
+			vi.fn(async () => ({ ok: true, arrayBuffer: async () => new ArrayBuffer(4) }) as Response),
+		);
+		nativeMocks.readStagedNativeExport.mockImplementation(
+			async () => new TextEncoder().encode(stagedBytes).buffer,
 		);
 		nativeMocks.replaceStagedNativeExport.mockImplementation(
 			async (_transactionId: string, data: ArrayBuffer) => {
@@ -210,6 +209,7 @@ describe("CLI MP4 export submission", () => {
 		expect(nativeMocks.exportMultiNativeStaged.mock.calls[0]?.[1]).toBe("/tmp/export.mp4");
 		expect(nativeMocks.exportMultiNativeStaged.mock.calls[0]?.[4]).toEqual(["/tmp/voiceover.wav"]);
 		expect(nativeMocks.replaceStagedNativeExport).toHaveBeenCalledOnce();
+		expect(nativeMocks.readStagedNativeExport).toHaveBeenCalledWith("transaction-1");
 		expect(nativeMocks.commitStagedNativeExport).toHaveBeenCalledWith("transaction-1");
 		expect(nativeMocks.abortStagedNativeExport).not.toHaveBeenCalled();
 		expect(destinationBytes).toBe("mixed output");

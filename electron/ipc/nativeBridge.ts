@@ -22,6 +22,7 @@ import { CursorService } from "../native-bridge/services/cursorService";
 import { ProjectService } from "../native-bridge/services/projectService";
 import { SystemService } from "../native-bridge/services/systemService";
 import { createNativeBridgeState } from "../native-bridge/store";
+import { ExportTransactionOwnerRegistry } from "./exportTransactionOwnerRegistry";
 
 export interface NativeBridgeContext {
 	getPlatform: () => NodeJS.Platform;
@@ -221,6 +222,9 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		getCursorCapabilities: () => cursorService.getCapabilities(),
 	});
 	const compositorViewService = new CompositorViewService();
+	const exportTransactionOwners = new ExportTransactionOwnerRegistry({
+		abortOwner: (owner) => compositorViewService.abortOwnerExports(owner),
+	});
 	const aiEditionService = new AiEditionService({
 		documents: context.getAiEditionDocuments(),
 		// Passed uncalled on purpose — invoking it here would build the store (and
@@ -400,6 +404,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 							return createSuccessResponse(requestId, { ok: true });
 						case "exportMulti": {
 							const sender = event.sender;
+							const owner = exportTransactionOwners.ownerFor(sender);
 							const stats = await compositorViewService.exportMulti(
 								request.payload.clips,
 								request.payload.outPath,
@@ -410,6 +415,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 										sender.send("export:native-progress", frames);
 									}
 								},
+								owner,
 							);
 							if (!stats) {
 								return createErrorResponse(
@@ -422,6 +428,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 						}
 						case "exportMultiStaged": {
 							const sender = event.sender;
+							const owner = exportTransactionOwners.ownerFor(sender);
 							const result = await compositorViewService.exportMultiStaged(
 								request.payload.clips,
 								request.payload.outPath,
@@ -433,6 +440,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 										sender.send("export:native-progress", frames);
 									}
 								},
+								owner,
 							);
 							if (!result) {
 								return createErrorResponse(
@@ -443,8 +451,16 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 							}
 							return createSuccessResponse(requestId, result);
 						}
+						case "readStagedExport": {
+							const data = await compositorViewService.readStagedExport(
+								exportTransactionOwners.ownerFor(event.sender),
+								request.payload.transactionId,
+							);
+							return createSuccessResponse(requestId, { data });
+						}
 						case "replaceStagedExport":
 							await compositorViewService.replaceStagedExport(
+								exportTransactionOwners.ownerFor(event.sender),
 								request.payload.transactionId,
 								request.payload.data,
 							);
@@ -452,14 +468,19 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 						case "commitStagedExport":
 							return createSuccessResponse(requestId, {
 								outputPath: await compositorViewService.commitStagedExport(
+									exportTransactionOwners.ownerFor(event.sender),
 									request.payload.transactionId,
 								),
 							});
 						case "abortStagedExport":
-							await compositorViewService.abortStagedExport(request.payload.transactionId);
+							await compositorViewService.abortStagedExport(
+								exportTransactionOwners.ownerFor(event.sender),
+								request.payload.transactionId,
+							);
 							return createSuccessResponse(requestId, { ok: true as const });
 						case "exportGif": {
 							const sender = event.sender;
+							const owner = exportTransactionOwners.ownerFor(sender);
 							const stats = await compositorViewService.exportGif(
 								request.payload.clips,
 								request.payload.outPath,
@@ -470,6 +491,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 										sender.send("export:native-progress", frames);
 									}
 								},
+								owner,
 							);
 							if (!stats) {
 								return createErrorResponse(

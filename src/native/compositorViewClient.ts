@@ -25,6 +25,7 @@ import type {
 	CompositorExportResult,
 	CompositorFramePacket,
 	CompositorParamValue,
+	CompositorStagedExportData,
 	CompositorStagedExportResult,
 	CompositorViewRect,
 	CompositorViewResult,
@@ -190,6 +191,14 @@ export function replaceStagedNativeExport(
 		action: "replaceStagedExport",
 		payload: { transactionId, data },
 	});
+}
+
+export function readStagedNativeExport(transactionId: string): Promise<ArrayBuffer> {
+	return requireNativeBridgeData<CompositorStagedExportData>({
+		domain: "compositor",
+		action: "readStagedExport",
+		payload: { transactionId },
+	}).then((result) => result.data);
 }
 
 export function commitStagedNativeExport(

@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type {
 	ClipInput,
@@ -8,7 +9,11 @@ import type {
 	ExportStats,
 	GifExportStats,
 } from "../../native/compositor-view/addon";
-import { CompositorViewService, collectNativeExportSourcePaths } from "./compositorViewService";
+import {
+	CompositorViewService,
+	collectNativeExportSourcePaths,
+	normalizeNativeExportInputs,
+} from "./compositorViewService";
 import { ExportDestinationTransactionManager } from "./exportDestinationTransaction";
 
 const MP4_STATS: ExportStats = { frames: 60, wallS: 1, fps: 60, videoDurationS: 1 };
@@ -64,6 +69,7 @@ describe("compositor export destination safety", () => {
 	it.each([
 		"exact",
 		"relative",
+		"file-url",
 		"symlink",
 		"hard-link",
 	])("rejects a %s source alias before calling native", async (aliasKind) => {
@@ -72,6 +78,8 @@ describe("compositor export destination safety", () => {
 		let destination = sourcePath;
 		if (aliasKind === "relative") {
 			destination = path.relative(process.cwd(), sourcePath);
+		} else if (aliasKind === "file-url") {
+			destination = pathToFileURL(sourcePath).toString();
 		} else if (aliasKind === "symlink") {
 			destination = path.join(directory, "recording-symlink.mp4");
 			await fs.symlink(sourcePath, destination);
@@ -139,7 +147,8 @@ describe("compositor export destination safety", () => {
 		expect(result).toEqual(MP4_STATS);
 		const nativePath = exportMulti.mock.calls[0]?.[1];
 		expect(nativePath).not.toBe(destination);
-		expect(path.dirname(nativePath ?? "")).toBe(directory);
+		expect(path.dirname(path.dirname(nativePath ?? ""))).toBe(directory);
+		expect(path.basename(path.dirname(nativePath ?? ""))).toMatch(/^\.openscreen-export-/);
 		expect(path.extname(nativePath ?? "")).toBe(".mp4");
 		expect(await fs.readFile(destination, "utf8")).toBe("native mp4");
 		expect((await fs.readdir(directory)).some((name) => name.includes(".openscreen-export-"))).toBe(
@@ -160,7 +169,8 @@ describe("compositor export destination safety", () => {
 		expect(result).toEqual(GIF_STATS);
 		const nativePath = exportGif.mock.calls[0]?.[1];
 		expect(nativePath).not.toBe(destination);
-		expect(path.dirname(nativePath ?? "")).toBe(directory);
+		expect(path.dirname(path.dirname(nativePath ?? ""))).toBe(directory);
+		expect(path.basename(path.dirname(nativePath ?? ""))).toMatch(/^\.openscreen-export-/);
 		expect(path.extname(nativePath ?? "")).toBe(".gif");
 		expect(await fs.readFile(destination, "utf8")).toBe("native gif");
 	});
@@ -174,6 +184,7 @@ describe("compositor export destination safety", () => {
 		await fs.writeFile(destination, "old export");
 		const clips = [clip(sourcePath)];
 		const { service } = makeService();
+		const owner = {};
 
 		const staged = await service.exportMultiStaged(
 			clips,
@@ -181,20 +192,58 @@ describe("compositor export destination safety", () => {
 			sceneJson(clips),
 			{ width: 1920, height: 1080 },
 			[voiceoverPath],
+			undefined,
+			owner,
 		);
 		if (!staged) throw new Error("Expected staged export");
+		expect(staged).toEqual({ transactionId: expect.any(String), stats: MP4_STATS });
 		expect(await fs.readFile(destination, "utf8")).toBe("old export");
+		expect(
+			new TextDecoder().decode(await service.readStagedExport(owner, staged.transactionId)),
+		).toBe("native mp4");
 
 		await service.replaceStagedExport(
+			owner,
 			staged.transactionId,
 			new TextEncoder().encode("mixed mp4").buffer,
 		);
-		await expect(service.commitStagedExport(staged.transactionId)).resolves.toBe(destination);
+		await expect(service.commitStagedExport(owner, staged.transactionId)).resolves.toBe(
+			destination,
+		);
 
 		expect(await fs.readFile(destination, "utf8")).toBe("mixed mp4");
 		expect((await fs.readdir(directory)).some((name) => name.includes(".openscreen-export-"))).toBe(
 			false,
 		);
+	});
+
+	it("normalizes a local file URL before native and collision comparison", async () => {
+		const sourcePath = path.join(directory, "recording.mp4");
+		const destination = path.join(directory, "output.mp4");
+		await fs.writeFile(sourcePath, "recording bytes");
+		const clips = [clip(pathToFileURL(sourcePath).toString())];
+		const { service, exportMulti } = makeService();
+
+		await service.exportMulti(clips, destination, sceneJson(clips), {
+			width: 1920,
+			height: 1080,
+		});
+
+		expect(exportMulti.mock.calls[0]?.[0][0]?.screenPath).toBe(sourcePath);
+	});
+
+	it("rejects a file-URL source alias before native opens it", async () => {
+		const sourcePath = path.join(directory, "recording.mp4");
+		await fs.writeFile(sourcePath, "recording bytes");
+		const clips = [clip(pathToFileURL(sourcePath).toString())];
+		const { service, exportMulti } = makeService();
+
+		await expect(
+			service.exportMulti(clips, sourcePath, sceneJson(clips), { width: 1920, height: 1080 }),
+		).rejects.toThrow(/same file as an export source/);
+
+		expect(exportMulti).not.toHaveBeenCalled();
+		expect(await fs.readFile(sourcePath, "utf8")).toBe("recording bytes");
 	});
 
 	it("treats a voiceover as an explicit staged-export input before native runs", async () => {
@@ -252,5 +301,41 @@ describe("collectNativeExportSourcePaths", () => {
 		);
 		expect(sources).not.toContain("/not/a/native/input.mp4");
 		expect(sources.some((source) => source.startsWith("data:"))).toBe(false);
+	});
+
+	it("keeps intentional data assets separate from local collision identities", () => {
+		const clips = [clip("/media/screen.mp4")];
+		const normalized = normalizeNativeExportInputs(
+			clips,
+			JSON.stringify({
+				clips,
+				background: { kind: "image", path: "data:image/png;base64,AAAA" },
+			}),
+		);
+		const scene = JSON.parse(normalized.sceneJson ?? "{}") as {
+			background: { path: string };
+		};
+
+		expect(scene.background.path).toBe("data:image/png;base64,AAAA");
+		expect(normalized.sourcePaths).not.toContain(scene.background.path);
+	});
+
+	it.each([
+		"file:///%ZZ",
+		"blob:opaque",
+		"ftp://localhost/image.png",
+		"http://example.test/image.png",
+		"https://example.test/image.png",
+		"data:image/png,not-base64",
+		"data:image/png;base64",
+		"DATA:image/png;base64,AAAA",
+	])("rejects ambiguous native asset input %s", (inputPath) => {
+		const clips = [clip("/media/screen.mp4")];
+		expect(() =>
+			normalizeNativeExportInputs(
+				clips,
+				JSON.stringify({ clips, background: { kind: "image", path: inputPath } }),
+			),
+		).toThrow(/local file URL|unsupported protocol/);
 	});
 });
