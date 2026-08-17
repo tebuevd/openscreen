@@ -8,19 +8,19 @@ OpenScreen builds its renderer, Electron main process, preload bridge, native he
 |---|---|
 | `npm run dev` | Starts Vite with the Electron plugin; builds and launches main/preload unless `NO_ELECTRON` is set. |
 | `npm run build-vite` | Runs TypeScript checking and Vite only. It produces `dist/` and `dist-electron/` but no installer. |
-| `npm run build` | Runs TypeScript checking, Vite, then unrestricted `electron-builder`. It does not build platform helpers or compositor addons. For a complete package, use `build:win`, `build:mac`, or `build:linux` — see [Stale native artifacts](#stale-native-artifacts). |
-| `npm run build:mac` | Builds the ScreenCaptureKit and cursor helpers, builds the pinned LGPL ffmpeg tree and Metal compositor addon, checks TypeScript, runs Vite, and packages the macOS target. |
+| `npm run build` | Runs TypeScript checking, Vite, then unrestricted `electron-builder`. It does not build platform helpers or compositor addons. Refresh the exact target's native payload before packaging; see [Stale native artifacts](#stale-native-artifacts). |
+| `npm run build:mac` | Builds FFmpeg and the Metal addon for `process.arch` (the helper build defaults there too), then asks electron-builder for its configured `x64` and `arm64` targets. It does not stage STT. A clean checkout therefore cannot produce both complete targets with this command; use the [per-architecture flow](#macos-builds-are-architecture-specific). |
 | `npm run build:win` | Builds WGC/cursor helpers and the D3D11 compositor addon, fetches FFmpeg, checks TypeScript, runs Vite, and packages the Windows NSIS target without npm rebuild. |
 | `npm run build:win:store` | Performs the Windows native and renderer build, then asks electron-builder for the configured AppX Store package. |
 | `npm run build:linux` | Fetches the pinned shared ffmpeg SDK, builds the PipeWire helper and wgpu/Vulkan compositor addon, checks TypeScript, runs Vite, then packages AppImage, Debian, pacman, and RPM artifacts without npm rebuild. Its explicit `--linux` target list overrides `linux.target` in `electron-builder.json5`, so a target added to the config alone is never built. |
-| `npm run build:native:mac` | Uses SwiftPM to build requested single-architecture ScreenCaptureKit and macOS cursor helpers and stages them under `electron/native/bin/darwin-*`. |
+| `npm run build:native:mac` | Uses SwiftPM to build one single-architecture ScreenCaptureKit/cursor helper pair per `OPENSCREEN_MAC_HELPER_ARCHS` entry (default: `process.arch`) and stages it under `electron/native/bin/darwin-*`. |
 | `npm run build:native:win` | Uses CMake/Ninja in an MSVC environment to build WGC capture and cursor-sampler executables and stage x64 binaries. |
 | `npm run build:native:compositor` | Uses Cargo/MSVC and the pinned shared FFmpeg SDK to build and stage the Windows `compositor_view.node`. |
-| `npm run build:native:compositor:mac` | Uses Cargo/Xcode and the pinned LGPL FFmpeg tree to build and stage the macOS addon and dylibs. |
+| `npm run build:native:compositor:mac` | Uses Cargo/Xcode and the pinned LGPL FFmpeg tree to build and stage the host-architecture macOS addon and dylibs. |
 | `npm run build:native:compositor:linux` | Uses Cargo, libclang, patchelf, and the pinned shared FFmpeg SDK to build the Linux addon, rename its FFmpeg symbols, and stage the addon and shared objects. |
 | `npm run build:whisper-binaries` | Runs the whisper.cpp CMake build and stages the speech-to-text executable plus ggml backend sidecars for the host. |
 | `npm run fetch:ffmpeg` | Downloads and stages the FFmpeg binaries and SDK used by native Windows capture/compositing paths. |
-| `npm run fetch:ffmpeg:mac` | Builds the pinned LGPL-compatible macOS shared FFmpeg tree from source. |
+| `npm run fetch:ffmpeg:mac` | Builds the pinned LGPL-compatible macOS shared FFmpeg tree from source for `process.arch`. |
 | `npm run fetch:ffmpeg:sdk` | Downloads only the pinned shared FFmpeg SDK used to build the Linux helper and compositor addon. |
 | `nix build` | Builds the flake's default Linux package with system Electron rather than electron-builder. |
 | `nix develop` | Opens the Linux Node/Electron/native-build/Playwright development shell defined by the flake. |
@@ -41,7 +41,50 @@ A usable full package depends on generated artifacts that are not committed:
 | Native wgpu/Vulkan compositor addon | `electron/native/bin/linux-<arch>/compositor_view.node` | Rust, host linker, libclang, patchelf, and the shared FFmpeg SDK from `fetch:ffmpeg:sdk` |
 | FFmpeg runtime files | matching `electron/native/bin/<platform>-<arch>/` directory | Downloaded by `fetch:ffmpeg` on Windows; **built from source** by `fetch:ffmpeg:mac` on macOS (~5 min); downloaded as an SDK and symbol-renamed during the Linux compositor build |
 
-Electron-builder copies only the matching `electron/native/bin/<platform>-<arch>/` directory into each package. On Windows, macOS, and Linux the compositor `.node` ships from inside that directory, beside the ffmpeg libraries it links against, and never travels through ASAR. Linux keeps the helper's unmodified FFmpeg libraries under `helper-ffmpeg/`; the compositor libraries beside the addon have `osff_*`-prefixed symbols so they cannot bind to Chromium's FFmpeg.
+Electron-builder copies `electron/native/bin` through per-platform `extraResources`
+filters, while runtime lookup selects `<platform>-<process.arch>`. On Windows, macOS,
+and Linux the compositor `.node` therefore ships in its architecture-tagged directory
+beside the FFmpeg libraries it links against, and never travels through ASAR. Linux
+keeps the helper's unmodified FFmpeg libraries under `helper-ffmpeg/`; the compositor
+libraries beside the addon have `osff_*`-prefixed symbols so they cannot bind to
+Chromium's FFmpeg.
+
+### macOS builds are architecture-specific
+
+The native macOS chain does not produce universal binaries. By default,
+`build:native:mac` builds helpers for `process.arch`; `fetch:ffmpeg:mac` configures
+FFmpeg for `process.arch`; and `build:native:compositor:mac` runs Cargo without a
+cross target and stages into `darwin-${process.arch}`. In contrast,
+`electron-builder.json5` configures `electron-builder --mac` to request both `x64`
+and `arm64`. `beforePack` checks the target-specific `darwin-<arch>/` payload, so a
+clean checkout prepared on one architecture is rejected when packaging reaches the
+other one. `npm run build:mac` does not bridge that mismatch.
+
+The supported release build uses two fresh jobs: Apple Silicon for `arm64` and an
+Intel runner for `x64`. Each stages the matching STT artifact, sets
+`OPENSCREEN_MAC_HELPER_ARCHS` to the matrix architecture, builds that architecture's
+FFmpeg and compositor, and packages only that target with
+`electron-builder --mac --<arch> --dir`. Cross-compiling the FFmpeg/compositor half
+is not wired into the local scripts.
+
+For a local package of the machine's current architecture, run under matching
+Node/Rust toolchains in a clean checkout (`ARCH=arm64` on Apple Silicon or `ARCH=x64`
+on Intel):
+
+```bash
+ARCH=arm64
+npm run build:whisper-binaries
+OPENSCREEN_MAC_HELPER_ARCHS="$ARCH" npm run build:native:mac
+npm run fetch:ffmpeg:mac
+npm run build:native:compositor:mac
+npm run build-vite
+npx electron-builder --mac "--${ARCH}" --publish never
+```
+
+Use a separate clean checkout on the matching native host for the other architecture.
+The FFmpeg SDK directory is not architecture-qualified, and every staged native
+artifact is gitignored and single-architecture; retaining or copying an old
+`darwin-*` payload is not a substitute for building the requested target.
 
 ### The compositor addon must sit beside its ffmpeg libraries
 
@@ -186,9 +229,9 @@ Expect the compositor to report a CPU backend: a VM may have no usable GPU, and 
 
 ### Stale native artifacts
 
-**Always use the platform package script for a complete package, not `npm run build`.**
+**Do not package from `npm run build` without refreshing the exact target's native payload.**
 
-`compositor_view.node` is gitignored, so it is whatever your last local Rust build produced. `npm run build` is `tsc && vite build && electron-builder`; it never invokes any compositor build. `build:win`, `build:mac`, and `build:linux` invoke their platform build instead. Two ways this bites:
+`compositor_view.node` is gitignored, so it is whatever your last local Rust build produced. `npm run build` is `tsc && vite build && electron-builder`; it never invokes any compositor build. The platform scripts invoke compositor builds, but macOS still requires the [target-specific flow](#macos-builds-are-architecture-specific) because `build:mac` builds native inputs for `process.arch` and asks electron-builder for both architectures. Two ways this bites:
 
 - You edit `crates/compositor/`, then package with `npm run build`. The installer gets the addon from before your edit.
 - You create a worktree. Git does not copy gitignored files, so the worktree has no addon until one is built or copied in — usually an old one from the main checkout.
@@ -264,7 +307,7 @@ Buying a certificate is the fix for the `.exe`, and it stays a live option (roug
 
 ### macOS
 
-Electron-builder targets DMG for both `arm64` and `x64`, enables hardened runtime, and applies `macos.entitlements` to the app and inherited code. The entitlements allow Electron JIT/native library loading and audio, camera, and screen capture. The configuration itself sets `notarize: false`; release CI packages the `.app`, creates and signs the DMG manually, submits it to `notarytool`, staples the ticket, and validates Gatekeeper. Pre-release tags go through the same path as stable ones — signing alone leaves Gatekeeper at `rejected, source=Unnotarized Developer ID`, so an RC that is signed but not notarized still forces testers to clear the quarantine attribute. Missing Apple credentials produce an ad-hoc-signed artifact.
+Electron-builder configures DMG targets for both `arm64` and `x64`; the release matrix restricts each invocation to its matching native architecture as described [above](#macos-builds-are-architecture-specific). It enables hardened runtime and applies `macos.entitlements` to the app and inherited code. The entitlements allow Electron JIT/native library loading and audio, camera, and screen capture. The configuration itself sets `notarize: false`; release CI packages the `.app`, creates and signs the DMG manually, submits it to `notarytool`, staples the ticket, and validates Gatekeeper. Pre-release tags go through the same path as stable ones — signing alone leaves Gatekeeper at `rejected, source=Unnotarized Developer ID`, so an RC that is signed but not notarized still forces testers to clear the quarantine attribute. Missing Apple credentials produce an ad-hoc-signed artifact.
 
 ### Linux and Nix
 

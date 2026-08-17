@@ -550,7 +550,15 @@ sync.
   not annotations — they are the caption layer rendered through the
   same plumbing. See [preview.md](preview.md) for the caption z-slot in
   the native scene and [export-pipeline.md](export-pipeline.md) for the
-  `projectRegionsToSourceTime` half of the round-trip.
+  shared native export path. In production,
+  [`buildSceneDescription`](../../src/native/sceneDescription.ts:405) derives the
+  caption regions, appends them to the document annotations, and projects that
+  combined list with
+  [`projectRegionsToSource`](../../src/lib/ai-edition/timeline/timelineMap.ts:452)
+  before serializing `SceneDescription`. The separate
+  [`projectRegionsToSourceTime`](../../src/lib/ai-edition/timeline/region-ventilation.ts:102)
+  helper remains alongside its unit tests, but it is not the caption
+  scene-construction path.
 
 ### Legacy caption annotations
 

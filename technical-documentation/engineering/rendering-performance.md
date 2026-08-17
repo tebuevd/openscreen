@@ -27,7 +27,7 @@ On the reference machine, same fixture, sustained regime:
 
 That fps envelopes **the whole run** — demux, decode, composite, encode and mux — because the measured window is one `Instant::now()` before and one after everything. Nothing inside can falsify the clock.
 
-> **This table is not the user-facing delta, and reading it as one understates the change by about an order of magnitude.** The 79 fps row is the web pipeline *after* the [Canvas2D compositor rebuild](#the-fix-and-what-it-bought) — an intermediate state of the 1.8.0 cycle that no release ever shipped. The last **released** web pipeline is v1.7.0's, which is the `webcodecs-legacy` arm: [~8 fps at M1](#m1--the-starting-pipeline), 9.8 fps under [Gate G0](#gate-g0--passed-2026-07-17). The tell is in the tree, not in the tags: `src/lib/exporter/frameRenderer.ts` carries no `shadowCache` at all in `v1.7.0` (1184 lines), and carries it throughout by `v1.8.0-rc.4` (1552 lines). So 1.8.0 compounds two changes against what a user actually had: the rebuild (~2×, byte-identical output) and then the native engine that replaced it. Quote the magnitude, never a precise multiple across these runs — [this machine does not support that arithmetic](#bench-methodology-of-the-deleted-harness).
+> **This table is not the user-facing delta, and reading it as one understates the change by about an order of magnitude.** The 79 fps row is the web pipeline *after* the [Canvas2D compositor rebuild](#the-fix-and-what-it-bought) — an intermediate state of the 1.8.0 cycle that no release ever shipped. The last **released** web pipeline is v1.7.0's, which is the `webcodecs-legacy` arm: [~8 fps at M1](#m1--the-starting-pipeline), 9.8 fps under [Gate G0](#gate-g0--passed-2026-07-17). The evidence is in the historical tags: the now-deleted `src/lib/exporter/frameRenderer.ts` had no `shadowCache` in `v1.7.0` (1184 lines), and carried it throughout by `v1.8.0-rc.4` (1552 lines). So 1.8.0 compounds two changes against what a user actually had: the rebuild (~2×, byte-identical output) and then the native engine that replaced it. Quote the magnitude, never a precise multiple across these runs — [this machine does not support that arithmetic](#bench-methodology-of-the-deleted-harness).
 
 The effect set is not a reduced one: animated layout, zooms, NV12→RGB BT.709, rounded corners and masks (SDF), drop shadows (SDF penumbra), background blur (dual-Kawase), per-velocity motion blur, custom cursor with click bounce.
 
@@ -176,15 +176,15 @@ not the codec.
 
 ## How we got here — the WebCodecs trail
 
-> **This section is history.** It records the measurements that killed the browser-based export pipeline and motivated the native one. The code it describes is **gone**: `src/lib/exporter/videoExporter.ts`, `src/bench/runBench.ts` and the `npm run bench:export` script were deleted with the web MP4 pipeline. It is kept because it is the evidence for [why the compositor, not the encoder, was the wall](#the-wall-is-the-compositor) — which is the entire reason `crates/compositor/` exists — and because the [measurement hazards](#measurement-hazards) it uncovered still apply to any new benchmark here.
+> **This section is history.** It records the measurements that killed the browser-based export pipeline and motivated the native one. The code it describes is **gone**: `src/lib/exporter/videoExporter.ts`, `src/lib/exporter/frameRenderer.ts`, `src/lib/exporter/gifExporter.ts`, `src/bench/runBench.ts`, and the `npm run bench:export` script were deleted. It is kept because it is the evidence for [why the compositor, not the encoder, was the wall](#the-wall-is-the-compositor) — which is the entire reason `crates/compositor/` exists — and because the [measurement hazards](#measurement-hazards) it uncovered still apply to any new benchmark here.
 >
-> One piece of it is still live: the Canvas2D compositor described under [The fix, and what it bought](#the-fix-and-what-it-bought) survives in `src/lib/exporter/frameRenderer.ts`, which now serves **GIF export only** — GIF has no native encoder yet.
+> The retired Canvas2D/Pixi renderer is not a current GIF fallback. Current GIF export calls `exportGifNative`, drives the shared native compositor and timeline walk, then writes the read-back frames through [`crates/compositor/src/gif_export.rs`](../../crates/compositor/src/gif_export.rs).
 
 ### Bench methodology (of the deleted harness)
 
-`npm run bench:export` (`scripts/bench-export.mjs` + `src/bench/runBench.ts`) opened the real editor window — same `webPreferences`, preload, sandbox — loads a real saved project through the same bridge the editor uses, and calls `exportAxcutDocument` (`ExportDialog`'s entry point). React is skipped, so nothing renders alongside.
+`npm run bench:export` (`scripts/bench-export.mjs` + `src/bench/runBench.ts`) opened the real editor window — same `webPreferences`, preload, sandbox — loaded a real saved project through the same bridge the editor used, and called the then-current `exportAxcutDocument` entry point. React was skipped, so nothing rendered alongside.
 
-Arms interleave A/B/A/B; same-arm spread is reported; a run above **10 %** spread declares itself VOID. Two earlier runs were discarded because battery and thermal drift (up to 62 % spread) inverted the conclusion. Treat any un-gated benchmark on this hardware as noise.
+Arms interleaved A/B/A/B; same-arm spread was reported; a run above **10 %** spread declared itself VOID. Two earlier runs were discarded because battery and thermal drift (up to 62 % spread) inverted the conclusion. Treat any un-gated benchmark on this hardware as noise.
 
 **This machine is not reproducible.** The same arm, same project, same settings has measured **44.0, 36.8, 32.3, 31.8, 22.2 and 11.9 fps** across sessions; the 11.9 run reported 0 % spread over its two samples and did not survive a re-run 40 minutes later (22.2). **Only within-run ratios transfer between machines, never absolute times.** A stable measurement is not a true one.
 
@@ -205,7 +205,7 @@ A bundled LGPL ffmpeg with the AMD hardware encoder (`h264_amf`) measured **165 
 
 ### M3 — the ceiling arm
 
-To bound every "make the crossing cheaper" idea at once (removing the sandbox, shared memory, zero-copy IPC): descend every frame and **throw it away** — no IPC, no encoder, no muxer, no audio. Result: **40.5 fps**, against **44.0 fps** for WebCodecs *doing the whole export including writing the file*. The descent alone, with nothing behind it, loses to the complete shipping pipeline. Every architecture that routes frames through renderer CPU RAM is dead on this machine, and none of them had to be built.
+To bound every "make the crossing cheaper" idea at once (removing the sandbox, shared memory, zero-copy IPC): descend every frame and **throw it away** — no IPC, no encoder, no muxer, no audio. Result: **40.5 fps**, against **44.0 fps** for WebCodecs *doing the whole export including writing the file*. The descent alone, with nothing behind it, lost to the complete WebCodecs pipeline shipping at the time. Every architecture that routes frames through renderer CPU RAM is dead on this machine, and none of them had to be built.
 
 ### M4 — the layer bench
 
@@ -221,7 +221,7 @@ Rebuild the pipeline layer by layer, measure each addition (same project, 1080p6
 | L6 — + circular webcam mask | 52 | 19.2 | +0.3 |
 | L7 — + animated zoom | (see [L7 row](#the-l7-row-and-the-shadow-cache-2026-07-17)) | | |
 
-**The full WebCodecs decode→encode loop runs at 213 fps** on this machine. The encoder was never slow.
+**The full WebCodecs decode→encode loop ran at 213 fps** on this machine. The encoder was never slow.
 
 ### M5 — the composite-ceiling re-measurement (2026-07-17)
 
@@ -248,14 +248,14 @@ Reference machine, real bench harness, four arms interleaved, 2 runs each, effec
 | webcodecs | 56.6 s | 14.6 | 5 % | 32 368 ms | — |
 | webcodecs-fence | 50.1 s | 16.4 | 9 % | **3 013 ms** | 28 199 ms |
 
-Per frame (820 frames): legacy `encodeWait` 71.1 → **3.9 ms** (×18 collapse), the difference reappearing under `fence` (54.3 ms/frame); shipping compositor 39.5 → **3.7 ms** (×10.7), `fence` 34.4 ms/frame. `encode` itself is ~0.03 ms/frame.
+Per frame (820 frames): legacy `encodeWait` 71.1 → **3.9 ms** (×18 collapse), the difference reappearing under `fence` (54.3 ms/frame); the optimized `webcodecs` arm 39.5 → **3.7 ms** (×10.7), `fence` 34.4 ms/frame. `encode` itself is ~0.03 ms/frame.
 
 **G0 confirmed.** `encodeWait` was billing the compositor's GPU execution; the encoder's own residual wait is ~3.7–3.9 ms/frame on this machine. The wall is the compositor — here even more so than M4 estimated, because this project composites a webcam bubble on every frame of both clips.
 
 Two findings G0 did not set out to test:
 
-- **The fenced arms are FASTER end-to-end** (legacy −23 %, shipping −11 %). Draining the GPU once per frame beats letting Chromium queue unboundedly — deep uncontrolled pipelining is actively harmful here. The "pipeline, don't await" rule needs the nuance: **bounded in-flight work, not maximal**.
-- **The compositor changes are confirmed in-run**: legacy 9.8 → shipping 14.6 fps (+49 %) on a project whose per-frame webcam compositing the changes never touched.
+- **The fenced arms are FASTER end-to-end** (legacy −23 %, optimized web −11 %). Draining the GPU once per frame beats letting Chromium queue unboundedly — deep uncontrolled pipelining is actively harmful here. The "pipeline, don't await" rule needs the nuance: **bounded in-flight work, not maximal**.
+- **The compositor changes are confirmed in-run**: legacy 9.8 → optimized web 14.6 fps (+49 %) on a project whose per-frame webcam compositing the changes never touched.
 
 ### The L7 row and the shadow cache (2026-07-17)
 
@@ -306,7 +306,7 @@ The product question — "how much of a typical timeline has a MOVING camera" �
 
 ### The standalone POC (`poc/`) — 2026-07-17
 
-`poc/` — its own directory, its own server, no Electron, no app code, nothing imported from the existing compositor. Two real recordings (screen + webcam), one layout, animated: two eased zooms with a focus point, and a layout move where the webcam grows from a docked circle into a panel, its shape morphing through the same SDF. Decode and mux via mediabunny, composite in WGSL, out to a watchable mp4. The layout, the easings and the effects are written from zero — the point was to prove the paradigm reconstructs the product, not to reuse what exists.
+The now-deleted `poc/` had its own server, no Electron, no app code, and nothing imported from the existing compositor. Two real recordings (screen + webcam), one layout, animated: two eased zooms with a focus point, and a layout move where the webcam grows from a docked circle into a panel, its shape morphing through the same SDF. Decode and mux ran via mediabunny, composition in WGSL, out to a watchable mp4. The layout, easings, and effects were written from zero; the point was to prove the paradigm reconstructed the product, not to reuse what existed.
 
 **Measured by the product owner, on a visible window, interleaved A/B, one discarded warm-up round, 4-second exports at 1080p on an AMD RDNA-3 iGPU:**
 
@@ -317,7 +317,7 @@ The product question — "how much of a typical timeline has a MOVING camera" �
 
 **+84 % — it roughly doubles.** Read honestly: the naive arm's 35 % spread makes the *size* loose (85.1 against its best run is +58 %, against its worst +127 %); the direction and the order of magnitude are not in doubt. The optimised arm is steady at 6 % because it does less work, so it has less to vary.
 
-Against the shipping compositor (different project — the comparison is an order of magnitude, not a measurement): 29.5 fps on a still frame, ~17 fps while the camera moves. The POC is 3–5× that, and it does not slow down when the camera moves, because there is no cache to miss.
+Against the then-current optimized web compositor (different project — the comparison is an order of magnitude, not a measurement): 29.5 fps on a still frame, ~17 fps while the camera moves. The POC is 3–5× that, and it does not slow down when the camera moves, because there is no cache to miss.
 
 **85 fps at 1080p is past 60.** That is the preview-fluidity target, reachable on the *weakest* machine in the fleet, with room over.
 
@@ -343,7 +343,7 @@ The same trap produced three disguises of one wall in this pipeline: an `encodeW
 
 - **First export pays for shader compilation, decoder setup and JIT** (9.3 s vs 5.6/6.6/5.8 s for its own repeats) and lands on whichever arm ran first: a 60 % same-arm spread that voided two runs by itself. **One discarded warm-up per arm brings the spread to 2–4 %.**
 - Battery and thermal drift has inverted conclusions on this hardware — up to 62 % spread on two earlier runs. Un-gated benchmarks on this hardware are noise.
-- **A hidden tab is a throttled tab**, and Chromium escalates the longer it stays hidden. Same code, same machine, one session: 58.3 → 42.8 → 35.5 → 6.0 fps, and an A/B that reported 6.0 on *both* arms with a 401 % spread. The harness refuses to run when `document.hidden`. **Nothing measured from an agent-driven browser pane is admissible; the numbers in this document were taken by a human, on a visible window.**
+- **A hidden tab is a throttled tab**, and Chromium escalates the longer it stays hidden. Same code, same machine, one session: 58.3 → 42.8 → 35.5 → 6.0 fps, and an A/B that reported 6.0 on *both* arms with a 401 % spread. The retired harness eventually refused to run when `document.hidden`. **Nothing measured from an agent-driven browser pane is admissible; the numbers in this document were taken by a human, on a visible window.**
 
 ### Clock-read placement
 
@@ -354,7 +354,7 @@ The same trap produced three disguises of one wall in this pipeline: an `encodeW
 
 ### Per-loop fps measured an empty loop, not throughput
 
-`submit()` is non-blocking; encode is awaited only on backpressure. Under the pipeline the loop does not wait for the work — so a SLOWER composite blocks the loop LESS and reads FASTER. The naive POC arm reported 588 fps, 5× the optimised arm's, doing more work. Throughput is frames ÷ wall until they are actually composited, encoded and muxed (`finalize()` forces completion); that is the metric the harness now computes. The product owner caught this from the numbers alone.
+`submit()` is non-blocking; encode is awaited only on backpressure. Under the pipeline the loop does not wait for the work — so a SLOWER composite blocks the loop LESS and reads FASTER. The naive POC arm reported 588 fps, 5× the optimised arm's, doing more work. Throughput is frames ÷ wall until they are actually composited, encoded and muxed (`finalize()` forces completion); that is the metric the corrected harness computed. The product owner caught this from the numbers alone.
 
 The same artifact produced a first, larger encoder-pipelining "gain" (+205 %) that disappeared under the corrected throughput metric.
 
@@ -364,7 +364,7 @@ The first frames of a 4-second export cost 358/113/28/350 ms — 10.3 ms/frame o
 
 ### The instruments cost 17 %
 
-`onSubmittedWorkDone()` per frame is a fence that forbids decode/composite/encode from overlapping; `mapAsync()` for the GPU timestamps is a sync per frame. Both are switchable, and the harness measures itself: instrumented 35.5 fps vs clean 42.8. The phase breakdown attributes; it does not price.
+`onSubmittedWorkDone()` per frame is a fence that forbids decode/composite/encode from overlapping; `mapAsync()` for the GPU timestamps is a sync per frame. Both were switchable, and the retired harness measured itself: instrumented 35.5 fps vs clean 42.8. The phase breakdown attributes; it does not price.
 
 ### Spread thresholds
 
@@ -373,8 +373,8 @@ The first frames of a 4-second export cost 358/113/28/350 ms — 10.3 ms/frame o
 
 ### Bench-methodology traps
 
-- `--effects` is per-session, not per-arm. Two effects A/B'd across two sessions is a cross-session comparison — the mistake this bench exists to prevent. Effects are now per-arm (`addEffects`), so an effect is A/B'd inside ONE interleaved run.
-- The `zoom` effect injected `depth: "medium"`; `ZOOM_DEPTH_SCALES` keys on 1–6, so the lookup returned `undefined` and **the zoom never ran** — every previous zoom arm reported a clean number for an effect that did nothing. The injected region is now parsed through `zoomRegionSchema` — the pipeline's own contract.
+- `--effects` was initially per-session, not per-arm. Two effects A/B'd across two sessions is a cross-session comparison — the mistake this bench existed to prevent. The retired harness moved effects per-arm (`addEffects`), so an effect was A/B'd inside ONE interleaved run.
+- The `zoom` effect injected `depth: "medium"`; `ZOOM_DEPTH_SCALES` keys on 1–6, so the lookup returned `undefined` and **the zoom never ran** — every previous zoom arm reported a clean number for an effect that did nothing. The retired harness later parsed the injected region through `zoomRegionSchema`, the pipeline's own contract.
 - Saved projects carry no appearance at all (`shadowIntensity` defaults to 0), so whole effects never execute; "fixing" the shadow on a default project measures exactly zero. The `zoom` effect matters beyond its own cost: it is the only effect that changes geometry per frame, so it is what invalidates a geometry-keyed cache. **A parity test without it passes with a broken cache key**, because nothing ever asks the cache to invalidate.
 - `app.getGPUFeatureStatus()` from a windowless script reports everything `disabled_software`. Probe with a real window.
 - Piping via `cat` under Git Bash caps at ~70 MB/s — MSYS emulation, not Windows.
@@ -382,7 +382,7 @@ The first frames of a 4-second export cost 358/113/28/350 ms — 10.3 ms/frame o
 - `-encoders` lists what was compiled in, not what the machine can run. A portable build lists nvenc/qsv/amf everywhere; on this AMD laptop nvenc dies with "Cannot load nvcuda.dll". A one-frame smoke encode is the only way to settle it — and the unit tests passed *because the fixtures encoded the same wrong assumption as the code*.
 - Electron cannot transfer an ArrayBuffer renderer→main. The transfer list takes `MessagePort[]`; transferring a buffer silently drops the whole message ([electron#34905](https://github.com/electron/electron/issues/34905)) — it works renderer→renderer.
 - `Buffer.from(typedArray)` copies. Wrapping (`Buffer.from(buf.buffer, byteOffset, byteLength)`) measured +31 %.
-- A stale `dist-electron` bundle runs the *previous* main process against the new renderer. It read as "export IPC not registered" once and as "the bench flag does nothing" once. The bench now refuses to run against one.
+- A stale `dist-electron` bundle ran the *previous* main process against the new renderer. It read as "export IPC not registered" once and as "the bench flag does nothing" once. The retired bench eventually refused to run against one.
 - A second instance of the same build quits silently: the lock keys on the `userData` path, so another dev build already running makes a launch exit 0 and report nothing. The installed app (`openscreen.exe`) resolves a different `userData` path and does not conflict.
 
 ## What the numbers mean
@@ -401,11 +401,11 @@ observed WebCodecs export:  20.7 ms  →  48.4 fps      ← the numbers close
 
 Confirmed by the M5 re-measurement on a different project: `composite-ceiling` 24.6 ms, `readback-ceiling` 24.6 ms (the descent adds **0.03 ms/frame**), `webcodecs` 31.1 ms. The compositor is **79 %** of the export; the encoder is **4.5 %**.
 
-**Why it hid:** `new VideoFrame(canvas)` is lazy and `encoder.encode()` is the first operation that forces the GPU/canvas work to finish (`src/lib/exporter/videoExporter.ts:477–519`). So the compositor's 14.5 ms was **billed to the encoder's timer**. The `render` timer (1.7 ms) measured *submission*, not execution.
+**Why it hid:** `new VideoFrame(canvas)` is lazy and `encoder.encode()` was the first operation that forced the GPU/canvas work to finish (`src/lib/exporter/videoExporter.ts:477–519` in the historical tree). So the compositor's 14.5 ms was **billed to the encoder's timer**. The `render` timer (1.7 ms) measured *submission*, not execution.
 
 ### What the compositor was rebuilding per frame
 
-| what it did | what the data was | wasted work | source | measured |
+| what it did | what the data was | wasted work | historical source | measured |
 |---|---|---|---|---:|
 | three chained `drop-shadow` over 2.07 Mpx of video, every frame | `drop-shadow` reads **only the alpha channel**. The video is opaque and masked by a rounded rect — its alpha *is* the rounded-rect silhouette. The result depends only on `(x, y, w, h, radius, intensity)`, not on a single video pixel. | the video pixels, 2.07 Mpx of them, blurred three times | `frameRenderer.ts:1045` (dup at `:533`) | **~30 ms/frame** (M2 + M5 re-measurement: **43.5 ms** isolated, spread 3–4 %) |
 | the wallpaper — a static image — cleared, re-blurred (`blur(6px)`) and re-blitted every frame | it never changes; blur it once at init | 1418 re-blurs for an image loaded once | `frameRenderer.ts:1007–1017` | ~5 ms/frame (M5 re-measurement: **17.9 ms** isolated) |
@@ -422,7 +422,7 @@ The radius change is ~free — it draws inside a pass that already exists (M5 re
 
 ## The fix, and what it bought
 
-> The Canvas2D/Pixi compositor this rebuilt is no longer on the MP4 path — `crates/compositor/` replaced it. `src/lib/exporter/frameRenderer.ts` still carries the work, and still serves **GIF export**, which has no native encoder yet. So the caches and the byte-identical parity gate below are live for GIF and history for MP4.
+> This section records an optimization to the retired Canvas2D/Pixi renderer. `src/lib/exporter/frameRenderer.ts` and its browser GIF consumer were later deleted, so the caches and byte-identical parity result below are historical for both MP4 and GIF. Current MP4 and GIF share `crates/compositor/`; GIF uses `gif_export.rs` after native composition.
 
 ### The change
 
@@ -455,7 +455,7 @@ Within-run ratios only (this machine is not reproducible):
 
 **Output is byte-identical.** Same timeline, same encoder, old compositor vs new → the files are identical byte for byte, SSIM 1.000000 across all 1418 frames. Not a pixel moved.
 
-Gate G0 measured the in-run effect: legacy 9.8 → shipping 14.6 fps (+49 %) on a project whose per-frame webcam compositing the changes never touched. The L7 row confirms the ceiling: compositor cache hits at 0.8 % miss on a still camera, so the shadow drops to ~1.3 ms/frame there.
+Gate G0 measured the in-run effect: legacy 9.8 → optimized web 14.6 fps (+49 %) on a project whose per-frame webcam compositing the changes never touched. The L7 row confirms the ceiling: compositor cache hits at 0.8 % miss on a still camera, so the shadow drops to ~1.3 ms/frame there.
 
 ## The WebCodecs bench (retired)
 
@@ -468,29 +468,32 @@ Gate G0 measured the in-run effect: legacy 9.8 → shipping 14.6 fps (+49 %) on 
 npm run bench:export -- --project=<id|title> --arms=webcodecs,native --runs=2 --effects=shadow,blur
 ```
 
-`scripts/bench-export.mjs` + `src/bench/runBench.ts`. It **simulated nothing**: it opened the real editor window (same `webPreferences`, preload and sandbox), loaded a real saved project through the same bridge the editor uses, and called `exportAxcutDocument` — `ExportDialog`'s own entry point. Only React was skipped, so nothing rendered alongside the export.
+`scripts/bench-export.mjs` + `src/bench/runBench.ts`. It **simulated nothing**: it opened the real editor window (same `webPreferences`, preload and sandbox), loaded a real saved project through the same bridge the editor used, and called the then-current `exportAxcutDocument` entry point. Only React was skipped, so nothing rendered alongside the export.
 
-It exists because driving this through the UI cost ~5 minutes a run and kept injecting confounds: one A/B ran with DevTools open on **one arm only**; another ran on a laptop at 5 % battery whose SoC budget drifted 26 % *between the two arms* — enough to invert the conclusion.
+It existed because driving this through the UI cost ~5 minutes a run and kept injecting confounds: one A/B ran with DevTools open on **one arm only**; another ran on a laptop at 5 % battery whose SoC budget drifted 26 % *between the two arms* — enough to invert the conclusion.
 
 ### Arms
 
-Arms set `localStorage` flags read at runtime, so one app session measures every arm against one document: `webcodecs`, `native`, `*-legacy` (the pre-2026-07-17 compositor, for attribution), `composite-ceiling` (render only), `readback-ceiling` (render + `copyTo`, discard).
+Arms set `localStorage` flags read at runtime, so one app session measured every arm against one document: `webcodecs`, `native`, `*-legacy` (the pre-2026-07-17 compositor, for attribution), `composite-ceiling` (render only), `readback-ceiling` (render + `copyTo`, discard).
 
 ### Fixture
 
-`--effects=shadow,blur,radius,zoom` patches an in-memory **copy** of the document; nothing reaches disk. Saved projects carry no appearance at all (`shadowIntensity` defaults to **0**), so whole effects never execute — "fixing" the shadow on a default project measures exactly zero. The `zoom` effect matters beyond its own cost: it is the only effect that changes geometry per frame, so it is what invalidates a geometry-keyed cache. **A parity test without it passes with a broken cache key**, because nothing ever asks the cache to invalidate.
+`--effects=shadow,blur,radius,zoom` patched an in-memory **copy** of the document; nothing reached disk. Saved projects in that pipeline carried no appearance (`shadowIntensity` defaulted to **0**), so whole effects otherwise never executed: "fixing" the shadow on a default project measured exactly zero. The `zoom` effect mattered beyond its own cost because it was the only effect that changed geometry per frame and invalidated a geometry-keyed cache. **A parity test without it passed with a broken cache key**, because nothing asked the cache to invalidate.
 
 ### Parity is gated, not argued
 
-Unit tests never look at a pixel. The `native*` arms write real files: export the same timeline through the same encoder with each compositor, then `cmp` and `ffmpeg -lavfi ssim`. Every compositor change above cleared it byte-for-byte. **"Obviously equivalent" is what this pipeline keeps punishing** — gate it.
+Unit tests did not look at a pixel. The `native*` arms wrote real files: export the same timeline through the same encoder with each compositor, then `cmp` and `ffmpeg -lavfi ssim`. Every compositor change above cleared it byte-for-byte. **"Obviously equivalent" is what this pipeline kept punishing** — gate it.
 
 ### Ratios only
 
-**Only within-run ratios transfer between machines, never absolute times.** Arms interleave (A, B, A, B), and the bench reports same-arm spread and declares itself VOID above 10 %. A stable measurement is not a true one — see [Measurement hazards](#measurement-hazards) for the full set of traps this bench exists to prevent.
+**Only within-run ratios transfer between machines, never absolute times.** Arms interleaved (A, B, A, B), and the bench reported same-arm spread and declared itself VOID above 10 %. A stable measurement is not a true one — see [Measurement hazards](#measurement-hazards) for the full set of traps this bench existed to prevent.
 
 ## Rejected routes
 
 ### Rust + wgpu native POC (`poc-native/`)
+
+The `poc-native/` directory has since been deleted; the measurements below describe
+that retired prototype, not the current Linux wgpu backend.
 
 **What it was.** `poc-native/` — Rust, wgpu (Vulkan on the reference AMD iGPU), the AMD hardware encoder via ffmpeg `h264_amf`. No browser, no WebCodecs. **What the measurement said.** The compositor is portable, proven: wgpu runs `composite.wgsl` **unchanged** — the only edits are the two the web platform forces and native lacks (`texture_external` → `texture_2d`, `textureSampleBaseClampToEdge` → `textureSampleLevel`); the native frame at t=0.5 s is pixel-identical to the web POC. Encoder ceilings measured (ffmpeg, `-benchmark`): `h264_amf` with CPU-decoded frames ~180 fps; `d3d11va` decode → `h264_amf`, frames stay on GPU **256 fps** — the hardware encoder is not the wall. The naive Vulkan pipeline measured 31 fps end-to-end (decoded via wgpu, composite in WGSL, encode `h264_amf`), but the cause was measured before it was concluded: with encode pipe 31.2 fps vs without 31.7 fps, the encoder isn't the wall; the decode pipe alone (ffmpeg → /dev/null, 180 frames) is **30 fps**, 3.9 s of system time — 8 MB/frame × 180 = 1.4 GB of *uncompressed* pixels shoved between subprocesses. The wall is the subprocess raw-RGBA pipes, an artifact of reaching ffmpeg as a child process, not the descent, not the compositor (1.9 ms), not the encoder (256 fps). The CPU path was pushed to its ceiling and loses by construction: subprocess pipes 31 fps, in-process CPU decode synchronous 25 fps, in-process CPU decode threaded (overlapped) no encode 61 fps, threaded decode + composite + `h264_amf` ~48 fps, threaded no-readback no encode 68 fps — against WebCodecs 79 fps and `d3d11va` → `h264_amf` all on GPU 256 fps. Threading the decode was the real lever (25 → 61): the subprocess version's advantage was never "pipes", it was parallel decode. The CPU path plateaus UNDER the browser, and the reason is pinned by the no-readback probe: the descent (GPU→CPU) is only ~10 % (61 → 68); the wall is **CPU↔GPU transport** — 9 MB uploaded per frame on input, 8 MB read back on output, plus CPU swscale at both ends (YUV→RGBA decode, RGBA→NV12 encode). The browser pays none of this: WebCodecs decodes into GPU-backed `VideoFrame`s that `importExternalTexture` wraps with no CPU copy. **The Vulkan route is blocked on the driver:** `VK_KHR_video_maintenance1` is required and the AMD iGPU's driver (24.10.38) predates it. `crates/compositor/` delivers the same GPU-resident principle on the shipped driver and is the retained native fast path (see [D3D11](#the-d3d11-native-fast-path-cratescompositor--2026-07-18) above). **One-line reason not to re-propose:** portability is proven but the GPU-resident native ceiling requires a path the AMD driver doesn't expose; the same goal is reached on D3D11.
 
@@ -512,9 +515,11 @@ Unit tests never look at a pixel. The `native*` arms write real files: export th
 
 ### Native GIF export — initial bench (slice 1, 2026-07-28)
 
-> **The path chosen.** Hand-rolled pure-Rust GIF89a writer in
-> [`crates/compositor/src/gif_export.rs`](../../crates/compositor/src/gif_export.rs):
-> header + Graphics Control Extension + Image Descriptor + LZW
+> **Current path.** `ExportDialog` calls `exportGifNative`; the N-API task dispatches to
+> [`crates/compositor/src/gif_export.rs`](../../crates/compositor/src/gif_export.rs),
+> whose `export_gif` drives the shared `walk_composited_timeline` and platform-native
+> compositor before reading each composed frame back. Its pure-Rust GIF89a writer emits
+> the header + Graphics Control Extension + Image Descriptor + LZW
 > (GIF's `palette`-as-codes-0..255-with-256-clear-257-EOI variant,
 > LSB-first code packing) + trailer, hand-rolled. Palette via
 > median-cut on the frame's colour histogram (the standard Heckbert
@@ -535,20 +540,19 @@ Unit tests never look at a pixel. The `native*` arms write real files: export th
 > auditable in one file. See [`crates/compositor/src/gif_export.rs`](../../crates/compositor/src/gif_export.rs) for
 > the implementation, [`crates/poc-d3d/src/bench.rs`](../../crates/poc-d3d/src/bench.rs) for the bench.
 >
-> **No prior `gif.js` baseline is documented in this file.** The browser-side
-> `npm run bench:export` that measured `gif.js` (Canvas2D compositor +
-> `gif.js` worker, the same path `gifExporter.ts` still uses today) was
-> deleted with the rest of the WebCodecs export pipeline (see
-> [The WebCodecs bench (retired)](#the-webcodecs-bench-retired)). The
+> **No browser `gif.js` baseline is preserved in this file.** The retired
+> `npm run bench:export` path once measured a Canvas2D compositor + `gif.js`
+> worker through the now-deleted `gifExporter.ts`; it is neither the current
+> implementation nor a fallback. The runner and exporter were deleted with the
+> browser pipeline (see [The WebCodecs bench (retired)](#the-webcodecs-bench-retired)). The
 > closest historical anchor is the M2 arm of the retired harness, which
 > measured the full `native ffmpeg` path (encode `h264_amf` of pre-materialised
 > frames) at **165 fps** — but that was the encode alone, not the
 > descent, and the comparison with GIF's CPU quantize + LZW is apples
 > to oranges anyway. **The honest signal here is the wall-time of the
-> native GIF path itself**; the comparison with `gif.js` is a separate
-> cross-stack measurement to be added once the renderer-side `gif.js`
-> is exercised through the same harness, and a follow-up PR will pick
-> that up.
+> native GIF path itself.** No same-harness `gif.js` comparison was completed
+> before the browser path was removed, so this record makes no native-vs-browser
+> GIF ratio claim.
 
 The slice-1 bench lives at `--cfg GIF` on the existing
 `crates/poc-d3d/src/bench.rs` (the same C0..C8 harness, just a separate
@@ -564,24 +568,22 @@ x.bat run --release -- --cfg GIF --repeat 3 --out out/
 # optional overrides: --gif-width 1920 --gif-height 1080 --gif-fps 24 --gif-dither 1
 ```
 
-Per the brief: "**the readback is the dominant per-frame cost**." That
-claim is the one the bench is built to verify. The wall-time recorded
-in slice 1 is the first number; a 5× regression vs. the renderer-side
-`gif.js` would block the swap (the user already chose the Rust path,
-but a 5× regression isn't a win). The follow-up slice will run the
-same harness against `gif.js` to settle that ratio.
+**Historical acceptance plan.** The slice brief proposed blocking the swap if the
+native path regressed more than 5× against the renderer-side `gif.js` path, with a
+follow-up arm intended to settle that ratio. That arm was never recorded before the
+browser exporter was deleted, so the threshold is retained as methodology, not as a
+completed comparison or a current fallback requirement.
 
-**Reading the result.** Compare two numbers:
+**Reading a native run.** Compare two numbers:
 - the C0 row of the C0..C8 bench (encode alone, no descent) — the
   GPU-residency ceiling on this machine for the same source;
 - the `wall_s_best` row of the GIF bench — what the native GIF path
   actually delivers, including the readback + median-cut + LZW.
 
 The gap between them is the cost the readback + palette add on top of
-the composite. If the GIF wall is within ~2× the C0 wall, the path is
-viable; if it's >5×, the swap is rejected on the bench signal. The
-ratio is what this section claims — the absolute number will land when
-the bench runs on the reference machine.
+the composite. The original protocol called a GIF wall within ~2× of C0 viable and
+one above 5× a rejection signal. This page records the protocol but no completed
+`gif.js` comparison, so those gates do not establish a cross-stack result.
 
 ## Known gaps
 
@@ -589,7 +591,7 @@ the bench runs on the reference machine.
 - **The fixture media is not versioned, and its cursor track has no provenance entry.** `crates/fixture/fixture.json` documents the exact `-c copy` cuts for `screen.mp4` and `webcam.mp4` (which is what made the run above reproducible), but says nothing about `screen.cursor.json`, which C7 needs. It happens to be the raw, uncut `.cursor.json` beside the origin recording — the loader windows it itself at `offset 100_000 ms, 6 s` ([`bench.rs:70`](../../crates/poc-d3d/src/bench.rs)), matching the manifest's `cut_offset_s: 100`. That is recoverable by reading the code, not by reading the manifest; the manifest should carry it.
 - **One bench fixture is still corrupt, from a bug since fixed.** Two concurrent saves used to be able to interleave and truncate a project file, which destroyed at least two real ones (a valid JSON prefix followed by the tail of a longer version). `proj_de6ffaaa` (`os_parity`) is still in that state — 4006 bytes, 3485 of them valid JSON — with a byte-exact backup beside it (`*.corrupt-backup-20260716`); recovery is mechanical (truncate to the 3485-byte prefix). The bug itself is gone: `DocumentService` now serialises saves through a per-project write queue and writes atomically (unique temp file → `fsync` → rename), which is why Gate G0 was run on `proj_5b3ac6bc` instead. The reference project for M1–M4 is `proj_a7468696`.
 - **A discrete-GPU and Intel QSV run is owed** (G3). Every number in this record is from a single iGPU laptop. A hybrid-GPU laptop (Intel iGPU + NVIDIA dGPU; AMD APU + AMD dGPU) is the case that must be measured and adapter-pinned before any native number is trusted there: if decode, composite and encode land on **different** adapters, the single-device zero-copy assumption breaks and a cross-adapter copy through system RAM / PCIe is forced — a descent in disguise, reintroducing exactly the wall this architecture removes.
-- **Shadow-on-GPU spike.** Reimplement the exact 3-pass cascade (the SVG `feGaussianBlur` for the project's radii) in a shader, pixel-diffed against the Canvas2D output. Falsifiable: if the GPU and Canvas2D outputs do not match, the claim is wrong. Skia's real path may not follow the spec's letter. The product call (2026-07-17) that a moving camera is the norm is what makes this the remaining lever on heavy timelines.
+- **Historical WebCodecs shadow follow-up.** The retired plan was to reimplement the exact 3-pass Canvas2D cascade in a shader and pixel-diff it against the old output. Current native backends already render shadows in platform shaders, so this is not an open task for the production renderer; the experiment matters only when interpreting the old Canvas2D measurements.
 - **Software VP9 under any target hardware is not measured** — it is recorded as a refuted route, not as a benchmarked number.
 - **The "moving camera is the norm" product call** is the product owner's standing answer, not a measurement. The L7 row's 0.8 % / 54.1 % cache-miss split is the bench's answer; the user's call is what determines what fraction of a typical timeline exercises the moving-camera path. The decision the call enables — the unified GPU-resident compositor — is recorded in [../architecture/decisions.md](../architecture/decisions.md).
-- **The "average fps vs cruise fps" correction** lives in the harness, not in the bench UI: cruise = median of the last three quarters. The same metric is reported everywhere.
+- **Historical cruise metric.** The retired WebCodecs harness defined cruise as the median of the last three quarters. The current Rust harness reports full-run best-of-repeat FPS instead; it does not implement that cruise metric.
