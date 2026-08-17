@@ -3,6 +3,7 @@ import { ASPECT_RATIO_PRESETS, type AspectRatio } from "@/utils/aspectRatioUtils
 import {
 	calculateEffectiveSourceDimensions,
 	calculateMp4ExportSettings,
+	calculateSourceExportDimensions,
 	MAX_MP4_EXPORT_DIMENSION,
 	MAX_MP4_EXPORT_PIXEL_AREA,
 	resolveMp4ExportSettings,
@@ -274,6 +275,41 @@ describe("resolveMp4ExportSettings", () => {
 			width: 2560,
 			height: 1440,
 		});
+	});
+
+	it("constrains 4:3 Source output by every visible clip's contain-fit capacity", () => {
+		const sources = [
+			{ width: 1600, height: 100 },
+			{ width: 800, height: 600 },
+		];
+		const result = resolveMp4ExportSettings({
+			quality: "source",
+			aspectRatio: "4:3",
+			sourceDimensions: sources[0],
+			sourceClipDimensions: sources,
+		});
+		expect(result).toMatchObject({ ok: true, settings: { width: 800, height: 600 } });
+		if (!result.ok) throw new Error(result.reason);
+		for (const source of sources) {
+			expect(wouldUpscale(result.settings, source)).toBe(false);
+		}
+	});
+
+	it("keeps mixed landscape, portrait, and display-rotated source geometry even", () => {
+		const sources = [
+			{ width: 1920, height: 1080 },
+			{ width: 1080, height: 1920 },
+			// A 1281x721 coded source rotated 90 degrees is reported display-first as 721x1281.
+			{ width: 721, height: 1281 },
+		];
+		const output = calculateSourceExportDimensions(sources, 1);
+		expect(output).toEqual({ width: 1280, height: 1280 });
+		if (!output) throw new Error("Expected Source dimensions");
+		expect(output.width % 2).toBe(0);
+		expect(output.height % 2).toBe(0);
+		for (const source of sources) {
+			expect(wouldUpscale(output, source)).toBe(false);
+		}
 	});
 
 	it("allows DCI 8K landscape and portrait at the allocation boundary", () => {

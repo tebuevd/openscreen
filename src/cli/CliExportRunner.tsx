@@ -18,24 +18,22 @@ import {
 	collectEffectiveClipDims,
 	pickExtremeDims,
 	resolveAspectRatioValue,
+	resolveVisibleClips,
 } from "@/lib/ai-edition/document/outputFormat";
 import { applyProbedDuration } from "@/lib/ai-edition/document/timeline";
 import type { AxcutDocument } from "@/lib/ai-edition/schema";
 import { getEditorSettings } from "@/lib/ai-edition/store/editorSettings";
-import { assetCameraSource } from "@/lib/ai-edition/timeline/camera";
-import { resolveClipSourceEndSec } from "@/lib/ai-edition/timeline/clipDuration";
 import { DEFAULT_ZOOM_DEPTH, ZOOM_DEPTH_SCALES } from "@/lib/ai-edition/timeline/zoom-scale";
 import { buildAutoZoomSuggestions } from "@/lib/ai-edition/timeline/zoom-suggestions";
 import type { CliDoneResult, CliExportRequest } from "@/lib/cliContracts";
 import { GIF_SIZE_PRESETS, type GifSizePreset } from "@/lib/exporter";
 import {
-	calculateMp4ExportSettings,
+	calculateMp4ExportSettingsForSources,
 	resolveMp4ExportSettings,
 } from "@/lib/exporter/mp4ExportSettings";
 import { mixVoiceoverIntoVideo } from "@/lib/exporter/voiceoverMix";
 import { exportGifNative, exportMultiNative, nativeBridgeClient } from "@/native";
-import type { CompositorClipInput } from "@/native/contracts";
-import { buildSceneDescription, resolveVisibleClips } from "@/native/sceneDescription";
+import { buildSceneDescription } from "@/native/sceneDescription";
 import { CLI_EXPORT_DIMENSIONS_ERROR, prepareCliExportDocument } from "./prepareExportDocument";
 import { clampZoomFocus } from "./vendor/zoomHelpers";
 
@@ -75,31 +73,6 @@ function probeVideoMetadata(
 
 function replaceExtension(filePath: string, newExtension: string): string {
 	return filePath.replace(/\.(openscreen|json)$/i, "") + newExtension;
-}
-
-/** Mirrors ExportDialog.buildNativeClipList: trim-narrowed visible clips mapped
- * onto the native multiclip contract. Kept in lock-step with
- * buildSceneDescription so export and scene agree on the clip stream. */
-function buildNativeClipList(axcutDocument: AxcutDocument): CompositorClipInput[] {
-	const assetById = new Map(axcutDocument.assets.map((asset) => [asset.id, asset]));
-	return resolveVisibleClips(axcutDocument).flatMap((clip) => {
-		const asset = assetById.get(clip.assetId);
-		if (!asset?.originalPath) {
-			return [];
-		}
-		const camera = assetCameraSource(asset);
-		const sourceEndSec = resolveClipSourceEndSec(clip, asset);
-		return [
-			{
-				screenPath: asset.originalPath,
-				webcamPath: camera.path,
-				sourceStartSec: clip.sourceStartSec,
-				sourceEndSec,
-				webcamOffsetSec: camera.offsetSec,
-				hasAudio: true,
-			},
-		];
-	});
 }
 
 /** Mirrors ExportDialog.gifOutputDims: cap height at the preset, keep even. */
@@ -218,7 +191,11 @@ export async function runExport(request: CliExportRequest): Promise<CliDoneResul
 		const added = appendAutoZoomRanges(axcutDocument, cursorTelemetry, probed.durationMs);
 		window.electronAPI.cliLog("info", `Auto-zoom: added ${added} region(s) from cursor telemetry`);
 	}
-	const visibleAssetIds = resolveVisibleClips(axcutDocument).map((clip) => clip.assetId);
+	const initialVisibleClips = resolveVisibleClips(axcutDocument);
+	if (initialVisibleClips.length === 0) {
+		throw new Error("The project's timeline has no visible clips to export");
+	}
+	const visibleAssetIds = initialVisibleClips.map((clip) => clip.assetId);
 	axcutDocument = await prepareCliExportDocument(
 		axcutDocument,
 		visibleAssetIds,
@@ -226,43 +203,50 @@ export async function runExport(request: CliExportRequest): Promise<CliDoneResul
 		probed,
 	);
 
-	// Output sizing mirrors the ExportDialog: crop-aware smallest clip on the
-	// timeline, normalized to the document's aspect ratio.
-	const effectiveClipDims = collectEffectiveClipDims(axcutDocument);
-	const smallestSource = pickExtremeDims(effectiveClipDims, "smallest") ?? {
-		width: probed.width,
-		height: probed.height,
-	};
-	const largestSource = pickExtremeDims(effectiveClipDims, "largest") ?? {
-		width: probed.width,
-		height: probed.height,
-	};
+	const visibleClips = resolveVisibleClips(axcutDocument);
+	if (visibleClips.length === 0) {
+		throw new Error("The project's timeline has no visible clips to export");
+	}
+	const effectiveClipDims = collectEffectiveClipDims(axcutDocument, {}, visibleClips);
+	if (effectiveClipDims.length !== visibleClips.length) {
+		throw new Error(CLI_EXPORT_DIMENSIONS_ERROR);
+	}
+	const largestSource = pickExtremeDims(effectiveClipDims, "largest");
 	const aspectRatio = getEditorSettings(axcutDocument).aspectRatio;
-	const aspectRatioValue = resolveAspectRatioValue(axcutDocument, aspectRatio);
-	const outDims = calculateMp4ExportSettings({
-		quality,
-		sourceWidth: smallestSource.width,
-		sourceHeight: smallestSource.height,
-		aspectRatioValue,
-	});
+	const aspectRatioValue = resolveAspectRatioValue(axcutDocument, aspectRatio, {}, visibleClips);
+	const tierSettings =
+		format === "gif"
+			? calculateMp4ExportSettingsForSources({
+					quality,
+					sourceDimensions: effectiveClipDims,
+					aspectRatioValue,
+				})
+			: null;
 	const mp4Resolution =
 		format === "mp4"
 			? resolveMp4ExportSettings({
 					quality,
 					aspectRatio,
-					sourceDimensions: smallestSource,
+					sourceDimensions: effectiveClipDims[0] ?? null,
+					sourceClipDimensions: effectiveClipDims,
 					originalDimensions: largestSource,
 				})
 			: null;
 	if (mp4Resolution && !mp4Resolution.ok) {
 		throw new Error(CLI_EXPORT_DIMENSIONS_ERROR);
 	}
-
-	const clips = buildNativeClipList(axcutDocument);
-	if (clips.length === 0) {
-		throw new Error("The project's timeline has no visible clips to export");
+	const gifDims = format === "gif" ? gifOutputDims(gifSizePreset, tierSettings) : null;
+	const outputDims = mp4Resolution?.ok
+		? { width: mp4Resolution.settings.width, height: mp4Resolution.settings.height }
+		: gifDims?.width !== undefined && gifDims.height !== undefined
+			? { width: gifDims.width, height: gifDims.height }
+			: null;
+	if (!outputDims) {
+		throw new Error(CLI_EXPORT_DIMENSIONS_ERROR);
 	}
-	const sceneJson = JSON.stringify(buildSceneDescription(axcutDocument));
+	const scene = buildSceneDescription(axcutDocument, null, { visibleClips, outputDims });
+	const clips = scene.clips;
+	const sceneJson = JSON.stringify(scene);
 
 	// Progress: native pushes raw encoded-frame counts; totals and pacing are
 	// computed here, mirroring the ExportDialog.
@@ -288,7 +272,7 @@ export async function runExport(request: CliExportRequest): Promise<CliDoneResul
 
 	try {
 		if (format === "gif") {
-			const dims = gifOutputDims(gifSizePreset, outDims);
+			const dims = gifDims ?? {};
 			await exportGifNative(clips, outPath, sceneJson, {
 				...dims,
 				fps: gifFrameRate,

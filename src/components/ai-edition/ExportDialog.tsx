@@ -17,11 +17,10 @@ import {
 	type Dims,
 	pickExtremeDims,
 	resolveAspectRatioValue,
+	resolveVisibleClips,
 } from "@/lib/ai-edition/document/outputFormat";
 import type { AxcutDocument } from "@/lib/ai-edition/schema";
 import { getEditorSettings } from "@/lib/ai-edition/store/editorSettings";
-import { assetCameraSource } from "@/lib/ai-edition/timeline/camera";
-import { resolveClipSourceEndSec } from "@/lib/ai-edition/timeline/clipDuration";
 import {
 	type ExportFormat,
 	type ExportProgress,
@@ -34,15 +33,14 @@ import {
 } from "@/lib/exporter";
 import { hydrateExportDocumentDimensions } from "@/lib/exporter/exportDocumentDimensions";
 import {
-	calculateMp4ExportSettings,
+	calculateMp4ExportSettingsForSources,
 	hasPracticalExportSourceDimensions,
 	type Mp4ExportSettings,
 	resolveMp4ExportSettings,
 	wouldUpscale,
 } from "@/lib/exporter/mp4ExportSettings";
 import { exportGifNative, exportMultiNative, useIsCpuCompositor } from "@/native";
-import type { CompositorClipInput } from "@/native/contracts";
-import { buildSceneDescription, resolveVisibleClips } from "@/native/sceneDescription";
+import { buildSceneDescription } from "@/native/sceneDescription";
 import { ModalShell } from "./Modals";
 import styles from "./NewEditorShell.module.css";
 
@@ -56,39 +54,6 @@ function formatHms(totalSeconds: number): string {
 	const m = Math.floor((s % 3600) / 60);
 	const sec = s % 60;
 	return [h, m, sec].map((v) => v.toString().padStart(2, "0")).join(":");
-}
-
-/** Maps the document's timeline to the native multiclip export contract: ordered,
- *  trim-narrowed clips (`resolveVisibleClips` — shared with `buildSceneDescription` and
- *  `NativeCompositorOverlay`, so export/preview/scene all see the exact same clip stream),
- *  each with its asset's screen file + camera file (falls back to the screen when a clip has
- *  no camera — the no-webcam layout is a later step) and its source trim. */
-function buildNativeClipList(document: AxcutDocument): CompositorClipInput[] {
-	const assetById = new Map(document.assets.map((a) => [a.id, a]));
-	return resolveVisibleClips(document).flatMap((clip) => {
-		const asset = assetById.get(clip.assetId);
-		if (!asset?.originalPath) {
-			return [];
-		}
-		const camera = assetCameraSource(asset);
-		// sourceEndSec is optional in the schema (unknown until probed) — fall back through
-		// the single canonical precedence used by every consumer (clip.probe → asset.duration
-		// → timeline-length guess). See `resolveClipSourceEndSec` for the full order.
-		const sourceEndSec = resolveClipSourceEndSec(clip, asset);
-		// ponytail: `hasAudio` stays optimistic for the same reason as in
-		// `buildSceneDescription` — nothing populates `asset.audio` yet, and the
-		// native side degrades cleanly on a stream-less file.
-		return [
-			{
-				screenPath: asset.originalPath,
-				webcamPath: camera.path,
-				sourceStartSec: clip.sourceStartSec,
-				sourceEndSec,
-				webcamOffsetSec: camera.offsetSec,
-				hasAudio: true,
-			},
-		];
-	});
 }
 
 const QUALITY_OPTIONS: Array<{
@@ -142,22 +107,12 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 		[document],
 	);
 
-	// Per-clip EFFECTIVE (post-crop) dims — single source of truth for both the "largest"
-	// and "smallest" picks below, computed once instead of two near-identical hand-rolled
-	// reduce+fallback loops. Crop is per-clip, so this must iterate clips, not assets: the
-	// same recording can be cropped differently in two different clips on the timeline.
+	// Crop is per clip, so Source sizing must retain every resolved clip footprint rather than
+	// collapsing the stream to one area-based representative.
+	const visibleClips = useMemo(() => (document ? resolveVisibleClips(document) : []), [document]);
 	const effectiveClipDims = useMemo<Dims[]>(
-		() => (document ? collectEffectiveClipDims(document) : []),
-		[document],
-	);
-	// Smallest clip's true (cropped) footprint on the timeline — a multiclip timeline can mix
-	// crops/resolutions, so this is what "Source" quality actually targets: sizing to the
-	// SMALLEST clip's own resolution means no clip on the timeline is ever upscaled past its
-	// true footprint by picking Source. It also feeds the upscale badge on the fixed
-	// 720p/1080p tiers, which can still genuinely upscale a small clip.
-	const smallestSource = useMemo(
-		() => pickExtremeDims(effectiveClipDims, "smallest"),
-		[effectiveClipDims],
+		() => (document ? collectEffectiveClipDims(document, {}, visibleClips) : []),
+		[document, visibleClips],
 	);
 	const largestSource = useMemo(
 		() => pickExtremeDims(effectiveClipDims, "largest"),
@@ -168,7 +123,6 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 	const hasCompleteSourceMetadata = useMemo(() => {
 		if (!document) return false;
 		const assetById = new Map(document.assets.map((asset) => [asset.id, asset]));
-		const visibleClips = resolveVisibleClips(document);
 		return (
 			visibleClips.length > 0 &&
 			visibleClips.every((clip) => {
@@ -176,8 +130,8 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 				return hasPracticalExportSourceDimensions(video ?? null);
 			})
 		);
-	}, [document]);
-	const validatedSmallestSource = hasCompleteSourceMetadata ? smallestSource : null;
+	}, [document, visibleClips]);
+	const validatedSourceDimensions = hasCompleteSourceMetadata ? effectiveClipDims : [];
 	const validatedLargestSource = hasCompleteSourceMetadata ? largestSource : null;
 
 	// Aspect the export normalizes to: the timeline's selected ratio (mirrors documentExporter),
@@ -186,14 +140,9 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 	// this dialog can't drift from the compositor if the storage ever moves. MP4 receives the token
 	// so legacy Original cannot silently resolve to 16:9.
 	const exportAspectRatio = useMemo(() => getEditorSettings(document).aspectRatio, [document]);
-	// Output dimensions the export will produce for a given tier, from the (crop-aware)
-	// SMALLEST clip on the timeline — see `smallestSource` above for why. Only "Source"
-	// quality actually uses these as its target size; 720p/1080p target a fixed short side
-	// regardless (`calculateDimensionsForShortSide`), so this only changes what "Source"
-	// resolves to.
+	// Only Source quality uses clip dimensions; 720p/1080p keep their fixed short side.
 	// GIF is 8-bit indexed and grows fast with area, so the size preset caps the
-	// output height rather than following the quality tier. `original` keeps the
-	// tier's dims; the native side falls back to its own defaults when undefined.
+	// output height rather than following the quality tier.
 	const gifOutputDims = (
 		preset: GifSizePreset,
 		tierDims: { width: number; height: number } | null,
@@ -214,7 +163,8 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 		resolveMp4ExportSettings({
 			quality: value,
 			aspectRatio: exportAspectRatio,
-			sourceDimensions: validatedSmallestSource,
+			sourceDimensions: validatedSourceDimensions[0] ?? null,
+			sourceClipDimensions: validatedSourceDimensions,
 			originalDimensions: validatedLargestSource,
 		});
 	const tierOutputDims = (value: ExportQuality) => {
@@ -269,17 +219,34 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 			return;
 		}
 		const exportDocument = hydrated.document;
-		const exportEffectiveDims = collectEffectiveClipDims(exportDocument);
-		const exportSmallestSource = pickExtremeDims(exportEffectiveDims, "smallest");
+		const exportVisibleClips = resolveVisibleClips(exportDocument);
+		if (exportVisibleClips.length === 0) {
+			setError(t("exportDialog.nothingToExport"));
+			setPhase("error");
+			return;
+		}
+		const exportEffectiveDims = collectEffectiveClipDims(exportDocument, {}, exportVisibleClips);
+		if (exportEffectiveDims.length !== exportVisibleClips.length) {
+			setError(dimensionsUnavailable);
+			setPhase("error");
+			return;
+		}
 		const exportLargestSource = pickExtremeDims(exportEffectiveDims, "largest");
 		const exportAspectRatio = getEditorSettings(exportDocument).aspectRatio;
-		const exportAspectValue = resolveAspectRatioValue(exportDocument, exportAspectRatio);
+		const exportAspectValue = resolveAspectRatioValue(
+			exportDocument,
+			exportAspectRatio,
+			{},
+			exportVisibleClips,
+		);
 		let mp4Output: Mp4ExportSettings | null = null;
+		let gifOutput: { width: number; height: number } | null = null;
 		if (format === "mp4") {
 			const resolution = resolveMp4ExportSettings({
 				quality,
 				aspectRatio: exportAspectRatio,
-				sourceDimensions: exportSmallestSource,
+				sourceDimensions: exportEffectiveDims[0] ?? null,
+				sourceClipDimensions: exportEffectiveDims,
 				originalDimensions: exportLargestSource,
 			});
 			if (!resolution.ok) {
@@ -288,7 +255,32 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 				return;
 			}
 			mp4Output = resolution.settings;
+		} else {
+			const gifTier = calculateMp4ExportSettingsForSources({
+				quality,
+				sourceDimensions: exportEffectiveDims,
+				aspectRatioValue: exportAspectValue,
+			});
+			const dimensions = gifOutputDims(gifSize, gifTier);
+			if (dimensions.width === undefined || dimensions.height === undefined) {
+				setError(dimensionsUnavailable);
+				setPhase("error");
+				return;
+			}
+			gifOutput = { width: dimensions.width, height: dimensions.height };
 		}
+		const outputDims = mp4Output ? { width: mp4Output.width, height: mp4Output.height } : gifOutput;
+		if (!outputDims) {
+			setError(dimensionsUnavailable);
+			setPhase("error");
+			return;
+		}
+		const scene = buildSceneDescription(exportDocument, null, {
+			visibleClips: exportVisibleClips,
+			outputDims,
+		});
+		const clips = scene.clips;
+		const sceneJson = JSON.stringify(scene);
 
 		const safeName = (exportDocument.project.title || "OpenScreen")
 			.replace(/[^a-z0-9-_]+/gi, "_")
@@ -321,8 +313,6 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 		// user previewed.
 		{
 			setPhase("rendering");
-			// Render the real timeline when there are clips; else fall back to the fixture.
-			const clips = buildNativeClipList(exportDocument);
 			// GIF runs at its own frame rate, so the progress total has to use it.
 			const outFps = format === "gif" ? gifFrameRate : fps;
 			// Total frames the encoder will produce, known upfront from the timeline (sum of
@@ -348,24 +338,11 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 				});
 			});
 			try {
-				const sceneJson = JSON.stringify(buildSceneDescription(exportDocument));
-				const gifTierDims = exportSmallestSource
-					? calculateMp4ExportSettings({
-							quality,
-							sourceWidth: exportSmallestSource.width,
-							sourceHeight: exportSmallestSource.height,
-							aspectRatioValue: exportAspectValue,
-						})
-					: null;
-				if (clips.length === 0) {
-					throw new Error(t("exportDialog.nothingToExport"));
-				}
 				let stats: { videoDurationS: number; wallS: number };
 				if (format === "gif") {
+					if (!gifOutput) throw new Error(dimensionsUnavailable);
 					stats = await exportGifNative(clips, pickedPath, sceneJson, {
-						// GIF is 256-colour and grows fast; cap the long edge at the
-						// chosen preset rather than exporting at source size.
-						...gifOutputDims(gifSize, gifTierDims),
+						...gifOutput,
 						fps: gifFrameRate,
 						// 0 = infinite, the historical GIF default; 1 = play once.
 						loopCount: gifLoop ? 0 : 1,
@@ -492,9 +469,11 @@ export function ExportDialog({ open, onClose, document }: ExportDialogProps) {
 										// letterbox rows a non-16:9 source gets in a 16:9 project as if they
 										// were stretched pixels, and flagged "1080p" on the very frame
 										// "Source" produced unflagged. No "Source" special case any more —
-										// its frame is the source's long side at the project ratio, so its
-										// contain scale is never above 1 and the general test covers it.
-										const isUpscale = smallestSource !== null && wouldUpscale(dims, smallestSource);
+										// its frame is capped by every clip's contain-fit capacity, so the
+										// general test covers it without a Source special case.
+										const isUpscale = effectiveClipDims.some((source) =>
+											wouldUpscale(dims, source),
+										);
 										return (
 											<span
 												style={{

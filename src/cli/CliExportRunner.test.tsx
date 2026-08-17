@@ -101,12 +101,37 @@ describe("CLI MP4 export submission", () => {
 		await runExport(request(quality));
 
 		expect(nativeMocks.exportMultiNative).toHaveBeenCalledOnce();
-		expect(nativeMocks.exportMultiNative.mock.calls[0]?.[3]).toEqual({
+		const call = nativeMocks.exportMultiNative.mock.calls[0];
+		expect(call?.[3]).toEqual({
 			width,
 			height,
 			fps: 60,
 			bitrate,
 			codec: "h264",
 		});
+		const scene = JSON.parse(call?.[2] as string) as {
+			clips: unknown[];
+			output: { width: number; height: number; fps: number | null };
+		};
+		expect(scene.output).toEqual({ width, height, fps: null });
+		expect(call?.[0]).toEqual(scene.clips);
+	});
+
+	it("blocks a fully trimmed timeline before native export", async () => {
+		nativeMocks.loadProjectFileFromPath.mockResolvedValue({
+			success: true,
+			project: {
+				version: 2,
+				media: { screenVideoPath: "/tmp/source.mp4" },
+				editor: {
+					trimRegions: [{ id: "trim-all", startMs: 0, endMs: 1000 }],
+				},
+			},
+		});
+
+		await expect(runExport(request("good"))).rejects.toThrow(
+			"The project's timeline has no visible clips to export",
+		);
+		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
 	});
 });

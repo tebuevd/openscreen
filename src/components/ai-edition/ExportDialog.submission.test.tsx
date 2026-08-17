@@ -133,6 +133,7 @@ function submittedScene(call: unknown[] | undefined) {
 	const sceneJson = call?.[2];
 	if (typeof sceneJson !== "string") throw new Error("Expected submitted scene JSON");
 	return JSON.parse(sceneJson) as {
+		clips: Array<{ screenPath: string; sourceStartSec: number; sourceEndSec: number }>;
 		output: { width: number; height: number; fps: number | null };
 		layout: {
 			screenRect: { width: number; height: number } | null;
@@ -224,7 +225,7 @@ describe("ExportDialog submission", () => {
 			codec: "h264",
 		});
 		const scene = submittedScene(call);
-		expect(scene.output).toEqual({ width: 2880, height: 1620, fps: null });
+		expect(scene.output).toEqual({ width: 1920, height: 1080, fps: null });
 		expect(scene.layout.screenRect).not.toBeNull();
 		if (!scene.layout.screenRect) throw new Error("Expected a screen rect");
 		const renderedAspect =
@@ -252,6 +253,130 @@ describe("ExportDialog submission", () => {
 		expect(submittedScene(call).output).toEqual({ width: 2880, height: 1864, fps: null });
 	});
 
+	it("excludes non-exported clips from Source size, Original aspect, and the native scene", async () => {
+		const document = makeDocument(video(2880, 1864), "native");
+		document.assets.push(
+			{
+				id: "trimmed-portrait",
+				kind: "video",
+				label: "Trimmed portrait",
+				originalPath: "/tmp/trimmed.mp4",
+				cameraTrack: null,
+				video: video(320, 640),
+			},
+			{
+				id: "pathless",
+				kind: "video",
+				label: "Pathless",
+				originalPath: "",
+				cameraTrack: null,
+				video: video(100, 100),
+			} as AxcutAsset,
+		);
+		document.timeline.clips.push(
+			{
+				...document.timeline.clips[0],
+				id: "trimmed-clip",
+				assetId: "trimmed-portrait",
+				timelineStartSec: 1,
+				timelineEndSec: 2,
+			},
+			{
+				...document.timeline.clips[0],
+				id: "pathless-clip",
+				assetId: "pathless",
+				timelineStartSec: 2,
+				timelineEndSec: 3,
+			},
+			{
+				...document.timeline.clips[0],
+				id: "missing-clip",
+				assetId: "missing",
+				timelineStartSec: 3,
+				timelineEndSec: 4,
+			},
+		);
+		document.timeline.trimRanges.push({
+			id: "trim-all",
+			assetId: "trimmed-portrait",
+			clipId: "trimmed-clip",
+			startSec: 0,
+			endSec: 1,
+			origin: "user",
+			reason: "",
+		});
+		renderDialog(document);
+		fireEvent.click(screen.getByRole("button", { name: /^Source/ }));
+
+		await submitMp4();
+
+		await waitFor(() => expect(nativeMocks.exportMultiNative).toHaveBeenCalledOnce());
+		const call = nativeMocks.exportMultiNative.mock.calls[0];
+		expect(call?.[3]).toMatchObject({ width: 2880, height: 1864 });
+		const scene = submittedScene(call);
+		expect(scene.output).toEqual({ width: 2880, height: 1864, fps: null });
+		expect(scene.clips.map((clip) => clip.screenPath)).toEqual(["/tmp/recording.mp4"]);
+		expect(call?.[0]).toEqual(scene.clips);
+		expect(probeVideoDimensionsMock).not.toHaveBeenCalled();
+	});
+
+	it("uses every visible clip's contain-fit capacity for 4:3 Source", async () => {
+		const document = makeDocument(video(1600, 100), "4:3");
+		document.assets.push({
+			id: "asset-2",
+			kind: "video",
+			label: "Second clip",
+			originalPath: "/tmp/second.mp4",
+			cameraTrack: null,
+			video: video(800, 600),
+		});
+		document.timeline.clips.push({
+			...document.timeline.clips[0],
+			id: "clip-2",
+			assetId: "asset-2",
+			timelineStartSec: 1,
+			timelineEndSec: 2,
+		});
+		renderDialog(document);
+		fireEvent.click(screen.getByRole("button", { name: /^Source/ }));
+
+		await submitMp4();
+
+		await waitFor(() => expect(nativeMocks.exportMultiNative).toHaveBeenCalledOnce());
+		const call = nativeMocks.exportMultiNative.mock.calls[0];
+		expect(call?.[3]).toMatchObject({ width: 800, height: 600 });
+		const scene = submittedScene(call);
+		expect(scene.output).toEqual({ width: 800, height: 600, fps: null });
+		expect(scene.clips.map((clip) => clip.screenPath)).toEqual([
+			"/tmp/recording.mp4",
+			"/tmp/second.mp4",
+		]);
+		expect(call?.[0]).toEqual(scene.clips);
+		for (const source of [video(1600, 100), video(800, 600)]) {
+			expect(Math.min(800 / source.width, 600 / source.height)).toBeLessThanOrEqual(1);
+		}
+	});
+
+	it("blocks a fully trimmed timeline before save or native export", async () => {
+		const document = makeDocument(video(1920, 1080));
+		document.timeline.trimRanges.push({
+			id: "trim-all",
+			assetId: "asset-1",
+			clipId: "clip-1",
+			startSec: 0,
+			endSec: 1,
+			origin: "user",
+			reason: "",
+		});
+		renderDialog(document);
+
+		await submitMp4();
+
+		expect(await screen.findByRole("alert")).toHaveTextContent(/Nothing to export/);
+		expect(bridgeMocks.pickExportSavePath).not.toHaveBeenCalled();
+		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
+	});
+
 	it.each([
 		[
 			"portrait",
@@ -275,7 +400,11 @@ describe("ExportDialog submission", () => {
 		const call = nativeMocks.exportMultiNative.mock.calls[0];
 		expect(call?.[3]).toEqual({ ...expectedParams, fps: 60, codec: "h264" });
 		const scene = submittedScene(call);
-		expect(scene.output).toEqual({ ...probed, fps: null });
+		expect(scene.output).toEqual({
+			width: expectedParams.width,
+			height: expectedParams.height,
+			fps: null,
+		});
 		expect(scene.layout.screenRect).not.toBeNull();
 		if (!scene.layout.screenRect) throw new Error("Expected a screen rect");
 		const renderedAspect =
@@ -293,7 +422,7 @@ describe("ExportDialog submission", () => {
 		await waitFor(() => expect(nativeMocks.exportGifNative).toHaveBeenCalledOnce());
 		const call = nativeMocks.exportGifNative.mock.calls[0];
 		expect(call?.[3]).toEqual({ width: 404, height: 720, fps: 15, loopCount: 0 });
-		expect(submittedScene(call).output).toEqual({ width: 1080, height: 1920, fps: null });
+		expect(submittedScene(call).output).toEqual({ width: 404, height: 720, fps: null });
 		expect(nativeMocks.exportMultiNative).not.toHaveBeenCalled();
 	});
 

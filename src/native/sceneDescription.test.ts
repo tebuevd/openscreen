@@ -351,6 +351,67 @@ describe("buildSceneDescription.clips", () => {
 		expect(buildSceneDescription(doc).clips).toEqual([]);
 	});
 
+	it("uses the resolved stream for fully trimmed, pathless, and missing-asset clips", () => {
+		const visible = makeAsset({ id: "visible", originalPath: "/visible.mp4" });
+		const trimmed = makeAsset({ id: "trimmed", originalPath: "/trimmed.mp4" });
+		const pathless = makeAsset({ id: "pathless", originalPath: "" });
+		const clips = [
+			makeClip({
+				id: "visible-clip",
+				assetId: "visible",
+				sourceStartSec: 0,
+				sourceEndSec: 4,
+				timelineStartSec: 0,
+				timelineEndSec: 4,
+			}),
+			makeClip({
+				id: "trimmed-clip",
+				assetId: "trimmed",
+				sourceStartSec: 0,
+				sourceEndSec: 4,
+				timelineStartSec: 4,
+				timelineEndSec: 8,
+			}),
+			makeClip({
+				id: "pathless-clip",
+				assetId: "pathless",
+				sourceStartSec: 0,
+				sourceEndSec: 4,
+				timelineStartSec: 8,
+				timelineEndSec: 12,
+			}),
+			makeClip({
+				id: "missing-clip",
+				assetId: "missing",
+				sourceStartSec: 0,
+				sourceEndSec: 4,
+				timelineStartSec: 12,
+				timelineEndSec: 16,
+			}),
+		];
+		const doc = makeDoc({
+			assets: [visible, trimmed, pathless],
+			clips,
+			timeline: {
+				trimRanges: [
+					{
+						id: "trim-all",
+						assetId: "trimmed",
+						clipId: "trimmed-clip",
+						startSec: 0,
+						endSec: 4,
+						origin: "user",
+						reason: "",
+					},
+				],
+			},
+		});
+
+		const scene = buildSceneDescription(doc, null, { outputDims: { width: 800, height: 600 } });
+		expect(scene.clips.map((clip) => clip.screenPath)).toEqual(["/visible.mp4"]);
+		expect(scene.output).toEqual({ width: 800, height: 600, fps: null });
+	});
+
 	it("sets hasAudio=true for a clip whose screen asset has an originalPath", () => {
 		// ponytail: the rule is "screen recordings from this app always carry a decodable
 		// audio track" (per product convention + ffprobe on real recordings). The visibleClips
@@ -1104,7 +1165,7 @@ describe("buildSceneDescription.output", () => {
 		expect(output).toEqual({ width: 1920, height: 1080, fps: null });
 	});
 
-	it("falls back to any asset with dims when no used asset has them", () => {
+	it("does not borrow dimensions from an asset outside the resolved clip stream", () => {
 		const used = makeAsset({ id: "used", originalPath: "/u.mp4" }); // no dims
 		const probe = makeAsset({
 			id: "probe",
@@ -1125,7 +1186,7 @@ describe("buildSceneDescription.output", () => {
 			],
 		});
 		const { output } = buildSceneDescription(doc);
-		expect(output).toEqual({ width: 2560, height: 1440, fps: null });
+		expect(output).toEqual({ width: 1920, height: 1080, fps: null });
 	});
 
 	it("honors legacyEditor.aspectRatio instead of always following the source asset's own ratio", () => {

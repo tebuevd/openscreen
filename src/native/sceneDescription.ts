@@ -25,12 +25,15 @@ import {
 	getCaptionTranslations,
 } from "@/lib/ai-edition/captions";
 import { createId } from "@/lib/ai-edition/document/ids";
-import { pickOutputDims } from "@/lib/ai-edition/document/outputFormat";
-import { resolvePlaybackSegments } from "@/lib/ai-edition/document/timeline";
+import {
+	type Dims,
+	pickOutputDims,
+	type ResolvedVisibleClip,
+	resolveVisibleClips,
+} from "@/lib/ai-edition/document/outputFormat";
 import type { AxcutClip, AxcutDocument } from "@/lib/ai-edition/schema";
 import { getEditorSettings } from "@/lib/ai-edition/store/editorSettings";
 import { assetCameraSource } from "@/lib/ai-edition/timeline/camera";
-import { resolveClipSourceEndSec } from "@/lib/ai-edition/timeline/clipDuration";
 import { projectRegionsToSource } from "@/lib/ai-edition/timeline/timelineMap";
 import {
 	computeCompositeLayout,
@@ -39,7 +42,10 @@ import {
 	webcamSizeToFraction,
 } from "@/lib/compositeLayout";
 import { parseCssGradient, resolveLinearGradientAngle } from "@/lib/exporter/gradientParser";
+import { calculateEffectiveSourceDimensions } from "@/lib/exporter/mp4ExportSettings";
 import type { CompositorClipInput } from "./contracts";
+
+export { resolveVisibleClips } from "@/lib/ai-edition/document/outputFormat";
 
 /** Background behind the screen. Parsed from `settings.wallpaper`. */
 export type SceneBackground =
@@ -390,34 +396,26 @@ function parseWallpaper(wallpaper: string) {
 	return { kind: "image", path: wallpaper } as const;
 }
 
-/**
- * The ONE clip list every native-facing consumer must build from — trim-narrowed
- * (`resolvePlaybackSegments`, so word-level cuts from the transcript editor actually reach
- * native instead of only affecting the transcript panel's own strikethrough), sorted, and
- * filtered to clips whose asset has a resolvable path. Shared by `buildSceneDescription`
- * below, `ExportDialog.tsx`'s `buildNativeClipList` (native MP4 export), and
- * `NativeCompositorOverlay.tsx`'s `nativeClips` (live preview) — previously these three each
- * hand-rolled their own sort+filter, acknowledged as needing to be "kept in lock-step".
- */
-export function resolveVisibleClips(document: AxcutDocument): AxcutClip[] {
-	const assetById = new Map(document.assets.map((a) => [a.id, a]));
-	return resolvePlaybackSegments(document.timeline.clips, document.timeline.trimRanges)
-		.sort((a, b) => a.timelineStartSec - b.timelineStartSec)
-		.filter((clip) => assetById.get(clip.assetId)?.originalPath);
+interface BuildSceneDescriptionOptions {
+	visibleClips?: ResolvedVisibleClip[];
+	outputDims?: Dims;
 }
 
 /** Serialize a document into a {@link SceneDescription}. Pure — no per-frame math. */
 export function buildSceneDescription(
 	document: AxcutDocument,
 	webcamSourceSize: { width: number; height: number } | null = null,
+	options: BuildSceneDescriptionOptions = {},
 ): SceneDescription {
 	const settings = getEditorSettings(document);
 
 	const assetById = new Map(document.assets.map((a) => [a.id, a]));
-	const visibleClips = resolveVisibleClips(document);
-	const clips: CompositorClipInput[] = visibleClips.flatMap((clip) => {
+	const visibleClips = options.visibleClips ?? resolveVisibleClips(document);
+	const clips: CompositorClipInput[] = visibleClips.map((clip) => {
 		const asset = assetById.get(clip.assetId);
-		if (!asset?.originalPath) return [];
+		if (!asset?.originalPath) {
+			throw new Error(`Resolved visible clip ${clip.id} has no source asset path`);
+		}
 		const camera = assetCameraSource(asset);
 		// ponytail: `asset.audio` exists in the schema but the probe pipeline never
 		// populates it, so there is no per-asset "is there a track?" signal to read
@@ -426,16 +424,14 @@ export function buildSceneDescription(
 		// audio" — a capture made with no mic and no system audio has no audio
 		// stream at all (issue #348). Swap to `Boolean(asset.audio)` the day the
 		// probe fills it in.
-		return [
-			{
-				screenPath: asset.originalPath,
-				webcamPath: camera.path,
-				sourceStartSec: clip.sourceStartSec,
-				sourceEndSec: resolveClipSourceEndSec(clip, asset),
-				webcamOffsetSec: camera.offsetSec,
-				hasAudio: true,
-			},
-		];
+		return {
+			screenPath: asset.originalPath,
+			webcamPath: camera.path,
+			sourceStartSec: clip.sourceStartSec,
+			sourceEndSec: clip.sourceEndSec,
+			webcamOffsetSec: camera.offsetSec,
+			hasAudio: true,
+		};
 	});
 	const cropByClip = visibleClips.map(
 		(clip): { x: number; y: number; width: number; height: number } | null => {
@@ -532,7 +528,8 @@ export function buildSceneDescription(
 	// fait sur la résolution de sortie (= taille du canvas rendu) avec les unités sources du
 	// premier asset visible — la même convention que `pickOutputDims` + SCREEN_SOURCE_SIZE /
 	// WEBCAM_SOURCE_SIZE dans PreviewCanvas — ce qui garde preview/export/natif alignés.
-	const outputDims = pickOutputDims(document, settings.aspectRatio);
+	const outputDims =
+		options.outputDims ?? pickOutputDims(document, settings.aspectRatio, {}, visibleClips);
 	// ponytail: when the active camera has been probed (real webcam dims cached by
 	// WebcamOverlay's loadedmetadata handler), use them so the box matches the actual
 	// camera aspect. Without this the box defaults to a hardcoded 4:3 (960x720) and the
@@ -564,10 +561,11 @@ export function buildSceneDescription(
 	const screenSourceSizeOf = (clip: AxcutClip, index: number) => {
 		const video = assetById.get(clip.assetId)?.video;
 		const crop = cropByClip[index]; // index-aligned; null = identity crop
-		return {
-			width: Math.max(1, Math.round((video?.width || 1920) * (crop?.width ?? 1))),
-			height: Math.max(1, Math.round((video?.height || 1080) * (crop?.height ?? 1))),
-		};
+		return calculateEffectiveSourceDimensions(
+			video?.width || 1920,
+			video?.height || 1080,
+			crop ?? undefined,
+		);
 	};
 	/** Does THIS clip have a camera to lay out? Same expression as the `webcamPath` sent
 	 *  with the clip above, so the layout and the decoder can never disagree about it.
@@ -813,6 +811,6 @@ export function buildSceneDescription(
 			clipIndex: region.clipIndex,
 		})),
 		cropByClip,
-		output: { ...pickOutputDims(document, settings.aspectRatio), fps: null },
+		output: { ...outputDims, fps: null },
 	};
 }

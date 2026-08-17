@@ -1,9 +1,5 @@
 import { describe, expect, it } from "vitest";
-import {
-	collectEffectiveClipDims,
-	collectUsedAssetDims,
-	pickExtremeDims,
-} from "@/lib/ai-edition/document/outputFormat";
+import { collectEffectiveClipDims, pickExtremeDims } from "@/lib/ai-edition/document/outputFormat";
 import {
 	type AxcutAsset,
 	type AxcutClip,
@@ -136,22 +132,5 @@ describe("collectEffectiveClipDims", () => {
 		expect(collectEffectiveClipDims(doc([a], clips), { a1: { width: 1280, height: 720 } })).toEqual(
 			[{ width: 1280, height: 720 }],
 		);
-	});
-});
-
-describe("collectUsedAssetDims", () => {
-	it("only considers assets actually referenced by a clip", () => {
-		const used = asset({
-			id: "used",
-			video: { codec: "h264", width: 1920, height: 1080, fps: 30 },
-		});
-		const unused = asset({
-			id: "unused",
-			video: { codec: "h264", width: 3840, height: 2160, fps: 30 },
-		});
-		const clips = [clip({ id: "c1", assetId: "used" })];
-		expect(collectUsedAssetDims(doc([used, unused], clips), {})).toEqual([
-			{ width: 1920, height: 1080 },
-		]);
 	});
 });

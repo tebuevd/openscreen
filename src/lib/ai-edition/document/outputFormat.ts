@@ -22,11 +22,15 @@ import {
 	toAspectRatioToken,
 } from "@/utils/aspectRatioUtils";
 import type { AxcutAsset, AxcutClip, AxcutDocument } from "../schema";
+import { resolveClipSourceEndSec } from "../timeline/clipDuration";
+import { resolvePlaybackSegments } from "./timeline";
 
 export interface Dims {
 	width: number;
 	height: number;
 }
+
+export type ResolvedVisibleClip = AxcutClip & { sourceEndSec: number };
 
 /** Output frame used when a document has no usable asset dimensions at all. */
 const FALLBACK_OUTPUT_DIMS: Dims = { width: 1920, height: 1080 };
@@ -77,6 +81,23 @@ export function pickExtremeDims(items: Dims[], direction: "largest" | "smallest"
 	return best;
 }
 
+/** The authoritative clip stream for preview, scene serialization, and export. */
+export function resolveVisibleClips(document: AxcutDocument): ResolvedVisibleClip[] {
+	const assetById = new Map(document.assets.map((asset) => [asset.id, asset]));
+	const exportableClips: ResolvedVisibleClip[] = [];
+	for (const clip of document.timeline.clips) {
+		const asset = assetById.get(clip.assetId);
+		if (!asset?.originalPath || clip.timelineEndSec <= clip.timelineStartSec) continue;
+		const sourceEndSec = resolveClipSourceEndSec(clip, asset);
+		if (!Number.isFinite(sourceEndSec) || sourceEndSec <= clip.sourceStartSec) continue;
+		exportableClips.push({ ...clip, sourceEndSec });
+	}
+	return resolvePlaybackSegments(exportableClips, document.timeline.trimRanges).flatMap((clip) => {
+		if (clip.sourceEndSec === undefined || clip.sourceEndSec <= clip.sourceStartSec) return [];
+		return [{ ...clip, sourceEndSec: clip.sourceEndSec }];
+	});
+}
+
 /**
  * One clip's EFFECTIVE (post-crop) pixel footprint, or null when its asset's dimensions aren't
  * known yet.
@@ -105,39 +126,19 @@ function clipEffectiveDims(
 	return calculateEffectiveSourceDimensions(rawWidth, rawHeight, clip.cropRegion);
 }
 
-/** Per-clip effective (post-crop) dims for the whole timeline — the true footprint each clip
- *  contributes. Falls back to `collectUsedAssetDims`'s raw dims while nothing has probed yet
- *  (crop can't be attributed without dimensions to apply it to), which is degraded but never
- *  blank. */
+/** Per-clip effective (post-crop) dimensions for the resolved visible clip stream. */
 export function collectEffectiveClipDims(
 	document: AxcutDocument,
 	probedAssetDims: Record<string, Dims> = {},
+	clips: readonly AxcutClip[] = resolveVisibleClips(document),
 ): Dims[] {
 	const assetById = new Map(document.assets.map((a) => [a.id, a]));
 	const dims: Dims[] = [];
-	for (const clip of document.timeline.clips) {
+	for (const clip of clips) {
 		const effective = clipEffectiveDims(clip, assetById, probedAssetDims);
 		if (effective) dims.push(effective);
 	}
-	if (dims.length > 0) return dims;
-	return collectUsedAssetDims(document, probedAssetDims);
-}
-
-/** Raw (uncropped) probed dims for every asset the timeline actually uses — falls back to ANY
- *  asset with known dims if none of the used ones have probed yet (still loading), so callers
- *  show *something* rather than blank. */
-export function collectUsedAssetDims(
-	document: AxcutDocument,
-	probedAssetDims: Record<string, Dims> = {},
-): Dims[] {
-	const usedAssetIds = new Set(document.timeline.clips.map((c) => c.assetId));
-	const dimsOf = (a: AxcutDocument["assets"][number]): Dims => ({
-		width: a.video?.width || probedAssetDims[a.id]?.width || 0,
-		height: a.video?.height || probedAssetDims[a.id]?.height || 0,
-	});
-	const used = document.assets.filter((a) => usedAssetIds.has(a.id)).map(dimsOf);
-	if (used.some((d) => d.width > 0 && d.height > 0)) return used;
-	return document.assets.map(dimsOf);
+	return dims;
 }
 
 /**
@@ -160,9 +161,10 @@ export function collectUsedAssetDims(
 export function referenceClipDims(
 	document: AxcutDocument,
 	probedAssetDims: Record<string, Dims> = {},
+	clips: readonly AxcutClip[] = resolveVisibleClips(document),
 ): Dims {
 	return (
-		pickExtremeDims(collectEffectiveClipDims(document, probedAssetDims), "largest") ??
+		pickExtremeDims(collectEffectiveClipDims(document, probedAssetDims, clips), "largest") ??
 		FALLBACK_OUTPUT_DIMS
 	);
 }
@@ -186,11 +188,12 @@ export function referenceClipDims(
 export function collectNativeFormats(
 	document: AxcutDocument,
 	probedAssetDims: Record<string, Dims> = {},
+	clips: readonly AxcutClip[] = resolveVisibleClips(document),
 ): NativeFormat[] {
 	const assetById = new Map(document.assets.map((a) => [a.id, a]));
 	const byToken = new Map<string, NativeFormat>();
 
-	for (const clip of document.timeline.clips) {
+	for (const clip of clips) {
 		const effective = clipEffectiveDims(clip, assetById, probedAssetDims);
 		if (!effective) continue;
 		const { width, height } = effective;
@@ -233,10 +236,15 @@ export function resolveAspectRatioValue(
 	document: AxcutDocument | null | undefined,
 	aspectRatio: AspectRatio,
 	probedAssetDims: Record<string, Dims> = {},
+	clips?: readonly AxcutClip[],
 ): number {
 	if (aspectRatio !== "native") return getAspectRatioValue(aspectRatio);
 	if (!document) return getAspectRatioValue("native");
-	const reference = referenceClipDims(document, probedAssetDims);
+	const reference = referenceClipDims(
+		document,
+		probedAssetDims,
+		clips ?? resolveVisibleClips(document),
+	);
 	return getNativeAspectRatioValue(reference.width, reference.height);
 }
 
@@ -259,9 +267,10 @@ export function pickOutputDims(
 	document: AxcutDocument,
 	aspectRatio: AspectRatio,
 	probedAssetDims: Record<string, Dims> = {},
+	clips: readonly AxcutClip[] = resolveVisibleClips(document),
 ): Dims {
-	const reference = referenceClipDims(document, probedAssetDims);
-	const ratio = resolveAspectRatioValue(document, aspectRatio, probedAssetDims);
+	const reference = referenceClipDims(document, probedAssetDims, clips);
+	const ratio = resolveAspectRatioValue(document, aspectRatio, probedAssetDims, clips);
 	const longSide = toEvenPx(Math.max(reference.width, reference.height));
 	if (ratio >= 1) {
 		return { width: longSide, height: toEvenPx(longSide / ratio) };

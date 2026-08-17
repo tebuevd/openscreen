@@ -16,6 +16,7 @@ import {
 	pickOutputDims,
 	referenceClipDims,
 	resolveAspectRatioValue,
+	resolveVisibleClips,
 } from "./outputFormat";
 
 function asset(id: string, width: number, height: number): AxcutAsset {
@@ -44,7 +45,11 @@ function clip(id: string, assetId: string, cropRegion?: AxcutClip["cropRegion"])
 	};
 }
 
-function doc(assets: AxcutAsset[], clips: AxcutClip[]): AxcutDocument {
+function doc(
+	assets: AxcutAsset[],
+	clips: AxcutClip[],
+	trimRanges: AxcutDocument["timeline"]["trimRanges"] = [],
+): AxcutDocument {
 	return {
 		schemaVersion: axcutSchemaVersion,
 		project: {
@@ -60,7 +65,7 @@ function doc(assets: AxcutAsset[], clips: AxcutClip[]): AxcutDocument {
 		timeline: {
 			clips,
 			gaps: [],
-			trimRanges: [],
+			trimRanges,
 			muteRanges: [],
 			speedRanges: [],
 			captionRanges: [],
@@ -70,6 +75,86 @@ function doc(assets: AxcutAsset[], clips: AxcutClip[]): AxcutDocument {
 		legacyEditor: null,
 	};
 }
+
+describe("resolveVisibleClips", () => {
+	it("is the sole filter for fully trimmed, zero-duration, pathless, and missing-asset clips", () => {
+		const visible = asset("visible", 2880, 1864);
+		const trimmed = asset("trimmed", 320, 240);
+		const pathless = { ...asset("pathless", 160, 90), originalPath: "" } as AxcutAsset;
+		const clips = [
+			clip("visible-clip", "visible"),
+			{ ...clip("trimmed-clip", "trimmed"), timelineStartSec: 10, timelineEndSec: 20 },
+			{ ...clip("pathless-clip", "pathless"), timelineStartSec: 20, timelineEndSec: 30 },
+			{ ...clip("missing-clip", "missing"), timelineStartSec: 30, timelineEndSec: 40 },
+			{ ...clip("zero-clip", "visible"), timelineStartSec: 40, timelineEndSec: 40 },
+		];
+		const d = doc([visible, trimmed, pathless], clips, [
+			{
+				id: "trim-all",
+				assetId: "trimmed",
+				clipId: "trimmed-clip",
+				startSec: 0,
+				endSec: 10,
+				origin: "user",
+				reason: "",
+			},
+		]);
+
+		const resolved = resolveVisibleClips(d);
+		expect(resolved.map((item) => item.id)).toEqual(["visible-clip"]);
+		expect(collectEffectiveClipDims(d, {}, resolved)).toEqual([{ width: 2880, height: 1864 }]);
+	});
+
+	it("does not let an excluded portrait clip dictate legacy Original aspect", () => {
+		const landscape = asset("landscape", 1920, 1080);
+		const portrait = asset("portrait", 1080, 1920);
+		const portraitClip = {
+			...clip("portrait-clip", "portrait"),
+			timelineStartSec: 10,
+			timelineEndSec: 20,
+		};
+		const d = doc(
+			[landscape, portrait],
+			[clip("landscape-clip", "landscape"), portraitClip],
+			[
+				{
+					id: "trim-portrait",
+					assetId: "portrait",
+					clipId: "portrait-clip",
+					startSec: 0,
+					endSec: 10,
+					origin: "user",
+					reason: "",
+				},
+			],
+		);
+
+		expect(resolveAspectRatioValue(d, "native")).toBeCloseTo(16 / 9, 6);
+		expect(pickOutputDims(d, "native")).toEqual({ width: 1920, height: 1080 });
+	});
+
+	it("fully trims a legacy clip after resolving its missing source end", () => {
+		const source = { ...asset("source", 1920, 1080), durationSec: 10 };
+		const legacyClip = { ...clip("legacy", "source"), sourceEndSec: undefined };
+		const d = doc(
+			[source],
+			[legacyClip],
+			[
+				{
+					id: "trim-all",
+					assetId: "source",
+					clipId: "legacy",
+					startSec: 0,
+					endSec: 10,
+					origin: "user",
+					reason: "",
+				},
+			],
+		);
+
+		expect(resolveVisibleClips(d)).toEqual([]);
+	});
+});
 
 describe("collectNativeFormats", () => {
 	it("returns one entry when every clip shares a shape — the common case stays a single choice", () => {
@@ -188,9 +273,9 @@ describe("referenceClipDims", () => {
 		expect(referenceClipDims(d)).toEqual({ width: 1920, height: 2160 });
 	});
 
-	it("falls back to any asset with dims when no used clip has probed yet", () => {
+	it("does not borrow dimensions from an asset outside the resolved clip stream", () => {
 		const d = doc([asset("a1", 0, 0), asset("a2", 1280, 720)], [clip("c1", "a1")]);
-		expect(referenceClipDims(d)).toEqual({ width: 1280, height: 720 });
+		expect(referenceClipDims(d)).toEqual({ width: 1920, height: 1080 });
 	});
 
 	it("falls back to 1920x1080 for a document with no dimensions at all", () => {

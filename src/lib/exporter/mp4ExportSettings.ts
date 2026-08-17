@@ -136,6 +136,8 @@ export function calculateEffectiveSourceDimensions(
 	sourceHeight: number,
 	cropRegion?: SourceCropRegion,
 ) {
+	// Callers supply display-oriented media dimensions (`videoWidth`/`videoHeight`), so container
+	// rotation is already reflected before crop geometry is applied.
 	const cropWidth = cropRegion?.width ?? 1;
 	const cropHeight = cropRegion?.height ?? 1;
 
@@ -203,6 +205,56 @@ function calculateSourceDimensions(
 	};
 }
 
+/**
+ * Largest frame at `aspectRatioValue` into which every source can be contain-fitted at scale <= 1.
+ * For landscape output, one source permits width `max(sourceWidth, sourceHeight * ratio)`; taking
+ * the minimum of those capacities enforces the invariant across the whole clip stream. Portrait
+ * output is the same calculation on height. Allocation limits are additional capacities.
+ */
+export function calculateSourceExportDimensions(
+	sourceDimensions: readonly ExportDimensions[],
+	aspectRatioValue: number,
+): ExportDimensions | null {
+	if (
+		!Number.isFinite(aspectRatioValue) ||
+		aspectRatioValue <= 0 ||
+		sourceDimensions.length === 0 ||
+		sourceDimensions.some((dimensions) => !hasPracticalExportSourceDimensions(dimensions))
+	) {
+		return null;
+	}
+
+	if (aspectRatioValue >= 1) {
+		const sourceWidthCapacity = Math.min(
+			...sourceDimensions.map(({ width, height }) => Math.max(width, height * aspectRatioValue)),
+		);
+		const width = even(
+			Math.min(
+				sourceWidthCapacity,
+				MAX_MP4_EXPORT_DIMENSION,
+				Math.sqrt(MAX_MP4_EXPORT_PIXEL_AREA * aspectRatioValue),
+			),
+		);
+		const height = even(width / aspectRatioValue);
+		const dimensions = { width, height };
+		return validateMp4ExportDimensions(dimensions).ok ? dimensions : null;
+	}
+
+	const sourceHeightCapacity = Math.min(
+		...sourceDimensions.map(({ width, height }) => Math.max(height, width / aspectRatioValue)),
+	);
+	const height = even(
+		Math.min(
+			sourceHeightCapacity,
+			MAX_MP4_EXPORT_DIMENSION,
+			Math.sqrt(MAX_MP4_EXPORT_PIXEL_AREA / aspectRatioValue),
+		),
+	);
+	const width = even(height * aspectRatioValue);
+	const dimensions = { width, height };
+	return validateMp4ExportDimensions(dimensions).ok ? dimensions : null;
+}
+
 function calculateBitrate(width: number, height: number, quality: ExportQuality) {
 	const totalPixels = width * height;
 
@@ -251,6 +303,31 @@ export function calculateMp4ExportSettings({
 	};
 }
 
+export function calculateMp4ExportSettingsForSources({
+	quality,
+	sourceDimensions,
+	aspectRatioValue,
+}: {
+	quality: ExportQuality;
+	sourceDimensions: readonly ExportDimensions[];
+	aspectRatioValue: number;
+}): Mp4ExportSettings | null {
+	if (quality !== "source") {
+		const source = sourceDimensions[0] ?? { width: 2, height: 2 };
+		return calculateMp4ExportSettings({
+			quality,
+			sourceWidth: source.width,
+			sourceHeight: source.height,
+			aspectRatioValue,
+		});
+	}
+
+	const dimensions = calculateSourceExportDimensions(sourceDimensions, aspectRatioValue);
+	return dimensions
+		? { ...dimensions, bitrate: calculateBitrate(dimensions.width, dimensions.height, quality) }
+		: null;
+}
+
 /**
  * Resolves the complete MP4 output pair before export submission. Fixed tiers only need a
  * concrete aspect ratio; Source needs source pixels, and the legacy Original token needs source
@@ -260,11 +337,13 @@ export function resolveMp4ExportSettings({
 	quality,
 	aspectRatio,
 	sourceDimensions,
+	sourceClipDimensions,
 	originalDimensions = sourceDimensions,
 }: {
 	quality: ExportQuality;
 	aspectRatio: AspectRatio;
 	sourceDimensions: ExportDimensions | null;
+	sourceClipDimensions?: readonly ExportDimensions[];
 	originalDimensions?: ExportDimensions | null;
 }): Mp4ExportSettingsResolution {
 	let aspectRatioValue: number;
@@ -281,31 +360,24 @@ export function resolveMp4ExportSettings({
 		aspectRatioValue = parsed.width / parsed.height;
 	}
 
+	const sources =
+		sourceClipDimensions ??
+		(hasValidExportSourceDimensions(sourceDimensions) ? [sourceDimensions] : []);
 	if (quality === "source") {
-		if (!hasValidExportSourceDimensions(sourceDimensions)) {
+		if (sources.length === 0 || sources.some((source) => !hasValidExportSourceDimensions(source))) {
 			return { ok: false, reason: "source-dimensions-unavailable" };
 		}
-		if (
-			sourceDimensions.width > MAX_MP4_EXPORT_DIMENSION ||
-			sourceDimensions.height > MAX_MP4_EXPORT_DIMENSION ||
-			sourceDimensions.width > Math.floor(MAX_MP4_EXPORT_PIXEL_AREA / sourceDimensions.height)
-		) {
+		if (sources.some((source) => !hasPracticalExportSourceDimensions(source))) {
 			return { ok: false, reason: "invalid-output-dimensions" };
 		}
 	}
 
-	// The fixed tiers do not read source dimensions. Supplying a valid sentinel keeps the legacy
-	// calculator's required input shape without making 720p/1080p depend on media probing.
-	const source = hasValidExportSourceDimensions(sourceDimensions)
-		? sourceDimensions
-		: { width: 2, height: 2 };
-	const settings = calculateMp4ExportSettings({
+	const settings = calculateMp4ExportSettingsForSources({
 		quality,
-		sourceWidth: source.width,
-		sourceHeight: source.height,
+		sourceDimensions: sources,
 		aspectRatioValue,
 	});
-	if (!validateMp4ExportDimensions(settings).ok) {
+	if (!settings || !validateMp4ExportDimensions(settings).ok) {
 		return { ok: false, reason: "invalid-output-dimensions" };
 	}
 
