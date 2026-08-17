@@ -600,68 +600,97 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	async applyDocumentResult(expected, document) {
-		const before = get();
-		if (
-			before.documentGeneration !== expected.documentGeneration ||
-			before.projectId !== expected.projectId ||
-			before.revision !== expected.revision ||
-			before.status !== "ready" ||
-			before.document?.project.id !== expected.projectId
-		) {
-			return false;
-		}
-
-		const parsed = parseDocument(document);
-		if (parsed.project.id !== expected.projectId) {
-			throw new Error(
-				`Document result belongs to ${parsed.project.id}, expected ${expected.projectId}`,
-			);
-		}
-
-		// Validation and installation are one synchronous store transaction. A project switch or
-		// edit that happened while the producer was running therefore cannot slip between a
-		// component-level check and this full-document replacement.
-		void import("./undo").then(({ pushHistory }) => {
-			pushHistory({ projectId: expected.projectId, doc: structuredClone(before.document!) });
-		});
-		set({
-			document: parsed,
-			revision: expected.revision + 1,
-			dirty: true,
-		});
-
-		await enqueueSave(expected.documentGeneration, async () => {
-			const saving = get();
+		return enqueueSave(expected.documentGeneration, async () => {
+			const before = get();
 			if (
-				saving.documentGeneration !== expected.documentGeneration ||
-				saving.projectId !== expected.projectId ||
-				saving.status !== "ready" ||
-				!saving.document ||
-				saving.document.project.id !== expected.projectId
+				before.documentGeneration !== expected.documentGeneration ||
+				before.projectId !== expected.projectId ||
+				before.revision !== expected.revision ||
+				before.status !== "ready" ||
+				before.document?.project.id !== expected.projectId
 			) {
-				return;
+				return false;
 			}
 
-			// If the user edited after this result was accepted, persist that newer document instead
-			// of replaying the accepted snapshot over it.
-			const revision = saving.revision;
-			const persisted = await persistDocument(saving.document);
+			const parsed = parseDocument(document);
+			if (parsed.project.id !== expected.projectId) {
+				throw new Error(
+					`Document result belongs to ${parsed.project.id}, expected ${expected.projectId}`,
+				);
+			}
+
+			let persisted: AxcutDocument;
+			try {
+				persisted = await persistDocument(parsed);
+			} catch (error) {
+				// A failed response is ambiguous: the main process may have committed before the
+				// acknowledgement was lost. Re-read disk and adopt it only while this operation's
+				// exact launch version is still current; never restore over an intervening edit.
+				try {
+					const result = await nativeBridgeClient.aiEdition.get(expected.projectId);
+					const authoritative =
+						result.success && result.document ? parseDocument(result.document) : null;
+					const current = get();
+					if (
+						authoritative?.project.id === expected.projectId &&
+						current.documentGeneration === expected.documentGeneration &&
+						current.projectId === expected.projectId &&
+						current.revision === expected.revision
+					) {
+						const beforeJson = JSON.stringify(before.document);
+						const authoritativeJson = JSON.stringify(authoritative);
+						if (authoritativeJson !== beforeJson) {
+							const { clearHistory, pushHistory } = await import("./undo");
+							const latest = get();
+							const operationStillCurrent =
+								latest.documentGeneration === expected.documentGeneration &&
+								latest.projectId === expected.projectId &&
+								latest.revision === expected.revision;
+							if (operationStillCurrent) {
+								if (authoritativeJson === JSON.stringify(parsed)) {
+									pushHistory({
+										projectId: expected.projectId,
+										doc: structuredClone(before.document),
+									});
+								} else {
+									clearHistory();
+								}
+								set({
+									document: authoritative,
+									revision: expected.revision + 1,
+									dirty: false,
+									lastSavedAt: new Date(),
+								});
+							}
+						}
+					}
+				} catch (reconciliationError) {
+					console.warn(
+						"[project] could not reconcile an ambiguous document-result save:",
+						reconciliationError,
+					);
+				}
+				throw error;
+			}
+
+			const { pushHistory } = await import("./undo");
 			const current = get();
 			if (
 				current.documentGeneration !== expected.documentGeneration ||
 				current.projectId !== expected.projectId ||
-				current.revision !== revision
+				current.revision !== expected.revision
 			) {
-				return;
+				return false;
 			}
+			pushHistory({ projectId: expected.projectId, doc: structuredClone(before.document) });
 			set({
 				document: persisted,
-				revision: revision + 1,
+				revision: expected.revision + 1,
 				dirty: false,
 				lastSavedAt: new Date(),
 			});
+			return true;
 		});
-		return true;
 	},
 
 	setDocument(document) {

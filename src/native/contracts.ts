@@ -320,13 +320,27 @@ export interface AiEditionChatResult {
 	userMessageCheckpointId?: string;
 }
 
-export interface AiEditionChatRewindResult {
-	success: true;
-	document: unknown;
-	messages: AiEditionChatMessage[];
-	/** The user message content of the rewound turn, prefilled back into the composer. */
-	prompt: string;
-}
+export type AiEditionChatOperationResult = { success: true } | { success: false; error: string };
+
+export type AiEditionChatRewindPrepareResult =
+	| {
+			success: true;
+			operationId: string;
+			sessionRevision: number;
+			document: unknown;
+			messages: AiEditionChatMessage[];
+			/** The user message content of the rewound turn, prefilled back into the composer. */
+			prompt: string;
+	  }
+	| { success: false; error: string };
+
+export type AiEditionChatRewindCommitResult =
+	| {
+			success: true;
+			messages: AiEditionChatMessage[];
+			prompt: string;
+	  }
+	| { success: false; error: string };
 
 export interface AiEditionChatSessionSummary {
 	id: string;
@@ -593,10 +607,17 @@ export type NativeBridgeRequest =
 				projectId: string;
 				sessionId: string;
 				message: string;
+				operationId: string;
 				/** Current AxcutDocument snapshot — enables the agent tool loop.
 				 * When omitted the chat runs text-only (no tools). */
 				document?: unknown;
 			};
+			requestId?: string;
+	  }
+	| {
+			domain: "aiEdition";
+			action: "chat.run.commit" | "chat.run.abort";
+			payload: { projectId: string; sessionId: string; operationId: string };
 			requestId?: string;
 	  }
 	| {
@@ -649,8 +670,25 @@ export type NativeBridgeRequest =
 	  }
 	| {
 			domain: "aiEdition";
-			action: "chat.rewind";
+			action: "chat.rewind.prepare";
 			payload: { projectId: string; sessionId: string; messageId: string };
+			requestId?: string;
+	  }
+	| {
+			domain: "aiEdition";
+			action: "chat.rewind.commit";
+			payload: {
+				projectId: string;
+				sessionId: string;
+				operationId: string;
+				sessionRevision: number;
+			};
+			requestId?: string;
+	  }
+	| {
+			domain: "aiEdition";
+			action: "chat.rewind.abort";
+			payload: { projectId: string; sessionId: string; operationId: string };
 			requestId?: string;
 	  }
 	| {
@@ -844,11 +882,18 @@ export type NativeBridgeEventName =
 // provider failed and the toast was a side-channel; the renderer shows it
 // inline so the chat doesn't appear to "echo back my question".
 export type AiEditionChatEvent =
-	| { kind: "text"; sessionId: string; delta: string }
-	| { kind: "thinking"; sessionId: string; delta: string }
-	| { kind: "toolStart"; sessionId: string; name: string; args: unknown }
-	| { kind: "toolEnd"; sessionId: string; name: string; ok: boolean; summary?: string }
-	| { kind: "error"; sessionId: string; message: string };
+	| { kind: "text"; sessionId: string; operationId: string; delta: string }
+	| { kind: "thinking"; sessionId: string; operationId: string; delta: string }
+	| { kind: "toolStart"; sessionId: string; operationId: string; name: string; args: unknown }
+	| {
+			kind: "toolEnd";
+			sessionId: string;
+			operationId: string;
+			name: string;
+			ok: boolean;
+			summary?: string;
+	  }
+	| { kind: "error"; sessionId: string; operationId: string; message: string };
 
 export interface NativeBridgeEvent<TPayload = unknown> {
 	name: NativeBridgeEventName;

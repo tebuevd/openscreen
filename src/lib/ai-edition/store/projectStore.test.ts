@@ -531,7 +531,7 @@ describe("useProjectStore", () => {
 		expect(useProjectStore.getState().document).toBe(reopened);
 	});
 
-	it("persists a newer edit instead of replaying an accepted result waiting in the save queue", async () => {
+	it("refuses a queued result when the revision changes before its serialized save", async () => {
 		const firstSave = deferred<{ success: true; document: AxcutDocument }>();
 		const snapshots: AxcutDocument[] = [];
 		bridgeMocks.save.mockImplementation((document: AxcutDocument) => {
@@ -548,24 +548,66 @@ describe("useProjectStore", () => {
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
 		const applying = useProjectStore.getState().applyDocumentResult(operationToken(), {
 			...sampleDoc,
-			project: { ...sampleDoc.project, title: "Accepted agent result" },
+			project: { ...sampleDoc.project, title: "Queued agent result" },
 		});
-		const accepted = useProjectStore.getState().document!;
+		const current = useProjectStore.getState().document!;
 		useProjectStore.getState().setDocument({
-			...accepted,
-			project: { ...accepted.project, title: "Edit after accepted result" },
+			...current,
+			project: { ...current.project, title: "Edit while result waits" },
 		});
 
 		firstSave.resolve({ success: true, document: snapshots[0] });
 		await firstSaving;
-		await expect(applying).resolves.toBe(true);
+		await expect(applying).resolves.toBe(false);
 
-		expect(bridgeMocks.save).toHaveBeenCalledTimes(2);
-		expect(snapshots[1].project.title).toBe("Edit after accepted result");
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
 		expect(useProjectStore.getState()).toMatchObject({
-			document: { project: { title: "Edit after accepted result" } },
+			document: { project: { title: "Edit while result waits" } },
+			dirty: true,
+		});
+	});
+
+	it("leaves memory and undo unchanged when a result save is authoritatively rejected", async () => {
+		const { clearHistory, undo } = await import("./undo");
+		clearHistory();
+		bridgeMocks.save.mockResolvedValue({ success: false, error: "disk full" });
+		bridgeMocks.get.mockResolvedValue({ success: true, document: sampleDoc });
+		loadDocument();
+
+		await expect(
+			useProjectStore.getState().applyDocumentResult(operationToken(), {
+				...sampleDoc,
+				project: { ...sampleDoc.project, title: "Rejected result" },
+			}),
+		).rejects.toThrow("disk full");
+
+		expect(bridgeMocks.save).toHaveBeenCalledTimes(1);
+		expect(bridgeMocks.get).toHaveBeenCalledWith("proj_test");
+		expect(useProjectStore.getState()).toMatchObject({ document: sampleDoc, dirty: false });
+		expect(undo()).toBe(false);
+	});
+
+	it("adopts an authoritative result after a lost save response without losing undo", async () => {
+		const { clearHistory, undo } = await import("./undo");
+		clearHistory();
+		const resultDocument: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Committed despite lost response" },
+		};
+		bridgeMocks.save.mockRejectedValue(new Error("response lost"));
+		bridgeMocks.get.mockResolvedValue({ success: true, document: resultDocument });
+		loadDocument();
+
+		await expect(
+			useProjectStore.getState().applyDocumentResult(operationToken(), resultDocument),
+		).rejects.toThrow("response lost");
+
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Committed despite lost response" } },
 			dirty: false,
 		});
+		expect(undo()).toBe(true);
+		expect(useProjectStore.getState().document?.project.title).toBe("Test");
 	});
 
 	it("merges a delayed add response without clearing a newer dirty edit", async () => {

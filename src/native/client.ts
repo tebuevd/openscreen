@@ -3,8 +3,10 @@ import {
 	type AiEditionCaptionTranslateResult,
 	type AiEditionChatBudget,
 	type AiEditionChatCompactResult,
+	type AiEditionChatOperationResult,
 	type AiEditionChatResult,
-	type AiEditionChatRewindResult,
+	type AiEditionChatRewindCommitResult,
+	type AiEditionChatRewindPrepareResult,
 	type AiEditionChatSession,
 	type AiEditionChatSessionSummary,
 	type AiEditionDocumentResult,
@@ -232,12 +234,25 @@ export const nativeBridgeClient = {
 			projectId: string,
 			sessionId: string,
 			message: string,
-			document?: unknown,
+			document: unknown | undefined,
+			operationId: string,
 		): Promise<AiEditionChatResult> =>
 			requireNativeBridgeData<AiEditionChatResult>({
 				domain: "aiEdition",
 				action: "chat.run",
-				payload: { projectId, sessionId, message, document },
+				payload: { projectId, sessionId, message, document, operationId },
+			}),
+		chatCommitRun: (projectId: string, sessionId: string, operationId: string) =>
+			requireNativeBridgeData<AiEditionChatOperationResult>({
+				domain: "aiEdition",
+				action: "chat.run.commit",
+				payload: { projectId, sessionId, operationId },
+			}),
+		chatAbortRun: (projectId: string, sessionId: string, operationId: string) =>
+			requireNativeBridgeData<AiEditionChatOperationResult>({
+				domain: "aiEdition",
+				action: "chat.run.abort",
+				payload: { projectId, sessionId, operationId },
 			}),
 		chatUndoLastBatch: (projectId: string, sessionId: string) =>
 			requireNativeBridgeData<AiEditionChatResult>({
@@ -287,11 +302,28 @@ export const nativeBridgeClient = {
 				action: "chat.compact",
 				payload: { projectId, sessionId },
 			}),
-		chatRewind: (projectId: string, sessionId: string, messageId: string) =>
-			requireNativeBridgeData<AiEditionChatRewindResult | { success: false; error: string }>({
+		chatPrepareRewind: (projectId: string, sessionId: string, messageId: string) =>
+			requireNativeBridgeData<AiEditionChatRewindPrepareResult>({
 				domain: "aiEdition",
-				action: "chat.rewind",
+				action: "chat.rewind.prepare",
 				payload: { projectId, sessionId, messageId },
+			}),
+		chatCommitRewind: (
+			projectId: string,
+			sessionId: string,
+			operationId: string,
+			sessionRevision: number,
+		) =>
+			requireNativeBridgeData<AiEditionChatRewindCommitResult>({
+				domain: "aiEdition",
+				action: "chat.rewind.commit",
+				payload: { projectId, sessionId, operationId, sessionRevision },
+			}),
+		chatAbortRewind: (projectId: string, sessionId: string, operationId: string) =>
+			requireNativeBridgeData<AiEditionChatOperationResult>({
+				domain: "aiEdition",
+				action: "chat.rewind.abort",
+				payload: { projectId, sessionId, operationId },
 			}),
 		chatContextUsage: (projectId: string, sessionId: string) =>
 			requireNativeBridgeData<AiEditionChatBudget | null>({

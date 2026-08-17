@@ -49,8 +49,84 @@ interface MessageCheckpoint {
 }
 const messageCheckpointsBySession = new Map<string, MessageCheckpoint[]>();
 
+const CHAT_OPERATION_TTL_MS = 5 * 60_000;
+
+interface PendingChatRun {
+	operationId: string;
+	projectId: string;
+	sessionId: string;
+	expectedSessionRevision: number;
+	userMessage: AiEditionChatMessage;
+	assistantMessage: AiEditionChatMessage | null;
+	checkpoint: AxcutDocument | null;
+	expiresAt: number;
+}
+
+interface PendingRewind {
+	operationId: string;
+	projectId: string;
+	sessionId: string;
+	targetMessageId: string;
+	expectedSessionRevision: number;
+	prompt: string;
+	document: AxcutDocument;
+	messages: AiEditionChatMessage[];
+	expiresAt: number;
+}
+
+const pendingChatRuns = new Map<string, PendingChatRun>();
+const pendingRewinds = new Map<string, PendingRewind>();
+
 function sessionKey(projectId: string, sessionId: string): string {
 	return `${projectId}::${sessionId}`;
+}
+
+function operationBelongsToSession(
+	operation: { projectId: string; sessionId: string },
+	projectId: string,
+	sessionId: string,
+): boolean {
+	return operation.projectId === projectId && operation.sessionId === sessionId;
+}
+
+function expireOperation<T extends { expiresAt: number }>(
+	map: Map<string, T>,
+	operationId: string,
+) {
+	const timeout = setTimeout(() => {
+		const operation = map.get(operationId);
+		if (operation && operation.expiresAt <= Date.now()) map.delete(operationId);
+	}, CHAT_OPERATION_TTL_MS + 1_000);
+	timeout.unref?.();
+}
+
+function pruneExpiredOperations(): void {
+	const now = Date.now();
+	for (const [operationId, operation] of pendingChatRuns) {
+		if (operation.expiresAt <= now) pendingChatRuns.delete(operationId);
+	}
+	for (const [operationId, operation] of pendingRewinds) {
+		if (operation.expiresAt <= now) pendingRewinds.delete(operationId);
+	}
+}
+
+function sessionHasPendingOperation(projectId: string, sessionId: string): boolean {
+	pruneExpiredOperations();
+	return (
+		[...pendingChatRuns.values()].some((operation) =>
+			operationBelongsToSession(operation, projectId, sessionId),
+		) ||
+		[...pendingRewinds.values()].some((operation) =>
+			operationBelongsToSession(operation, projectId, sessionId),
+		)
+	);
+}
+
+function cloneMessage(message: AiEditionChatMessage): AiEditionChatMessage {
+	return {
+		...message,
+		toolCalls: message.toolCalls ? [...message.toolCalls] : undefined,
+	};
 }
 
 function checkpointsForSession(projectId: string, sessionId: string): MessageCheckpoint[] {
@@ -130,6 +206,8 @@ export interface ChatSession {
 	title: string;
 	createdAt: string;
 	messages: AiEditionChatMessage[];
+	/** Monotonic identity for destructive message/checkpoint mutations. */
+	revision: number;
 	/** Main-process bookkeeping: the compaction boundary, not part of the
 	 *  transcript. See `modelMessages`. */
 	compaction?: SessionCompaction;
@@ -152,8 +230,13 @@ const MODEL_HISTORY_WINDOW = 20;
  * half the session, so at the token counts that trip compaction in the first
  * place a plain `slice(-N)` drops the very summary we just paid to produce.
  */
-function modelHistory(session: ChatSession): AiEditionChatMessage[] {
-	const messages = modelMessages(session);
+function modelHistory(
+	session: ChatSession,
+	pendingUserMessage?: AiEditionChatMessage,
+): AiEditionChatMessage[] {
+	const messages = pendingUserMessage
+		? [...modelMessages(session), pendingUserMessage]
+		: modelMessages(session);
 	if (messages.length <= MODEL_HISTORY_WINDOW) return messages;
 	const summary = session.compaction?.summary;
 	if (!summary) return messages.slice(-MODEL_HISTORY_WINDOW);
@@ -209,6 +292,7 @@ export function createSession(projectId: string, title?: string): ChatSessionSum
 		title: title?.trim() || defaultSessionTitle(m.size + 1),
 		createdAt: now,
 		messages: [],
+		revision: 0,
 	};
 	m.set(id, session);
 	return toSummary(session);
@@ -227,6 +311,7 @@ export function selectSession(projectId: string, sessionId: string): ChatSession
 		title: s.title,
 		createdAt: s.createdAt,
 		messages: [...s.messages],
+		revision: s.revision,
 	};
 }
 
@@ -238,15 +323,21 @@ export function renameSession(
 	const m = sessionsByProject.get(projectId);
 	const s = m?.get(sessionId);
 	if (!s) return null;
+	if (sessionHasPendingOperation(projectId, sessionId)) return null;
 	const trimmed = title.trim();
-	if (trimmed) s.title = trimmed;
+	if (trimmed && trimmed !== s.title) {
+		s.title = trimmed;
+		s.revision++;
+	}
 	return toSummary(s);
 }
 
 export function deleteSession(projectId: string, sessionId: string): boolean {
 	const m = sessionsByProject.get(projectId);
 	if (!m?.has(sessionId)) return false;
+	if (sessionHasPendingOperation(projectId, sessionId)) return false;
 	m.delete(sessionId);
+	messageCheckpointsBySession.delete(sessionKey(projectId, sessionId));
 	return true;
 }
 
@@ -296,6 +387,8 @@ export async function runChat(
 	 *  production caller which forgets to pass `cursor` gets an agent that answers
 	 *  "I could not look" every time, which is honest and unhelpful. */
 	env: ChatRunEnv = {},
+	/** Renderer-owned identity. When supplied, history remains staged until commitChatRun. */
+	operationId?: string,
 ): Promise<AiEditionChatResult> {
 	const emit: Required<ChatEventSink> = { ...NOOP_SINK, ...sink };
 	const config = llmConfig.getConfig();
@@ -321,16 +414,12 @@ export async function runChat(
 	}
 
 	const sessions = getProjectSessions(projectId);
-	let session = sessions.get(sessionId);
-	if (!session) {
-		// ponytail: tolerate a stale/missing session id by recreating one. The
-		// renderer should keep these in sync, but a missing session should
-		// never break the chat run path.
-		const summary = createSession(projectId, defaultSessionTitle(sessions.size + 1));
-		session = sessions.get(summary.id);
-	}
+	const session = sessions.get(sessionId);
 	if (!session) {
 		return { success: false, error: "Chat session unavailable." };
+	}
+	if (sessionHasPendingOperation(projectId, session.id)) {
+		return { success: false, error: "Another chat operation is already pending." };
 	}
 
 	// Tools only run against a valid document snapshot; a missing or invalid
@@ -355,12 +444,23 @@ export async function runChat(
 	const documentForCheckpoint: AxcutDocument | null = workingDocument
 		? structuredClone(workingDocument)
 		: null;
-	if (documentForCheckpoint) {
-		recordMessageCheckpoint(projectId, sessionId, userMessage.id, documentForCheckpoint);
-	}
 	userMessage.checkpointId = documentForCheckpoint ? userMessage.id : null;
-
-	session.messages.push(userMessage);
+	const runOperationId = operationId?.trim() || `chat_run_${randomUUID()}`;
+	if (pendingChatRuns.has(runOperationId) || pendingRewinds.has(runOperationId)) {
+		return { success: false, error: "Chat operation id is already in use." };
+	}
+	const pendingRun: PendingChatRun = {
+		operationId: runOperationId,
+		projectId,
+		sessionId: session.id,
+		expectedSessionRevision: session.revision,
+		userMessage,
+		assistantMessage: null,
+		checkpoint: documentForCheckpoint,
+		expiresAt: Date.now() + CHAT_OPERATION_TTL_MS,
+	};
+	pendingChatRuns.set(runOperationId, pendingRun);
+	expireOperation(pendingChatRuns, runOperationId);
 
 	const editsAllowed = config.allowAgentEdits !== false;
 
@@ -373,7 +473,7 @@ export async function runChat(
 	// held. Compaction is now only ever what the user asked for by pressing the
 	// button. See chat-compaction.ts.
 
-	const history = modelHistory(session).map((m) => ({
+	const history = modelHistory(session, userMessage).map((m) => ({
 		role: m.role as "user" | "assistant" | "system",
 		content: m.content,
 	}));
@@ -397,23 +497,33 @@ export async function runChat(
 
 	const { invokeOpenScreenAgent } = await import("./deep-agent/service");
 
-	const result = await invokeOpenScreenAgent({
-		document: workingDocument ?? emptyDocumentForTextOnly(projectId),
-		model: {
-			provider: config.provider,
-			model: config.model,
-			apiKey: apiKey ?? undefined,
-			baseUrl: config.baseUrl,
-			reasoningEffort: config.reasoningEffort,
-		},
-		history,
-		userMessage: message,
-		sink: agentSink,
-		editsAllowed,
-		cursor: env.cursor,
-	});
+	let result: Awaited<ReturnType<typeof invokeOpenScreenAgent>>;
+	try {
+		result = await invokeOpenScreenAgent({
+			document: workingDocument ?? emptyDocumentForTextOnly(projectId),
+			model: {
+				provider: config.provider,
+				model: config.model,
+				apiKey: apiKey ?? undefined,
+				baseUrl: config.baseUrl,
+				reasoningEffort: config.reasoningEffort,
+			},
+			history,
+			userMessage: message,
+			sink: agentSink,
+			editsAllowed,
+			cursor: env.cursor,
+		});
+	} catch (error) {
+		pendingChatRuns.delete(runOperationId);
+		throw error;
+	}
+	if (pendingChatRuns.get(runOperationId) !== pendingRun) {
+		return { success: false, error: "Chat run was abandoned." };
+	}
 
 	if (!result.text) {
+		pendingChatRuns.delete(runOperationId);
 		// ponytail: surface the deep-agent's diagnostic so the user can see
 		// *why* the model produced no text (e.g. MiniMax streaming only
 		// thinking blocks, or a non-text content shape that our extractor
@@ -432,13 +542,20 @@ export async function runChat(
 		createdAt: new Date().toISOString(),
 		toolCalls: appliedToolCalls.length ? appliedToolCalls : undefined,
 	};
-	session.messages.push(assistantMessage);
+	pendingRun.assistantMessage = assistantMessage;
+
+	// Direct main-process consumers use immediate commit. The renderer supplies an operation id
+	// and commits only after its launch document has been accepted and persisted.
+	if (!operationId) {
+		const committed = commitChatRun(projectId, session.id, runOperationId);
+		if (!committed.success) return committed;
+	}
 
 	return {
 		success: true,
 		assistantMessage,
 		// ponytail: belt and braces on `editsAllowed`. This returned document is
-		// the ONLY path to disk (LeftPanel → applyAgentDocument → saveDocument),
+		// the ONLY path to disk (LeftPanel → applyDocumentResult),
 		// so it is where a write that somehow escaped the executor's guard would
 		// still land. Cheap, and it makes the setting's guarantee structural
 		// rather than dependent on one predicate holding everywhere.
@@ -448,28 +565,80 @@ export async function runChat(
 	};
 }
 
-// ponytail: port of axcut's AxcutAgentRuntime.rewindToMessage. Restores the
-// document snapshot taken right before the given user message, truncates the
-// session's message list (exclusive of the rewound message), drops every
-// checkpoint at or after that message id, and returns the rewound message
-// content so the renderer can put it back in the composer.
-//
-// The renderer is responsible for applying the returned document — that
-// mirrors axcut's exact "the assistant rewrites itself" flow, including
-// the same projectId's local files going back to that state (we hit
-// DocumentService in the IPC handler).
-export function rewindToMessage(
+export function commitChatRun(
+	projectId: string,
+	sessionId: string,
+	operationId: string,
+): { success: true } | { success: false; error: string } {
+	pruneExpiredOperations();
+	const pending = pendingChatRuns.get(operationId);
+	if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
+		return { success: false, error: "Chat operation not found or expired." };
+	}
+	if (!pending.assistantMessage) {
+		return { success: false, error: "Chat operation is still running." };
+	}
+	const session = sessionsByProject.get(projectId)?.get(sessionId);
+	if (!session || session.revision !== pending.expectedSessionRevision) {
+		pendingChatRuns.delete(operationId);
+		return { success: false, error: "Conversation changed before the chat result committed." };
+	}
+	if (
+		[...pendingRewinds.values()].some((operation) =>
+			operationBelongsToSession(operation, projectId, sessionId),
+		)
+	) {
+		return { success: false, error: "A rewind is pending for this conversation." };
+	}
+
+	if (pending.checkpoint) {
+		recordMessageCheckpoint(projectId, sessionId, pending.userMessage.id, pending.checkpoint);
+	}
+	session.messages.push(cloneMessage(pending.userMessage), cloneMessage(pending.assistantMessage));
+	session.revision++;
+	pendingChatRuns.delete(operationId);
+	return { success: true };
+}
+
+export function abortChatRun(
+	projectId: string,
+	sessionId: string,
+	operationId: string,
+): { success: true } | { success: false; error: string } {
+	pruneExpiredOperations();
+	const pending = pendingChatRuns.get(operationId);
+	if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
+		return { success: false, error: "Chat operation not found or expired." };
+	}
+	pendingChatRuns.delete(operationId);
+	return { success: true };
+}
+
+// Preparation is non-destructive. It locks this session revision until the renderer has
+// accepted and persisted the document; only commitRewindToMessage truncates history.
+export function prepareRewindToMessage(
 	projectId: string,
 	sessionId: string,
 	messageId: string,
 ):
-	| { success: true; prompt: string; document: AxcutDocument; messages: AiEditionChatMessage[] }
+	| {
+			success: true;
+			operationId: string;
+			sessionRevision: number;
+			prompt: string;
+			document: AxcutDocument;
+			messages: AiEditionChatMessage[];
+	  }
 	| {
 			success: false;
 			error: string;
 	  } {
+	pruneExpiredOperations();
 	const session = sessionsByProject.get(projectId)?.get(sessionId);
 	if (!session) return { success: false, error: "Chat session not found." };
+	if (sessionHasPendingOperation(projectId, sessionId)) {
+		return { success: false, error: "Another chat operation is already pending." };
+	}
 	const messageIndex = session.messages.findIndex((m) => m.id === messageId);
 	if (messageIndex === -1) {
 		return { success: false, error: "Message not found in this session." };
@@ -489,25 +658,87 @@ export function rewindToMessage(
 		};
 	}
 
-	const survived = session.messages.slice(0, messageIndex + 1).map((m) => ({
-		...m,
-		toolCalls: m.toolCalls ? [...m.toolCalls] : undefined,
-	}));
-	session.messages = survived;
-	// ponytail: a rewind that cuts back past the compaction boundary leaves a
-	// summary standing for messages this lineage no longer has. Drop it and let
-	// the next turn re-derive one, same reasoning as the checkpoints below.
-	if (session.compaction && session.compaction.coveredCount > survived.length) {
-		session.compaction = undefined;
-	}
-	dropCheckpointsFrom(projectId, sessionId, target.checkpointId);
+	const operationId = `chat_rewind_${randomUUID()}`;
+	const prepared: PendingRewind = {
+		operationId,
+		projectId,
+		sessionId,
+		targetMessageId: messageId,
+		expectedSessionRevision: session.revision,
+		prompt: target.content,
+		document: structuredClone(cp.document),
+		messages: session.messages.slice(0, messageIndex + 1).map(cloneMessage),
+		expiresAt: Date.now() + CHAT_OPERATION_TTL_MS,
+	};
+	pendingRewinds.set(operationId, prepared);
+	expireOperation(pendingRewinds, operationId);
 
 	return {
 		success: true,
-		prompt: target.content,
-		document: cp.document,
-		messages: [...survived],
+		operationId,
+		sessionRevision: session.revision,
+		prompt: prepared.prompt,
+		document: structuredClone(prepared.document),
+		messages: prepared.messages.map(cloneMessage),
 	};
+}
+
+export function commitRewindToMessage(
+	projectId: string,
+	sessionId: string,
+	operationId: string,
+	sessionRevision: number,
+):
+	| { success: true; prompt: string; messages: AiEditionChatMessage[] }
+	| { success: false; error: string } {
+	pruneExpiredOperations();
+	const prepared = pendingRewinds.get(operationId);
+	if (!prepared || !operationBelongsToSession(prepared, projectId, sessionId)) {
+		return { success: false, error: "Rewind operation not found or expired." };
+	}
+	if (sessionRevision !== prepared.expectedSessionRevision) {
+		return { success: false, error: "Rewind session revision does not match its preparation." };
+	}
+	const session = sessionsByProject.get(projectId)?.get(sessionId);
+	if (!session || session.revision !== prepared.expectedSessionRevision) {
+		pendingRewinds.delete(operationId);
+		return { success: false, error: "Conversation changed before rewind commit." };
+	}
+	const target = session.messages.find((message) => message.id === prepared.targetMessageId);
+	if (
+		!target?.checkpointId ||
+		!findCheckpointForMessage(projectId, sessionId, target.checkpointId)
+	) {
+		pendingRewinds.delete(operationId);
+		return { success: false, error: "Rewind checkpoint is no longer available." };
+	}
+
+	session.messages = prepared.messages.map(cloneMessage);
+	if (session.compaction && session.compaction.coveredCount > session.messages.length) {
+		session.compaction = undefined;
+	}
+	dropCheckpointsFrom(projectId, sessionId, target.checkpointId);
+	session.revision++;
+	pendingRewinds.delete(operationId);
+	return {
+		success: true,
+		prompt: prepared.prompt,
+		messages: session.messages.map(cloneMessage),
+	};
+}
+
+export function abortRewindToMessage(
+	projectId: string,
+	sessionId: string,
+	operationId: string,
+): { success: true } | { success: false; error: string } {
+	pruneExpiredOperations();
+	const prepared = pendingRewinds.get(operationId);
+	if (!prepared || !operationBelongsToSession(prepared, projectId, sessionId)) {
+		return { success: false, error: "Rewind operation not found or expired." };
+	}
+	pendingRewinds.delete(operationId);
+	return { success: true };
 }
 
 // ponytail: renderer-initiated timeline operation. Reads the doc from disk,
@@ -536,6 +767,9 @@ export async function runTimelineOperation(
 		const summary = createSession(projectId);
 		session = selectSession(projectId, summary.id) ?? undefined;
 		if (!session) return { success: false, error: "Could not create session." };
+	}
+	if (sessionHasPendingOperation(projectId, sessionId)) {
+		return { success: false, error: "Another chat operation is already pending." };
 	}
 
 	let current: AxcutDocument;
@@ -568,6 +802,7 @@ export async function runTimelineOperation(
 			createdAt: new Date().toISOString(),
 		};
 		session.messages.push(assistantMessage);
+		session.revision++;
 	}
 
 	return {
@@ -589,6 +824,7 @@ export async function compactSessionNow(
 ): Promise<{ summaryMessageId: string | null; summary: string; session: ChatSession } | null> {
 	const session = sessionsByProject.get(projectId)?.get(sessionId);
 	if (!session) return null;
+	if (sessionHasPendingOperation(projectId, sessionId)) return null;
 	const config = llmConfig.getConfig();
 	if (!config) return null;
 	const def = PROVIDER_DEFINITIONS.find((d) => d.id === config.provider);
@@ -630,6 +866,7 @@ export function getSessionContextUsage(
 ): { usedTokens: number; budgetTokens: number; ratio: number; fillPercent: number } | null {
 	const session = sessionsByProject.get(projectId)?.get(sessionId);
 	if (!session) return null;
+	if (sessionHasPendingOperation(projectId, sessionId)) return null;
 	// Measured on what the model is given, not on the transcript — after a
 	// compaction those differ, and the number that matters is the one that
 	// fills the context window.
@@ -749,6 +986,7 @@ async function tryCompactSession(opts: {
 	reasoningEffort?: string;
 }): Promise<{ summaryMessageId: string | null; summary: string } | null> {
 	const { session, plan, apiKey, provider, model, baseUrl, reasoningEffort } = opts;
+	const expectedRevision = session.revision;
 	const oldMessages = plan.payload.slice(0, plan.splitIndex);
 	if (oldMessages.length === 0) return null;
 
@@ -795,7 +1033,14 @@ async function tryCompactSession(opts: {
 		// which is the user asking again knowingly.)
 		return null;
 	}
+	if (
+		session.revision !== expectedRevision ||
+		sessionHasPendingOperation(session.projectId, session.id)
+	) {
+		return null;
+	}
 	session.compaction = { summary: summaryMessage, coveredCount: plan.coveredCount };
+	session.revision++;
 	return {
 		summaryMessageId: summaryMessage.id,
 		summary,

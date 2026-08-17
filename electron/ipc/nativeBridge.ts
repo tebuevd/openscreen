@@ -60,24 +60,39 @@ export interface NativeBridgeContext {
 		sessionId: string,
 		message: string,
 		document?: unknown,
+		operationId?: string,
 		sink?: ChatEventSink,
 	) => Promise<import("../../src/native/contracts").AiEditionChatResult>;
+	commitAiEditionChatRun: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => import("../../src/native/contracts").AiEditionChatOperationResult;
+	abortAiEditionChatRun: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => import("../../src/native/contracts").AiEditionChatOperationResult;
 	undoAiEditionToolBatch: (
 		projectId: string,
 		sessionId: string,
 	) => import("../../src/native/contracts").AiEditionChatResult;
-	rewindToMessage: (
+	prepareRewindToMessage: (
 		projectId: string,
 		sessionId: string,
 		messageId: string,
-	) =>
-		| {
-				success: true;
-				prompt: string;
-				document: unknown;
-				messages: import("../../src/native/contracts").AiEditionChatMessage[];
-		  }
-		| { success: false; error: string };
+	) => import("../../src/native/contracts").AiEditionChatRewindPrepareResult;
+	commitRewindToMessage: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+		sessionRevision: number,
+	) => import("../../src/native/contracts").AiEditionChatRewindCommitResult;
+	abortRewindToMessage: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => import("../../src/native/contracts").AiEditionChatOperationResult;
 	compactNow: (
 		projectId: string,
 		sessionId: string,
@@ -173,7 +188,11 @@ function isBridgeRequest(value: unknown): value is NativeBridgeRequest {
 // delta fires (tab closed, window destroyed) — webContents.send throws, so we
 // swallow the error to keep the loop running. The renderer treats a missing
 // "end of stream" as "the run was abandoned" and shows an inline error.
-function buildChatEventSink(sender: Electron.WebContents, sessionId: string): ChatEventSink {
+function buildChatEventSink(
+	sender: Electron.WebContents,
+	sessionId: string,
+	operationId: string,
+): ChatEventSink {
 	const send = (payload: AiEditionChatEvent) => {
 		try {
 			sender.send("ai-edition.chat-event", payload);
@@ -182,11 +201,12 @@ function buildChatEventSink(sender: Electron.WebContents, sessionId: string): Ch
 		}
 	};
 	return {
-		text: (delta) => send({ kind: "text", sessionId, delta }),
-		thinking: (delta) => send({ kind: "thinking", sessionId, delta }),
-		toolStart: (name, args) => send({ kind: "toolStart", sessionId, name, args }),
-		toolEnd: (name, ok, summary) => send({ kind: "toolEnd", sessionId, name, ok, summary }),
-		error: (message) => send({ kind: "error", sessionId, message }),
+		text: (delta) => send({ kind: "text", sessionId, operationId, delta }),
+		thinking: (delta) => send({ kind: "thinking", sessionId, operationId, delta }),
+		toolStart: (name, args) => send({ kind: "toolStart", sessionId, operationId, name, args }),
+		toolEnd: (name, ok, summary) =>
+			send({ kind: "toolEnd", sessionId, operationId, name, ok, summary }),
+		error: (message) => send({ kind: "error", sessionId, operationId, message }),
 	};
 }
 
@@ -237,8 +257,12 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		// hit the macOS Keychain) while wiring the bridge at startup.
 		llmConfig: context.getAiEditionLlmConfig,
 		runChat: context.runAiEditionChat,
+		commitChatRun: context.commitAiEditionChatRun,
+		abortChatRun: context.abortAiEditionChatRun,
 		undoLastToolBatch: context.undoAiEditionToolBatch,
-		rewindToMessage: context.rewindToMessage,
+		prepareRewindToMessage: context.prepareRewindToMessage,
+		commitRewindToMessage: context.commitRewindToMessage,
+		abortRewindToMessage: context.abortRewindToMessage,
 		compactNow: context.compactNow,
 		getContextUsage: context.getContextUsage,
 		listSessions: context.listAiEditionChatSessions,
@@ -599,7 +623,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 							);
 						case "chat.run": {
 							const sessionId = request.payload.sessionId;
-							const sink = buildChatEventSink(event.sender, sessionId);
+							const sink = buildChatEventSink(event.sender, sessionId, request.payload.operationId);
 							return createSuccessResponse(
 								requestId,
 								await aiEditionService.chatRun(
@@ -607,10 +631,29 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									sessionId,
 									request.payload.message,
 									request.payload.document,
+									request.payload.operationId,
 									sink,
 								),
 							);
 						}
+						case "chat.run.commit":
+							return createSuccessResponse(
+								requestId,
+								aiEditionService.chatCommitRun(
+									request.payload.projectId,
+									request.payload.sessionId,
+									request.payload.operationId,
+								),
+							);
+						case "chat.run.abort":
+							return createSuccessResponse(
+								requestId,
+								aiEditionService.chatAbortRun(
+									request.payload.projectId,
+									request.payload.sessionId,
+									request.payload.operationId,
+								),
+							);
 						case "chat.undoLastBatch":
 							return createSuccessResponse(
 								requestId,
@@ -670,13 +713,32 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.sessionId,
 								),
 							);
-						case "chat.rewind":
+						case "chat.rewind.prepare":
 							return createSuccessResponse(
 								requestId,
-								aiEditionService.chatRewindToMessage(
+								aiEditionService.chatPrepareRewind(
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.messageId,
+								),
+							);
+						case "chat.rewind.commit":
+							return createSuccessResponse(
+								requestId,
+								aiEditionService.chatCommitRewind(
+									request.payload.projectId,
+									request.payload.sessionId,
+									request.payload.operationId,
+									request.payload.sessionRevision,
+								),
+							);
+						case "chat.rewind.abort":
+							return createSuccessResponse(
+								requestId,
+								aiEditionService.chatAbortRewind(
+									request.payload.projectId,
+									request.payload.sessionId,
+									request.payload.operationId,
 								),
 							);
 						case "chat.contextUsage":

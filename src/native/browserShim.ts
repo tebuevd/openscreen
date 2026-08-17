@@ -291,16 +291,34 @@ function createShimBridgeClient() {
 		title: string;
 		createdAt: string;
 		messages: Array<{ id: string; role: "user" | "assistant"; content: string; createdAt: string }>;
+		revision: number;
 	};
 	const chatStorageKey = "browser-shim-chat-v1";
 	const sessionsByProject = new Map<string, Map<string, ShimSession>>();
+	const pendingChatRuns = new Map<
+		string,
+		{
+			projectId: string;
+			sessionId: string;
+			expectedRevision: number;
+			messages: ShimSession["messages"];
+		}
+	>();
 	(() => {
 		try {
 			const raw = localStorage.getItem(chatStorageKey);
 			if (!raw) return;
 			const parsed = JSON.parse(raw) as Record<string, Record<string, ShimSession>>;
 			for (const [projectId, sessions] of Object.entries(parsed)) {
-				sessionsByProject.set(projectId, new Map(Object.entries(sessions)));
+				sessionsByProject.set(
+					projectId,
+					new Map(
+						Object.entries(sessions).map(([id, session]) => [
+							id,
+							{ ...session, revision: session.revision ?? 0 },
+						]),
+					),
+				);
 			}
 		} catch {
 			// ponytail: corrupt/unavailable localStorage — start fresh.
@@ -450,7 +468,13 @@ function createShimBridgeClient() {
 				Promise.resolve({
 					models: [`${providerId}-demo-model-1`, `${providerId}-demo-model-2`],
 				}),
-			chatRun: (projectId: string, sessionId: string, message?: string) => {
+			chatRun: (
+				projectId: string,
+				sessionId: string,
+				message?: string,
+				_document?: unknown,
+				operationId?: string,
+			) => {
 				const sessions = getSessions(projectId);
 				let s = sessions.get(sessionId);
 				if (!s) {
@@ -460,16 +484,24 @@ function createShimBridgeClient() {
 						title: "Conversation 1",
 						createdAt: new Date().toISOString(),
 						messages: [],
+						revision: 0,
 					};
 					sessions.set(sessionId, s);
 				}
-				// ponytail: actually persist the exchange into the session. Without
-				// this, the useEffect that refetches history on activeSessionId
-				// change (chatSelectSession) would clobber the caller's optimistic
-				// `setMessages` with an empty list — same class of bug the real
-				// chat-service avoids by persisting before returning.
+				if (
+					[...pendingChatRuns.values()].some(
+						(pending) => pending.projectId === projectId && pending.sessionId === s.id,
+					) ||
+					(operationId !== undefined && pendingChatRuns.has(operationId))
+				) {
+					return Promise.resolve({
+						success: false,
+						error: "Another chat operation is already pending.",
+					});
+				}
+				const stagedMessages: ShimSession["messages"] = [];
 				if (message) {
-					s.messages.push({
+					stagedMessages.push({
 						id: `msg_${Date.now()}_u`,
 						role: "user",
 						content: message,
@@ -483,10 +515,57 @@ function createShimBridgeClient() {
 						"[browser-shim] AI features need real LLM deps. Configure a provider in Settings, install the LangChain packages, then chat will work for real.",
 					createdAt: new Date().toISOString(),
 				};
-				s.messages.push(assistantMessage);
-				persistChat();
+				stagedMessages.push(assistantMessage);
+				if (operationId) {
+					pendingChatRuns.set(operationId, {
+						projectId,
+						sessionId: s.id,
+						expectedRevision: s.revision,
+						messages: stagedMessages,
+					});
+				} else {
+					s.messages.push(...stagedMessages);
+					s.revision++;
+					persistChat();
+				}
 				return Promise.resolve({ success: true, assistantMessage });
 			},
+			chatCommitRun: (projectId: string, sessionId: string, operationId: string) => {
+				const pending = pendingChatRuns.get(operationId);
+				const session = sessionsByProject.get(projectId)?.get(sessionId);
+				if (
+					!pending ||
+					pending.projectId !== projectId ||
+					pending.sessionId !== sessionId ||
+					!session ||
+					session.revision !== pending.expectedRevision
+				) {
+					pendingChatRuns.delete(operationId);
+					return Promise.resolve({ success: false, error: "Chat operation is stale." });
+				}
+				session.messages.push(...pending.messages);
+				session.revision++;
+				pendingChatRuns.delete(operationId);
+				persistChat();
+				return Promise.resolve({ success: true });
+			},
+			chatAbortRun: (projectId: string, sessionId: string, operationId: string) => {
+				const pending = pendingChatRuns.get(operationId);
+				if (!pending || pending.projectId !== projectId || pending.sessionId !== sessionId) {
+					return Promise.resolve({ success: false, error: "Chat operation is stale." });
+				}
+				pendingChatRuns.delete(operationId);
+				return Promise.resolve({ success: true });
+			},
+			chatPrepareRewind: () =>
+				Promise.resolve({
+					success: false,
+					error: "Browser preview chat does not retain document checkpoints.",
+				}),
+			chatCommitRewind: () =>
+				Promise.resolve({ success: false, error: "No browser rewind is prepared." }),
+			chatAbortRewind: () =>
+				Promise.resolve({ success: false, error: "No browser rewind is prepared." }),
 			chatUndoLastBatch: () =>
 				Promise.resolve({
 					success: false,
@@ -504,6 +583,7 @@ function createShimBridgeClient() {
 						title: "Conversation 1",
 						createdAt: new Date().toISOString(),
 						messages: [],
+						revision: 0,
 					};
 					sessions.set(s.id, s);
 				}
@@ -523,6 +603,7 @@ function createShimBridgeClient() {
 					createdAt: new Date().toISOString(),
 				};
 				s.messages.push(assistantMessage);
+				s.revision++;
 				persistChat();
 				return Promise.resolve({ success: true, assistantMessage });
 			},
@@ -534,7 +615,12 @@ function createShimBridgeClient() {
 			},
 			chatClear: (projectId: string) => {
 				const m = sessionsByProject.get(projectId);
-				if (m) for (const s of m.values()) s.messages = [];
+				if (m) {
+					for (const s of m.values()) {
+						s.messages = [];
+						s.revision++;
+					}
+				}
 				persistChat();
 				return Promise.resolve({ success: true });
 			},
@@ -552,6 +638,7 @@ function createShimBridgeClient() {
 					title: title?.trim() || `Conversation ${sessions.size + 1}`,
 					createdAt: new Date().toISOString(),
 					messages: [],
+					revision: 0,
 				};
 				sessions.set(id, s);
 				persistChat();
@@ -565,7 +652,10 @@ function createShimBridgeClient() {
 				const s = sessionsByProject.get(projectId)?.get(sessionId);
 				if (!s) return Promise.resolve(null);
 				const trimmed = title.trim();
-				if (trimmed) s.title = trimmed;
+				if (trimmed && trimmed !== s.title) {
+					s.title = trimmed;
+					s.revision++;
+				}
 				persistChat();
 				return Promise.resolve(summarize(s));
 			},

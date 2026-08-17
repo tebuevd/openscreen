@@ -42,13 +42,17 @@ import type {
 	ProjectPathResult,
 } from "../../src/native/contracts";
 import {
+	abortChatRun,
+	abortRewindToMessage,
+	commitChatRun,
+	commitRewindToMessage,
 	compactSessionNow,
 	createSession,
 	deleteSession,
 	getSessionContextUsage,
 	listSessions,
+	prepareRewindToMessage,
 	renameSession,
-	rewindToMessage,
 	runChat,
 	selectSession,
 } from "../ai-edition/chat-service";
@@ -4118,16 +4122,28 @@ export function registerIpcHandlers(
 		},
 		getAiEditionDocuments: () => aiEditionDocuments,
 		getAiEditionLlmConfig,
-		runAiEditionChat: (projectId, sessionId, message, document, sink) =>
-			runChat(projectId, sessionId, message, getAiEditionLlmConfig(), document, sink, {
-				cursor: agentCursorTelemetryReader,
-			}),
+		runAiEditionChat: (projectId, sessionId, message, document, operationId, sink) =>
+			runChat(
+				projectId,
+				sessionId,
+				message,
+				getAiEditionLlmConfig(),
+				document,
+				sink,
+				{
+					cursor: agentCursorTelemetryReader,
+				},
+				operationId,
+			),
+		commitAiEditionChatRun: commitChatRun,
+		abortAiEditionChatRun: abortChatRun,
 		undoAiEditionToolBatch: (_projectId, _sessionId) => ({
 			success: false,
 			error: "Per-tool-batch undo retired in favor of per-message rewind.",
 		}),
-		rewindToMessage: (projectId, sessionId, messageId) =>
-			rewindToMessage(projectId, sessionId, messageId),
+		prepareRewindToMessage,
+		commitRewindToMessage,
+		abortRewindToMessage,
 		compactNow: (projectId, sessionId) =>
 			compactSessionNow(projectId, sessionId, getAiEditionLlmConfig()),
 		getContextUsage: getSessionContextUsage,

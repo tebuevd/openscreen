@@ -15,7 +15,15 @@ vi.mock("./deep-agent/service", () => ({
 	invokeOpenScreenAgent: vi.fn(),
 }));
 
-import { createSession, rewindToMessage, runChat } from "./chat-service";
+import {
+	abortChatRun,
+	abortRewindToMessage,
+	commitChatRun,
+	commitRewindToMessage,
+	createSession,
+	prepareRewindToMessage,
+	runChat,
+} from "./chat-service";
 import { invokeOpenScreenAgent } from "./deep-agent/service";
 import type { LlmConfigStore } from "./llm-config-store";
 
@@ -142,6 +150,42 @@ async function streamAgent(
 }
 
 describe("runChat tool loop", () => {
+	it("stages renderer chat history until explicit commit and can abort without contamination", async () => {
+		const { selectSession } = await import("./chat-service");
+		const session = createSession("proj_staged_chat");
+		const result = await runChat(
+			"proj_staged_chat",
+			session.id,
+			"pending turn",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"run_abort",
+		);
+		expect(result.success).toBe(true);
+		expect(selectSession("proj_staged_chat", session.id)?.messages).toEqual([]);
+		expect(abortChatRun("proj_staged_chat", session.id, "run_abort")).toEqual({ success: true });
+		expect(selectSession("proj_staged_chat", session.id)?.messages).toEqual([]);
+
+		await runChat(
+			"proj_staged_chat",
+			session.id,
+			"committed turn",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"run_commit",
+		);
+		expect(selectSession("proj_staged_chat", session.id)?.messages).toEqual([]);
+		expect(commitChatRun("proj_staged_chat", session.id, "run_commit")).toEqual({
+			success: true,
+		});
+		expect(selectSession("proj_staged_chat", session.id)?.messages).toHaveLength(2);
+		expect(commitChatRun("proj_staged_chat", session.id, "run_commit").success).toBe(false);
+	});
+
 	it("executes tool calls, chains turns, and returns the mutated document", async () => {
 		invokeMock.mockImplementationOnce(async (args) => {
 			args.sink.toolStart("addTrim", { startSec: 5, endSec: 8, reason: "silence" });
@@ -192,15 +236,37 @@ describe("runChat tool loop", () => {
 		expect(user?.role).toBe("user");
 		expect(user?.checkpointId).toBe(user?.id);
 
-		const undo = rewindToMessage("proj_rewind", session.id, user!.id);
-		expect(undo.success).toBe(true);
-		if (!undo.success) return;
-		const restored = documentSchema.parse(undo.document);
+		const prepared = prepareRewindToMessage("proj_rewind", session.id, user!.id);
+		expect(prepared.success).toBe(true);
+		if (!prepared.success) return;
+		const restored = documentSchema.parse(prepared.document);
 		expect(restored.timeline.trimRanges).toHaveLength(0);
-		expect(undo.prompt).toBe("cut the silence");
+		expect(prepared.prompt).toBe("cut the silence");
+		expect(
+			(await import("./chat-service")).selectSession("proj_rewind", session.id)?.messages,
+		).toHaveLength(2);
+
+		const committed = commitRewindToMessage(
+			"proj_rewind",
+			session.id,
+			prepared.operationId,
+			prepared.sessionRevision,
+		);
+		expect(committed.success).toBe(true);
+		expect(
+			(await import("./chat-service")).selectSession("proj_rewind", session.id)?.messages,
+		).toHaveLength(1);
+		expect(
+			commitRewindToMessage(
+				"proj_rewind",
+				session.id,
+				prepared.operationId,
+				prepared.sessionRevision,
+			).success,
+		).toBe(false);
 	});
 
-	it("rewindToMessage refuses when the target has no checkpoint", async () => {
+	it("prepareRewindToMessage refuses when the target has no checkpoint", async () => {
 		const { createSession, selectSession, runChat } = await import("./chat-service");
 		const session = createSession("proj_rewind_no_cp");
 		await runChat(
@@ -211,20 +277,73 @@ describe("runChat tool loop", () => {
 			// text-only: no document → no checkpoint
 		);
 		const userId = selectSession("proj_rewind_no_cp", session.id)?.messages[0].id;
-		const result = rewindToMessage("proj_rewind_no_cp", session.id, userId!);
+		const result = prepareRewindToMessage("proj_rewind_no_cp", session.id, userId!);
 		expect(result.success).toBe(false);
 	});
 
-	it("rewindToMessage rejects targeting an assistant message", async () => {
+	it("prepareRewindToMessage rejects targeting an assistant message", async () => {
 		const { createSession, listSessions, selectSession, runChat } = await import("./chat-service");
 		const session = createSession("proj_rewind_aimessage");
 		await runChat("proj_rewind_aimessage", session.id, "hi", stubConfig(), fixtureDocument());
 		const assistant = selectSession("proj_rewind_aimessage", session.id)?.messages.find(
 			(m) => m.role === "assistant",
 		);
-		const result = rewindToMessage("proj_rewind_aimessage", session.id, assistant!.id);
+		const result = prepareRewindToMessage("proj_rewind_aimessage", session.id, assistant!.id);
 		expect(result.success).toBe(false);
 		void listSessions;
+	});
+
+	it("aborts a prepared rewind without changing messages or consuming its checkpoint", async () => {
+		const { selectSession } = await import("./chat-service");
+		const session = createSession("proj_rewind_abort");
+		await runChat("proj_rewind_abort", session.id, "first turn", stubConfig(), fixtureDocument());
+		const before = selectSession("proj_rewind_abort", session.id)!;
+		const targetId = before.messages[0].id;
+		const prepared = prepareRewindToMessage("proj_rewind_abort", session.id, targetId);
+		expect(prepared.success).toBe(true);
+		if (!prepared.success) return;
+
+		expect(abortRewindToMessage("proj_rewind_abort", session.id, prepared.operationId)).toEqual({
+			success: true,
+		});
+		expect(selectSession("proj_rewind_abort", session.id)?.messages).toEqual(before.messages);
+		const retry = prepareRewindToMessage("proj_rewind_abort", session.id, targetId);
+		expect(retry.success).toBe(true);
+		if (retry.success) {
+			abortRewindToMessage("proj_rewind_abort", session.id, retry.operationId);
+		}
+	});
+
+	it("refuses a rewind commit with the wrong prepared revision without truncating", async () => {
+		const { selectSession } = await import("./chat-service");
+		const session = createSession("proj_rewind_revision");
+		await runChat(
+			"proj_rewind_revision",
+			session.id,
+			"first turn",
+			stubConfig(),
+			fixtureDocument(),
+		);
+		const before = selectSession("proj_rewind_revision", session.id)!;
+		const prepared = prepareRewindToMessage(
+			"proj_rewind_revision",
+			session.id,
+			before.messages[0].id,
+		);
+		expect(prepared.success).toBe(true);
+		if (!prepared.success) return;
+
+		const commit = commitRewindToMessage(
+			"proj_rewind_revision",
+			session.id,
+			prepared.operationId,
+			prepared.sessionRevision + 1,
+		);
+		expect(commit.success).toBe(false);
+		expect(selectSession("proj_rewind_revision", session.id)?.messages).toEqual(before.messages);
+		expect(abortRewindToMessage("proj_rewind_revision", session.id, prepared.operationId)).toEqual({
+			success: true,
+		});
 	});
 
 	it("runs text-only when no document snapshot is provided", async () => {

@@ -5,8 +5,10 @@ import type {
 	AiEditionChatBudget,
 	AiEditionChatCompactResult,
 	AiEditionChatMessage,
+	AiEditionChatOperationResult,
 	AiEditionChatResult,
-	AiEditionChatRewindResult,
+	AiEditionChatRewindCommitResult,
+	AiEditionChatRewindPrepareResult,
 	AiEditionChatSession,
 	AiEditionChatSessionSummary,
 	AiEditionDocumentResult,
@@ -49,20 +51,35 @@ export interface AiEditionServiceOptions {
 		sessionId: string,
 		message: string,
 		document?: unknown,
+		operationId?: string,
 		sink?: ChatEventSink,
 	) => Promise<AiEditionChatResult>;
-	rewindToMessage: (
+	commitChatRun: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => AiEditionChatOperationResult;
+	abortChatRun: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => AiEditionChatOperationResult;
+	prepareRewindToMessage: (
 		projectId: string,
 		sessionId: string,
 		messageId: string,
-	) =>
-		| {
-				success: true;
-				prompt: string;
-				document: unknown;
-				messages: AiEditionChatMessage[];
-		  }
-		| { success: false; error: string };
+	) => AiEditionChatRewindPrepareResult;
+	commitRewindToMessage: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+		sessionRevision: number,
+	) => AiEditionChatRewindCommitResult;
+	abortRewindToMessage: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => AiEditionChatOperationResult;
 	compactNow: (projectId: string, sessionId: string) => Promise<AiEditionChatCompactResult | null>;
 	getContextUsage: (
 		projectId: string,
@@ -269,21 +286,55 @@ export class AiEditionService {
 		sessionId: string,
 		message: string,
 		document?: unknown,
+		operationId?: string,
 		sink?: ChatEventSink,
 	): Promise<AiEditionChatResult> {
-		return this.options.runChat(projectId, sessionId, message, document, sink);
+		return this.options.runChat(projectId, sessionId, message, document, operationId, sink);
+	}
+
+	chatCommitRun(
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	): AiEditionChatOperationResult {
+		return this.options.commitChatRun(projectId, sessionId, operationId);
+	}
+
+	chatAbortRun(
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	): AiEditionChatOperationResult {
+		return this.options.abortChatRun(projectId, sessionId, operationId);
 	}
 
 	chatUndoLastBatch(_projectId: string, _sessionId: string): AiEditionChatResult {
 		return { success: false, error: "Per-tool-batch undo retired in favor of per-message rewind." };
 	}
 
-	chatRewindToMessage(
+	chatPrepareRewind(
 		projectId: string,
 		sessionId: string,
 		messageId: string,
-	): AiEditionChatRewindResult | { success: false; error: string } {
-		return this.options.rewindToMessage(projectId, sessionId, messageId);
+	): AiEditionChatRewindPrepareResult {
+		return this.options.prepareRewindToMessage(projectId, sessionId, messageId);
+	}
+
+	chatCommitRewind(
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+		sessionRevision: number,
+	): AiEditionChatRewindCommitResult {
+		return this.options.commitRewindToMessage(projectId, sessionId, operationId, sessionRevision);
+	}
+
+	chatAbortRewind(
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	): AiEditionChatOperationResult {
+		return this.options.abortRewindToMessage(projectId, sessionId, operationId);
 	}
 
 	chatContextUsage(projectId: string, sessionId: string): AiEditionChatBudget | null {
