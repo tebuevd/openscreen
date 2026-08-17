@@ -1,9 +1,10 @@
 # Preview
 
 The preview is the editor's frame-at-the-playhead surface. It is composited by the same
-Rust + Direct3D 11 native crate that drives MP4 export — `crates/compositor/` reached via the
-`compositor_view.node` napi-rs addon — and pulled into the renderer as an RGBA8
-bitmap that paints onto an HTML `<canvas>`. The DOM around the canvas hosts the
+cross-platform Rust crate that drives native MP4 and GIF export: `crates/compositor/`,
+reached through the `compositor_view.node` napi-rs addon. Windows renders with D3D11,
+macOS with Metal, and Linux with wgpu/Vulkan. RGBA8 frames are pulled into the renderer
+and painted onto an HTML `<canvas>`. The DOM around the canvas hosts the
 interactive-only layers (zoom gimbal, annotation selection, PiP webcam drag) that
 need real hitboxes. Everything visible in the preview comes out of the same
 compositor that writes the export; parity is the property of one renderer, not a
@@ -22,13 +23,13 @@ One compositor exists in the source tree, and it is the live one. A Pixi/WebGL
 single-canvas screen compositor was tried alongside it and removed once it was
 established that nothing mounted it.
 
-### Native D3D compositor overlay (live)
+### Native compositor overlay (live)
 
 Mounted as the first child of `.previewFrame` by
 [`NativeCompositorOverlay.tsx`](../../src/components/ai-edition/NativeCompositorOverlay.tsx).
 It owns the `<canvas>`, drives a `useNativeCompositorView` hook that allocates an
 offscreen `compositor_view` view sized to the canvas's device-pixel rect
-([`useNativeCompositorView.ts:73`](../../src/native/hooks/useNativeCompositorView.ts:73)),
+([`useNativeCompositorView.ts:281`](../../src/native/hooks/useNativeCompositorView.ts:281)),
 and pushes a `SceneDescription` JSON every time the document or the editor
 settings change. Wallpaper, screen video, webcam, cursor, zoom regions, annotations
 — every visible pixel comes from this view. The DOM neighbours it (the `.screenStage`
@@ -36,18 +37,21 @@ wrapper, the `<video>` for screen decode, the `WebcamOverlay` `<video>`, the
 `AnnotationLayer`, the `ZoomFocusOverlay`, the webcam drag hitbox) are *interactive
 overlays*: their pixels are hidden in CSS, only their pointer-event geometry counts.
 
-The path is enabled by the *presence of the native addon* — there is no flag,
-no capability probe, no per-document switch. The compositing service loads
-`compositor_view.node` at startup via
-[`compositorViewService.ts`](../../electron/native-bridge/services/compositorViewService.ts:271)
-(`ensureAddon`); when the binary is missing the service logs once
+The path is enabled by the *presence of the native addon*: there is no feature flag
+or per-document switch. The backend probe only reports which native backend was
+selected; it does not decide whether this overlay mounts. The compositing service
+loads `compositor_view.node` lazily through `ensureAddon` in
+[`compositorViewService.ts`](../../electron/native-bridge/services/compositorViewService.ts);
+when the binary is missing the service logs once
 (`[compositor-view] native addon not present; running as no-op`,
-[`compositorViewService.ts:288`](../../electron/native-bridge/services/compositorViewService.ts:288))
+[`compositorViewService.ts:582`](../../electron/native-bridge/services/compositorViewService.ts:582))
 and returns synthetic negative view ids whose `readFrame` always returns `null`, so
-the whole overlay stays inert. In that mode the renderer's own `<video>` element
-keeps playing (decode is the responsibility of the DOM, not the compositor), but
-nothing composites a frame — the canvas stays empty. The editor ships like this
-on platforms where the addon isn't built; the dev build brings the addon in.
+the whole overlay stays inert. In that mode the renderer's hidden `<video>` element
+can keep playing as the editing clock and audio source, but nothing composites a
+frame and the canvas stays empty. This mode covers an incomplete
+development checkout or an unsupported packaged architecture. The Windows, macOS,
+and Linux package scripts all build and stage the addon for their supported targets;
+`npm run dev` alone does not rebuild it.
 
 The renderer→addon IPC goes through `native-bridge:invoke` with a single
 `compositor` domain
@@ -55,16 +59,19 @@ The renderer→addon IPC goes through `native-bridge:invoke` with a single
 service in the main process loads the addon from
 `electron/native/bin/<platform>-<arch>/compositor_view.node` (packaged) or
 `electron/native/compositor-view/build/compositor_view.node` (dev), with an
-`OPENSCREEN_COMPOSITOR_VIEW_NODE` env override for the standalone builds. The
-ffmpeg shared-DLL directory is prepended to `PATH` before the require so the
-addon's `LoadLibrary("avcodec-NN.dll")` resolves against the same pinned build the
-crate links against
-([`compositorViewService.ts:206`](../../electron/native-bridge/services/compositorViewService.ts:206)).
+`OPENSCREEN_COMPOSITOR_VIEW_NODE` env override for standalone builds. On Windows,
+the ffmpeg shared-DLL directory is prepended to `PATH` before the require
+so the addon's `LoadLibrary("avcodec-NN.dll")` resolves against the same pinned build
+the crate links against. Packaged builds also place each platform's addon beside its
+ffmpeg runtime libraries; macOS and Linux resolve those colocated libraries through
+their native loader metadata
+([`compositorViewService.ts:507`](../../electron/native-bridge/services/compositorViewService.ts:507)).
 
-There is no fallback to a CPU/Canvas2D legacy compositor: before the native view
-ships a frame, only the wallpaper painted by CSS is visible, and the cursor / zoom
-DOM layers depend on the layout math (not the compositor) to know where to land.
-That is a product gap, not a fallback path. The native preview is the only
+There is no renderer-side Canvas2D fallback when the addon is absent: before the
+native view ships a frame, only the wallpaper painted by CSS is visible, and the
+cursor / zoom DOM layers depend on the layout math (not the compositor) to know where
+to land. The Windows WARP and Linux lavapipe CPU backends live inside the addon and
+therefore do not change this missing-addon behavior. The native preview is the only
 compositor in service.
 
 ## Scene description
@@ -73,11 +80,11 @@ compositor in service.
 compositor so it can compute the composed frame itself; the renderer does no
 per-frame math.
 
-[`buildSceneDescription`](../../src/native/sceneDescription.ts:419)
+[`buildSceneDescription`](../../src/native/sceneDescription.ts:405)
 (`src/native/sceneDescription.ts`) is a pure data mapping from an `AxcutDocument` plus the
 current editor settings to a `SceneDescription` JSON string. It resolves:
 
-- **Visible clips.** [`resolveVisibleClips`](../../src/native/sceneDescription.ts:411)
+- **Visible clips.** [`resolveVisibleClips`](../../src/lib/ai-edition/document/outputFormat.ts:84)
   is the single shared clip list: `resolvePlaybackSegments(document.timeline.clips, document.timeline.trimRanges)`
   (trim-narrowed, so word-level cuts from the transcript editor actually reach the
   compositor instead of only affecting the transcript panel's own strikethrough)
@@ -97,8 +104,8 @@ current editor settings to a `SceneDescription` JSON string. It resolves:
   so the compositor draws them with the same path; deliberately no separate
   caption layer in the native code.
 - **Layout.** The webcam rect is resolved by the same
-  [`computeCompositeLayout`](../../src/lib/compositeLayout.ts) call the legacy
-  `frameRenderer` runs and shipped to the addon as `layout.webcamRect` /
+  [`computeCompositeLayout`](../../src/lib/compositeLayout.ts) call the DOM preview
+  uses and shipped to the addon as `layout.webcamRect` /
   `layout.screenRect` in fractions of the output frame. The native side consumes
   those verbatim and applies the padding-slider and reactive-zoom adjustments on
   top, so preview/export never disagree on placement. Per-clip screen resolutions
@@ -118,12 +125,14 @@ current editor settings to a `SceneDescription` JSON string. It resolves:
 
 The descriptor mirrors the Rust struct in
 [`crates/compositor/src/scene.rs`](../../crates/compositor/src/scene.rs); field rename is `camelCase`
-on both sides. The Rust consumer (`compositor.rs::compose_frame`,
-[`crates/compositor/src/compositor.rs:1421`](../../crates/compositor/src/compositor_windows.rs:1421)) reads
-the JSON per frame, derives the per-clip and per-frame values it needs (zoom
+on both sides. The platform consumers in
+[`compositor_windows.rs`](../../crates/compositor/src/compositor_windows.rs),
+[`compositor_macos.rs`](../../crates/compositor/src/compositor_macos.rs), and
+[`compositor_linux.rs`](../../crates/compositor/src/compositor_linux.rs) read the JSON
+per frame and derive the per-clip and per-frame values they need (zoom
 state from `regions.rs::zoom_state_at`, camera-fullscreen progress from
 `regions.rs::camera_fullscreen_progress_at`, screen crop from
-`SceneCrop::belongs`), and only then issues GPU draw calls. Region visibility is
+`SceneCrop::belongs`), and only then issue GPU draw calls. Region visibility is
 expressed as `[startSec, endSec)` intervals and matched against `t = source_time`;
 a region straddling a clip boundary emits one entry per covered clip via
 `projectRegionsToSource`.
@@ -239,12 +248,12 @@ in the middle of a clip transition is honoured, not silently undone.
 
 ## Known gaps
 
-- **Live preview is video-only.** `crates/compositor/src/live.rs` (1628 lines) handles only
-  the video packet stream; audio is decoded and mixed in
-  [`audio.rs::decode_clip_audio`](../../crates/compositor/src/audio.rs) for the export
-  path and not for the live view. Editing playback is therefore silent against
-  the exported file; users hear audio only when the export runs. There is no
-  flag in this branch that re-routes live audio.
+- **The native preview stream is video-only.** `crates/compositor/src/live.rs` handles only
+  video packets. The hidden renderer `<video>` remains the editing playback clock and
+  audio source, while [`audio.rs`](../../crates/compositor/src/audio.rs) separately
+  decodes, mixes, stretches, and encodes audio for MP4 export. The native canvas is
+  therefore not the source of editing audio; a failed compositor can leave audio
+  playing over a blank frame.
 - **Long-recording scrub drift.** `useNativePlaybackSync:18` documents the
   accepted-at-fixture-time drift between the app's rAF playhead and the addon's
   free-run clock as a known limitation; a pause re-aligns them. A scrub further
@@ -256,8 +265,8 @@ in the middle of a clip transition is honoured, not silently undone.
 - **Add-on absent = blank frame.** When `compositor_view.node` is missing
   (development with the addon not yet built, or a packaged build for an
   unsupported architecture) the overlay renders no pixels: only the DOM/CSS
-  wallpaper and the interactive layers show. There is no CPU/Canvas2D fallback
-  path; the live preview is gated on the addon being present.
+  wallpaper and the interactive layers show. There is no renderer-side Canvas2D
+  fallback; native CPU backends still require the addon to be present.
 
 ## A single frame, end-to-end
 
@@ -286,7 +295,7 @@ sequenceDiagram
     Svc->>Addon: setRect(id, rect)
     Addon-->>Svc: ok
 
-    Note over Addon,Canvas: compositing thread runs off-screen<br/>(D3D11VA decode → compositor → RGBA8 staging)
+    Note over Addon,Canvas: compositing thread runs off-screen<br/>(platform decode → compositor → RGBA8 readback)
 
     loop every other rAF tick (~30 fps)
         Hook->>IPC: readFrame(viewId, lastGen)

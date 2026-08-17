@@ -127,7 +127,7 @@ turns that plan into its own draw calls and shaders. Shared geometry removes one
 source of drift, but shader, text, and readback implementations remain
 platform-specific and require platform-specific verification.
 
-The scene's semantic layer order is:
+Windows and macOS use this layer order:
 
 1. Background image, color, or gradient, with optional background blur.
 2. Screen shadow.
@@ -136,6 +136,11 @@ The scene's semantic layer order is:
 5. Webcam shadow for floating layouts.
 6. Webcam video with mirror, shape, reactive scale, and Full Camera transition.
 7. Annotations and derived captions above the media layers.
+
+Linux instead draws background, screen shadow/screen, webcam shadow/webcam,
+annotations, then cursor. The cursor is therefore its topmost layer. That backend
+difference is current implementation behavior, not a cross-platform z-order
+guarantee.
 
 Several dimensions are deliberately serialized as fractions rather than pixels so
 the same scene scales between preview and export:
@@ -189,7 +194,7 @@ encodes AAC once before the trailer.
 
 The live preview is video-only: `live.rs` does not decode or play this export audio.
 
-## Build and packaging
+## Build
 
 The compositor links the ffmpeg libraries through bindgen-generated FFI and must be
 built against a compatible shared SDK. Release artifacts use the repository's pinned

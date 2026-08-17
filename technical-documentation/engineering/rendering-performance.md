@@ -4,9 +4,13 @@ This is the measurement record for preview fluidity and export speed, and the ev
 
 The reference machine for every number in this document is an AMD Ryzen 5 7520U laptop with the integrated Radeon GPU, running Windows 11 — deliberately the weak case, and the only fully-measured machine. A discrete-GPU and Intel QSV run is owed (see [Known gaps](#known-gaps)).
 
+This is therefore a record of the Windows backend decision, not a benchmark of every
+current platform backend. The production crate now also has Metal and wgpu/Vulkan
+implementations for macOS and Linux; no performance number for either is claimed here.
+
 ## Where it landed
 
-**The shipped path is the D3D11 compositor in [`crates/compositor/`](../../crates/compositor/), at ~126 fps for 1080p60 with every effect on.** One `ID3D11Device`, no CPU readback between any stage:
+**On the measured Windows path, the shipped D3D11 backend in [`crates/compositor/`](../../crates/compositor/) reaches ~126 fps for 1080p60 with every effect on.** One `ID3D11Device`, no CPU readback between any stage:
 
 ```
 demux → D3D11VA decode (×2, NV12 GPU textures) → HLSL composite
@@ -17,9 +21,9 @@ On the reference machine, same fixture, sustained regime:
 
 | path | fps @ 1080p60, full effects | status |
 |---|---:|---|
-| **D3D11 (`crates/compositor/`)** | **~126** (median 125.9, spread 11.8 %) | **shipped** |
+| **D3D11 (`crates/compositor/`, Windows)** | **~126** (median 125.9, spread 11.8 %) | **shipped Windows backend** |
 | WebCodecs in Chromium | 79 | removed — the web pipeline *after* the [Canvas2D rebuild](#the-fix-and-what-it-bought); never released |
-| Rust + wgpu / Vulkan | 48–68 | [rejected](#rust--wgpu-native-poc-poc-native), driver-blocked |
+| Original Rust + wgpu/Vulkan POC | 48–68 | [rejected for the Windows zero-copy path](#rust--wgpu-native-poc-poc-native); not the current Linux backend |
 
 That fps envelopes **the whole run** — demux, decode, composite, encode and mux — because the measured window is one `Instant::now()` before and one after everything. Nothing inside can falsify the clock.
 
@@ -35,7 +39,7 @@ Windows per-engine GPU counters (`\GPU Engine\Utilization` — no elevation, no 
 - The VCN encoder is the hard ceiling at **~210 fps** for decode+encode alone (fixed-function; `-quality speed` buys +2 %). So on heavy configs the compositor is the only optimisable surface left.
 - **Already parallel on the GPU.** The 3d and codec engines are both busy over the same window (84 % + 61 % = 145 %, impossible if serialised): the GPU pipelines stages across frames on its own, single-threaded CPU loop notwithstanding. An explicit CPU-side pipeline adds ~nothing — confirmed by a no-op SRV-cache trial that moved neither bound. This is the native twin of the [encoder-pipelining loss](#encoder-pipelining).
 
-The direction is thermal-robust: absolute fps drifts with the passive iGPU's boost/throttle, but at **every state measured** the full-effects config beats both the browser and the wgpu path, throttled floor included.
+The direction is thermal-robust: absolute fps drifts with the passive iGPU's boost/throttle, but at **every state measured** the full-effects config beats both the browser and the original wgpu POC, throttled floor included.
 
 ### Measuring it today
 
