@@ -6,7 +6,7 @@ import { I18nProvider } from "@/contexts/I18nContext";
 import type { AxcutDocument } from "@/lib/ai-edition/schema";
 import { useProjectStore } from "@/lib/ai-edition/store/projectStore";
 import { useChatPromptBus } from "@/lib/ai-edition/store/useChatPromptBus";
-import type { AiEditionChatEvent } from "@/native/contracts";
+import type { AiEditionChatEvent, AiEditionChatSessionUpdatedEvent } from "@/native/contracts";
 import { LeftPanel } from "./LeftPanel";
 
 const bridgeMocks = vi.hoisted(() => ({
@@ -20,7 +20,9 @@ const bridgeMocks = vi.hoisted(() => ({
 	chatRun: vi.fn(),
 	chatCommitRun: vi.fn(),
 	chatAbortRun: vi.fn(),
-	chatRenewOperation: vi.fn(),
+	chatBeginPersistence: vi.fn(),
+	chatOperationStatus: vi.fn(),
+	chatResolvePersistence: vi.fn(),
 	chatPrepareRewind: vi.fn(),
 	chatCommitRewind: vi.fn(),
 	chatAbortRewind: vi.fn(),
@@ -33,6 +35,7 @@ const toastMocks = vi.hoisted(() => ({
 }));
 
 let chatEventListener: ((event: AiEditionChatEvent) => void) | null = null;
+let chatSessionUpdateListener: ((event: AiEditionChatSessionUpdatedEvent) => void) | null = null;
 
 vi.mock("@/native/client", () => ({
 	nativeBridgeClient: {
@@ -115,6 +118,28 @@ function chatResult(document: AxcutDocument, userMessageCheckpointId = "canonica
 	};
 }
 
+function canonicalChatCommit(sessionRevision = 1, userMessageCheckpointId = "canonical_user_1") {
+	return {
+		success: true as const,
+		messages: [
+			{
+				id: userMessageCheckpointId,
+				role: "user" as const,
+				content: "Improve this edit",
+				createdAt: "2026-08-16T10:00:00.000Z",
+				checkpointId: userMessageCheckpointId,
+			},
+			{
+				id: "assistant_1",
+				role: "assistant" as const,
+				content: "The edit is ready.",
+				createdAt: "2026-08-16T10:00:01.000Z",
+			},
+		],
+		sessionRevision,
+	};
+}
+
 const rewindMessages = [
 	{
 		id: "user_1",
@@ -170,6 +195,7 @@ async function startPendingRewind<T>(pending: Promise<T>) {
 		title: "Conversation",
 		createdAt: "2026-08-16T10:00:00.000Z",
 		messages: rewindMessages,
+		revision: 4,
 	});
 	bridgeMocks.chatPrepareRewind.mockReturnValue(pending);
 	const view = renderPanel();
@@ -183,6 +209,7 @@ async function startPendingRewind<T>(pending: Promise<T>) {
 describe("LeftPanel async document results", () => {
 	beforeEach(() => {
 		chatEventListener = null;
+		chatSessionUpdateListener = null;
 		useProjectStore.getState().clear();
 		useChatPromptBus.setState({ pending: null });
 		for (const mock of Object.values(bridgeMocks)) mock.mockReset();
@@ -191,9 +218,18 @@ describe("LeftPanel async document results", () => {
 			success: true,
 			document,
 		}));
-		bridgeMocks.chatCommitRun.mockResolvedValue({ success: true });
+		bridgeMocks.chatCommitRun.mockResolvedValue(canonicalChatCommit());
 		bridgeMocks.chatAbortRun.mockResolvedValue({ success: true });
-		bridgeMocks.chatRenewOperation.mockResolvedValue({ success: true });
+		bridgeMocks.chatBeginPersistence.mockResolvedValue({ success: true });
+		bridgeMocks.chatOperationStatus.mockImplementation(
+			async (_projectId: string, _sessionId: string, operationId: string) => ({
+				state: "persisting",
+				kind: operationId.startsWith("rewind") ? "rewind" : "chat",
+				operationId,
+				expiresAt: Number.MAX_SAFE_INTEGER,
+			}),
+		);
+		bridgeMocks.chatResolvePersistence.mockResolvedValue({ success: true });
 		bridgeMocks.chatAbortRewind.mockResolvedValue({ success: true });
 		bridgeMocks.chatDeleteSession.mockResolvedValue({ success: true });
 		bridgeMocks.llmGetSnapshot.mockResolvedValue({
@@ -216,6 +252,7 @@ describe("LeftPanel async document results", () => {
 			title: "Conversation",
 			createdAt: "2026-08-16T10:00:00.000Z",
 			messages: [],
+			revision: 0,
 		});
 		Object.assign(window, {
 			electronAPI: {
@@ -225,6 +262,14 @@ describe("LeftPanel async document results", () => {
 						if (chatEventListener === listener) chatEventListener = null;
 					};
 				}),
+				onAiEditionChatSessionUpdated: vi.fn(
+					(listener: (event: AiEditionChatSessionUpdatedEvent) => void) => {
+						chatSessionUpdateListener = listener;
+						return () => {
+							if (chatSessionUpdateListener === listener) chatSessionUpdateListener = null;
+						};
+					},
+				),
 				setLocale: vi.fn(),
 			},
 		});
@@ -371,7 +416,8 @@ describe("LeftPanel async document results", () => {
 		});
 		expect(bridgeMocks.save).not.toHaveBeenCalled();
 		expect(bridgeMocks.chatCommitRun).not.toHaveBeenCalled();
-		expect(bridgeMocks.chatAbortRun).toHaveBeenCalledTimes(1);
+		expect(bridgeMocks.chatAbortRun).not.toHaveBeenCalled();
+		expect(bridgeMocks.chatResolvePersistence).toHaveBeenCalledTimes(1);
 		expect(bridgeMocks.chatListSessions).toHaveBeenCalledTimes(listCallsBeforeCompletion);
 		expect(bridgeMocks.chatSelectSession).toHaveBeenCalledTimes(selectCallsBeforeCompletion);
 		expect(screen.queryByText("The edit is ready.")).not.toBeInTheDocument();
@@ -433,10 +479,25 @@ describe("LeftPanel async document results", () => {
 		expect(toastMocks.error).not.toHaveBeenCalled();
 	});
 
-	it("retries an ambiguous chat history commit without duplicating the visible turn", async () => {
+	it("recovers two lost chat commit replies from canonical status without duplication", async () => {
+		const committed = canonicalChatCommit();
 		bridgeMocks.chatCommitRun
-			.mockRejectedValueOnce(new Error("commit reply lost"))
-			.mockResolvedValue({ success: true });
+			.mockRejectedValueOnce(new Error("first commit reply lost"))
+			.mockRejectedValueOnce(new Error("second commit reply lost"));
+		bridgeMocks.chatOperationStatus
+			.mockImplementationOnce(async (_projectId, _sessionId, operationId) => ({
+				state: "persisting",
+				kind: "chat",
+				operationId,
+				expiresAt: Number.MAX_SAFE_INTEGER,
+			}))
+			.mockResolvedValueOnce({ state: "unknown", operationId: "unknown" })
+			.mockImplementation(async (_projectId, _sessionId, operationId) => ({
+				state: "committed",
+				kind: "chat",
+				operationId,
+				result: committed,
+			}));
 		const run = deferred<ReturnType<typeof chatResult>>();
 		await startPendingChat(run.promise);
 
@@ -446,12 +507,63 @@ describe("LeftPanel async document results", () => {
 		});
 
 		await waitFor(() => expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(2));
+		expect(bridgeMocks.chatOperationStatus).toHaveBeenCalledTimes(3);
 		expect(screen.getAllByText("The edit is ready.")).toHaveLength(1);
 		expect(bridgeMocks.chatAbortRun).not.toHaveBeenCalled();
 		expect(toastMocks.error).not.toHaveBeenCalled();
 	});
 
+	it("refreshes a remounted panel when detached persistence commits canonically", async () => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const resultDocument = withTitle(sampleDoc, "Detached persisted edit");
+		const committed = canonicalChatCommit();
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.chatCommitRun.mockImplementation(
+			async (_projectId: string, _sessionId: string, operationId: string) => {
+				chatSessionUpdateListener?.({
+					projectId: "proj_a",
+					sessionId: "session_1",
+					revision: committed.sessionRevision,
+					operationId,
+					kind: "chat",
+					messages: committed.messages,
+				});
+				return committed;
+			},
+		);
+		const run = deferred<ReturnType<typeof chatResult>>();
+		const firstView = await startPendingChat(run.promise);
+
+		await act(async () => {
+			run.resolve(chatResult(resultDocument));
+			await run.promise;
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
+		await waitFor(() => expect(bridgeMocks.chatBeginPersistence).toHaveBeenCalledTimes(1));
+		firstView.unmount();
+		expect(bridgeMocks.chatAbortRun).not.toHaveBeenCalled();
+		expect(chatSessionUpdateListener).toBeNull();
+
+		const selectCalls = bridgeMocks.chatSelectSession.mock.calls.length;
+		renderPanel();
+		await waitFor(() =>
+			expect(bridgeMocks.chatSelectSession.mock.calls.length).toBeGreaterThan(selectCalls),
+		);
+		await waitFor(() => expect(chatSessionUpdateListener).not.toBeNull());
+
+		await act(async () => {
+			saving.resolve({ success: true, document: resultDocument });
+			await saving.promise;
+		});
+
+		await waitFor(() => expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(1));
+		expect(screen.getAllByText("The edit is ready.")).toHaveLength(1);
+		expect(bridgeMocks.chatAbortRun).not.toHaveBeenCalled();
+		expect(bridgeMocks.chatResolvePersistence).not.toHaveBeenCalled();
+	});
+
 	it("maps the optimistic user message to its canonical checkpoint before session reload", async () => {
+		bridgeMocks.chatCommitRun.mockResolvedValue(canonicalChatCommit(1, "canonical_checkpoint"));
 		const run = deferred<ReturnType<typeof chatResult>>();
 		await startPendingChat(run.promise);
 		await act(async () => {
@@ -520,7 +632,13 @@ describe("LeftPanel async document results", () => {
 			await preparing.promise;
 		});
 
-		await waitFor(() => expect(bridgeMocks.chatAbortRewind).toHaveBeenCalledTimes(1));
+		if (mutation === "same-generation edit") {
+			await waitFor(() => expect(bridgeMocks.chatResolvePersistence).toHaveBeenCalledTimes(1));
+			expect(bridgeMocks.chatAbortRewind).not.toHaveBeenCalled();
+		} else {
+			await waitFor(() => expect(bridgeMocks.chatAbortRewind).toHaveBeenCalledTimes(1));
+			expect(bridgeMocks.chatResolvePersistence).not.toHaveBeenCalled();
+		}
 		expect(bridgeMocks.chatCommitRewind).not.toHaveBeenCalled();
 		expect(useProjectStore.getState().document?.project.title).toBe(winner.project.title);
 		expect(screen.getByText("Applied the old edit.")).toBeInTheDocument();
@@ -532,12 +650,13 @@ describe("LeftPanel async document results", () => {
 		);
 	});
 
-	it("aborts rewind without changing renderer history when persistence is rejected", async () => {
+	it("resolves rewind without changing renderer history when persistence is rejected", async () => {
 		bridgeMocks.save.mockResolvedValue({ success: false, error: "disk full" });
 		bridgeMocks.get.mockResolvedValue({ success: true, document: sampleDoc });
 		await startPendingRewind(Promise.resolve(preparedRewind()));
 
-		await waitFor(() => expect(bridgeMocks.chatAbortRewind).toHaveBeenCalledTimes(1));
+		await waitFor(() => expect(bridgeMocks.chatResolvePersistence).toHaveBeenCalledTimes(1));
+		expect(bridgeMocks.chatAbortRewind).not.toHaveBeenCalled();
 		expect(bridgeMocks.chatCommitRewind).not.toHaveBeenCalled();
 		expect(useProjectStore.getState()).toMatchObject({ document: sampleDoc, dirty: false });
 		expect(screen.getByText("Applied the old edit.")).toBeInTheDocument();
@@ -556,6 +675,7 @@ describe("LeftPanel async document results", () => {
 			success: true,
 			messages: prepared.messages,
 			prompt: prepared.prompt,
+			sessionRevision: prepared.sessionRevision + 1,
 		});
 		await startPendingRewind(Promise.resolve(prepared));
 
@@ -569,13 +689,14 @@ describe("LeftPanel async document results", () => {
 		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("Try this edit");
 	});
 
-	it("adopts a differing authoritative save and aborts rewind history", async () => {
+	it("adopts a differing authoritative save and resolves rewind history", async () => {
 		const authoritative = withTitle(sampleDoc, "Different authoritative document");
 		bridgeMocks.save.mockRejectedValue(new Error("response lost"));
 		bridgeMocks.get.mockResolvedValue({ success: true, document: authoritative });
 		await startPendingRewind(Promise.resolve(preparedRewind()));
 
-		await waitFor(() => expect(bridgeMocks.chatAbortRewind).toHaveBeenCalledTimes(1));
+		await waitFor(() => expect(bridgeMocks.chatResolvePersistence).toHaveBeenCalledTimes(1));
+		expect(bridgeMocks.chatAbortRewind).not.toHaveBeenCalled();
 		expect(bridgeMocks.chatCommitRewind).not.toHaveBeenCalled();
 		expect(useProjectStore.getState()).toMatchObject({
 			document: { project: { title: "Different authoritative document" } },
@@ -594,6 +715,7 @@ describe("LeftPanel async document results", () => {
 			success: true,
 			messages: prepared.messages,
 			prompt: prepared.prompt,
+			sessionRevision: prepared.sessionRevision + 1,
 		});
 		await startPendingRewind(Promise.resolve(prepared));
 
@@ -620,6 +742,7 @@ describe("LeftPanel async document results", () => {
 				success: true,
 				messages: prepared.messages,
 				prompt: prepared.prompt,
+				sessionRevision: prepared.sessionRevision + 1,
 			});
 		await startPendingRewind(Promise.resolve(prepared));
 
@@ -659,6 +782,7 @@ describe("LeftPanel async document results", () => {
 			success: true,
 			messages: prepared.messages,
 			prompt: prepared.prompt,
+			sessionRevision: prepared.sessionRevision + 1,
 		});
 		const view = await startPendingRewind(Promise.resolve(prepared));
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledTimes(1));
@@ -772,6 +896,7 @@ describe("LeftPanel async document results", () => {
 			title: "Conversation",
 			createdAt: "2026-08-16T10:00:00.000Z",
 			messages: rewindMessages,
+			revision: 4,
 		});
 		const run = deferred<ReturnType<typeof chatResult>>();
 		await startPendingChat(run.promise);
@@ -785,33 +910,51 @@ describe("LeftPanel async document results", () => {
 		});
 	});
 
-	it("renews the owner-bound lease while a chat operation is active", async () => {
-		let heartbeat: (() => void) | null = null;
-		const realSetInterval = globalThis.setInterval;
-		vi.spyOn(globalThis, "setInterval").mockImplementation((handler, timeout, ...args) => {
-			if (timeout === 60_000 && typeof handler === "function") {
-				heartbeat = () => handler(...args);
-				return 987_654 as unknown as ReturnType<typeof setInterval>;
-			}
-			return realSetInterval(handler, timeout, ...args);
-		});
+	it("begins bounded persistence without scheduling a renderer heartbeat", async () => {
+		const intervalSpy = vi.spyOn(globalThis, "setInterval");
 		const run = deferred<ReturnType<typeof chatResult>>();
 		await startPendingChat(run.promise);
 		const operationId = bridgeMocks.chatRun.mock.calls[0][4] as string;
 
 		await act(async () => {
-			heartbeat?.();
-			await Promise.resolve();
+			run.resolve(chatResult(withTitle(sampleDoc, "Persisted without heartbeat")));
+			await run.promise;
 		});
-		expect(bridgeMocks.chatRenewOperation).toHaveBeenCalledWith("proj_a", "session_1", operationId);
 
-		await act(async () => {
-			run.reject(new Error("cancelled"));
-			await run.promise.catch(() => undefined);
-		});
+		await waitFor(() =>
+			expect(bridgeMocks.chatBeginPersistence).toHaveBeenCalledWith(
+				"proj_a",
+				"session_1",
+				operationId,
+			),
+		);
+		expect(intervalSpy.mock.calls.some(([, timeout]) => timeout === 60_000)).toBe(false);
 	});
 
-	it("ignores streamed reasoning from an older operation in the same session", async () => {
+	it("does not persist after a suspended renderer resumes past operation expiry", async () => {
+		bridgeMocks.chatOperationStatus.mockImplementation(
+			async (_projectId: string, _sessionId: string, operationId: string) => ({
+				state: "persisting",
+				kind: "chat",
+				operationId,
+				expiresAt: Date.now() - 1,
+			}),
+		);
+		const run = deferred<ReturnType<typeof chatResult>>();
+		await startPendingChat(run.promise);
+
+		await act(async () => {
+			run.resolve(chatResult(withTitle(sampleDoc, "Expired edit")));
+			await run.promise;
+		});
+
+		await waitFor(() => expect(bridgeMocks.chatOperationStatus).toHaveBeenCalledTimes(2));
+		await waitFor(() => expect(screen.queryByText("Thinking…")).not.toBeInTheDocument());
+		expect(bridgeMocks.save).not.toHaveBeenCalled();
+		expect(bridgeMocks.chatCommitRun).not.toHaveBeenCalled();
+	});
+
+	it("ignores stale reasoning and preserves the current trace on the canonical result", async () => {
 		const run = deferred<ReturnType<typeof chatResult>>();
 		await startPendingChat(run.promise);
 		const operationId = bridgeMocks.chatRun.mock.calls[0][4] as string;
@@ -837,8 +980,22 @@ describe("LeftPanel async document results", () => {
 		expect(screen.getByText("current reasoning")).toBeInTheDocument();
 
 		await act(async () => {
-			run.reject(new Error("cancelled"));
-			await run.promise.catch(() => undefined);
+			run.resolve(chatResult(withTitle(sampleDoc, "Reasoned edit")));
+			await run.promise;
 		});
+		await waitFor(() => expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(1));
+		expect(screen.getByText("current reasoning")).toBeInTheDocument();
+
+		act(() => {
+			chatSessionUpdateListener?.({
+				projectId: "proj_a",
+				sessionId: "session_1",
+				revision: 1,
+				operationId,
+				kind: "chat",
+				messages: canonicalChatCommit().messages,
+			});
+		});
+		expect(screen.getByText("current reasoning")).toBeInTheDocument();
 	});
 });

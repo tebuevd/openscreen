@@ -14,7 +14,12 @@ import { splitRoundedTime } from "@/lib/ai-edition/timeline/format";
 import type { AssetTranscriptionView } from "@/lib/ai-edition/transcription/status";
 import { nativeBridgeClient } from "@/native/client";
 import type {
+	AiEditionChatCommitResult,
 	AiEditionChatEvent,
+	AiEditionChatMessage,
+	AiEditionChatOperationStatus,
+	AiEditionChatRewindCommitResult,
+	AiEditionChatSessionUpdatedEvent,
 	AiEditionLlmConfig,
 	AiEditionToolCallSummary,
 } from "@/native/contracts";
@@ -72,32 +77,79 @@ interface PanelOperation {
 	cancelled: boolean;
 	uiAttached: boolean;
 	abortRequested: boolean;
-	stopHeartbeat: () => void;
 }
 
 function operationMustFinish(operation: PanelOperation): boolean {
 	return operation.phase === "persisting" || operation.phase === "committing";
 }
 
-function startOperationHeartbeat(
+type SuccessfulChatCommit = Extract<AiEditionChatCommitResult, { success: true }>;
+type SuccessfulRewindCommit = Extract<AiEditionChatRewindCommitResult, { success: true }>;
+
+type CommitResolution<T> =
+	| { state: "committed"; result: T }
+	| { state: "aborted"; error: string }
+	| { state: "unknown"; error: string };
+
+function boundedDelay(ms: number): Promise<void> {
+	return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function reconcileAmbiguousCommit<T extends { success: true }>(options: {
+	kind: "chat" | "rewind";
+	commit: () => Promise<T | { success: false; error: string }>;
+	status: () => Promise<AiEditionChatOperationStatus>;
+}): Promise<CommitResolution<T>> {
+	let lastError = "Commit acknowledgement is unavailable.";
+	for (const delayMs of [0, 10, 25]) {
+		if (delayMs > 0) await boundedDelay(delayMs);
+		try {
+			const result = await options.commit();
+			if (result.success) return { state: "committed", result };
+			lastError = result.error;
+		} catch (error) {
+			lastError = error instanceof Error ? error.message : String(error);
+		}
+
+		try {
+			const status = await options.status();
+			if (status.state === "committed" && status.kind === options.kind) {
+				return { state: "committed", result: status.result as unknown as T };
+			}
+			if (status.state === "aborted") return { state: "aborted", error: lastError };
+		} catch (error) {
+			lastError = error instanceof Error ? error.message : String(error);
+		}
+	}
+	return { state: "unknown", error: lastError };
+}
+
+async function beginPersistenceBounded(
 	projectId: string,
 	sessionId: string,
 	operationId: string,
-): () => void {
-	const timeout = setInterval(() => {
-		void nativeBridgeClient.aiEdition
-			.chatRenewOperation(projectId, sessionId, operationId)
-			.catch(() => undefined);
-	}, 60_000);
-	return () => clearInterval(timeout);
-}
-
-async function retryAmbiguousCommit<T>(commit: () => Promise<T>): Promise<T> {
-	try {
-		return await commit();
-	} catch {
-		return commit();
+): Promise<"started" | "committed" | "aborted" | "unknown"> {
+	for (const delayMs of [0, 10]) {
+		if (delayMs > 0) await boundedDelay(delayMs);
+		try {
+			await nativeBridgeClient.aiEdition.chatBeginPersistence(projectId, sessionId, operationId);
+		} catch {
+			// Fresh status distinguishes a lost transition reply from a rejected transition.
+		}
+		try {
+			const status = await nativeBridgeClient.aiEdition.chatOperationStatus(
+				projectId,
+				sessionId,
+				operationId,
+			);
+			if (status.state === "persisting" && status.expiresAt > Date.now()) return "started";
+			if (status.state === "committed") return "committed";
+			if (status.state === "aborted") return "aborted";
+		} catch {
+			// The second bounded attempt may still recover a lost transition response.
+		}
 	}
+	return "unknown";
 }
 
 function requestOperationAbort(operation: PanelOperation): void {
@@ -377,6 +429,26 @@ interface ChatDisplayMessage {
 	// above the answer. Ephemeral — only present for the turn that streamed it;
 	// reloading a session won't show past traces.
 	thinking?: string;
+}
+
+function toDisplayMessages(messages: AiEditionChatMessage[]): ChatDisplayMessage[] {
+	return messages.map((message) => ({
+		id: message.id,
+		role: message.role,
+		content: message.content,
+		time: message.createdAt,
+		toolCalls: message.toolCalls,
+		checkpointId: message.checkpointId ?? null,
+	}));
+}
+
+function rememberAppliedSessionUpdate(operationIds: Set<string>, operationId: string): void {
+	operationIds.add(operationId);
+	while (operationIds.size > 128) {
+		const oldest = operationIds.values().next().value;
+		if (typeof oldest !== "string") break;
+		operationIds.delete(oldest);
+	}
 }
 
 // Quick-access model picker anchored to the composer's model pill — mirrors
@@ -812,11 +884,14 @@ function ChatStripPanel() {
 	// freshly-created empty one.
 	const activeSessionIdRef = useRef<string | null>(activeSessionId);
 	activeSessionIdRef.current = activeSessionId;
+	const sessionRevisionRef = useRef(new Map<string, number>());
+	const appliedSessionUpdatesRef = useRef(new Set<string>());
 	const scrollRef = useRef<HTMLDivElement | null>(null);
 	// ponytail: live reasoning trace for the in-flight turn. Reset at send()
 	// start; deltas append through the chat-event subscription; once the run
 	// resolves we copy it onto the assistant message and clear it.
 	const [thinkingText, setThinkingText] = useState("");
+	const thinkingTextRef = useRef("");
 	const [thinkingExpanded, setThinkingExpanded] = useState(false);
 	// sessionId of the in-flight run — late events for prior runs (or for
 	// other windows) are ignored so a stale stream can't pollute the new turn.
@@ -898,10 +973,46 @@ function ChatStripPanel() {
 			if (event.sessionId !== thinkingRunSessionRef.current) return;
 			const operation = activeOperationRef.current;
 			if (operation?.kind !== "chat" || event.operationId !== operation.localId) return;
-			setThinkingText((prev) => prev + event.delta);
+			thinkingTextRef.current += event.delta;
+			setThinkingText(thinkingTextRef.current);
 		});
 		return unsubChatEvent;
 	}, []);
+
+	useEffect(() => {
+		return window.electronAPI.onAiEditionChatSessionUpdated(
+			(event: AiEditionChatSessionUpdatedEvent) => {
+				const current = useProjectStore.getState();
+				if (
+					current.projectId !== projectId ||
+					current.documentGeneration !== documentGeneration ||
+					event.projectId !== projectId ||
+					event.sessionId !== activeSessionIdRef.current
+				) {
+					return;
+				}
+				const knownRevision = sessionRevisionRef.current.get(event.sessionId) ?? -1;
+				if (
+					event.revision < knownRevision ||
+					(event.revision === knownRevision &&
+						appliedSessionUpdatesRef.current.has(event.operationId))
+				) {
+					return;
+				}
+				sessionRevisionRef.current.set(event.sessionId, event.revision);
+				rememberAppliedSessionUpdate(appliedSessionUpdatesRef.current, event.operationId);
+				setMessages(toDisplayMessages(event.messages));
+				setSessions((previous) =>
+					previous.map((session) =>
+						session.id === event.sessionId
+							? { ...session, messageCount: event.messages.length }
+							: session,
+					),
+				);
+				if (event.kind === "rewind" && event.prompt !== undefined) setInput(event.prompt);
+			},
+		);
+	}, [projectId, documentGeneration]);
 
 	useEffect(() => {
 		mountedRef.current = true;
@@ -915,7 +1026,6 @@ function ChatStripPanel() {
 			operation.uiAttached = false;
 			if (!operationMustFinish(operation)) {
 				operation.cancelled = true;
-				operation.stopHeartbeat();
 				requestOperationAbort(operation);
 			}
 		};
@@ -928,7 +1038,6 @@ function ChatStripPanel() {
 			operation.uiAttached = false;
 			if (!operationMustFinish(operation)) {
 				operation.cancelled = true;
-				operation.stopHeartbeat();
 				requestOperationAbort(operation);
 			}
 			toast.error(t("chat.applyEditsFailed"), {
@@ -941,6 +1050,9 @@ function ChatStripPanel() {
 		setCompactNowPending(false);
 		setRewindFor(null);
 		thinkingRunSessionRef.current = null;
+		sessionRevisionRef.current.clear();
+		appliedSessionUpdatesRef.current.clear();
+		thinkingTextRef.current = "";
 		setThinkingText("");
 		if (!projectId) {
 			setSessions([]);
@@ -974,16 +1086,10 @@ function ChatStripPanel() {
 					return;
 				}
 				if (session) {
-					setMessages(
-						session.messages.map((m) => ({
-							id: m.id,
-							role: m.role,
-							content: m.content,
-							time: m.createdAt,
-							toolCalls: m.toolCalls,
-							checkpointId: m.checkpointId ?? null,
-						})),
-					);
+					const knownRevision = sessionRevisionRef.current.get(activeSessionId) ?? -1;
+					if (session.revision < knownRevision) return;
+					sessionRevisionRef.current.set(activeSessionId, session.revision);
+					setMessages(toDisplayMessages(session.messages));
 				} else {
 					setMessages([]);
 				}
@@ -1053,7 +1159,6 @@ function ChatStripPanel() {
 			cancelled: false,
 			uiAttached: true,
 			abortRequested: false,
-			stopHeartbeat: () => undefined,
 		};
 		activeOperationRef.current = operation;
 		setInput("");
@@ -1061,6 +1166,7 @@ function ChatStripPanel() {
 		// ponytail: prepare the live reasoning-trace accumulator. Late events
 		// from a previous run (or from another panel/window) won't match this
 		// sessionId and are dropped by the subscription above.
+		thinkingTextRef.current = "";
 		setThinkingText("");
 		setThinkingExpanded(false);
 		thinkingRunSessionRef.current = null;
@@ -1089,7 +1195,15 @@ function ChatStripPanel() {
 				current.revision === documentOperation.revision + (applied ? 1 : 0)
 			);
 		};
-		const discardRun = async (stale: boolean): Promise<boolean> => {
+		const removeOptimisticMessage = (stale: boolean): boolean => {
+			if (!ownsUi()) return false;
+			setMessages((prev) =>
+				prev.filter((message) => message.id !== optimisticUserId && message.id !== canonicalUserId),
+			);
+			if (stale) showStaleDocumentResult();
+			return true;
+		};
+		const abortRunBeforePersistence = async (stale: boolean): Promise<boolean> => {
 			if (operation.sessionId && operation.remoteId && !operation.abortRequested) {
 				operation.abortRequested = true;
 				try {
@@ -1102,12 +1216,41 @@ function ChatStripPanel() {
 					// Expiry or an already-aborted operation needs no second error.
 				}
 			}
-			if (!ownsUi()) return false;
-			setMessages((prev) =>
-				prev.filter((message) => message.id !== optimisticUserId && message.id !== canonicalUserId),
-			);
-			if (stale) showStaleDocumentResult();
-			return true;
+			return removeOptimisticMessage(stale);
+		};
+		const resolveNotPersisted = async (stale: boolean): Promise<boolean> => {
+			if (operation.sessionId && operation.remoteId) {
+				try {
+					await nativeBridgeClient.aiEdition.chatResolvePersistence(
+						projectId,
+						operation.sessionId,
+						operation.remoteId,
+					);
+				} catch {
+					// The bounded main-side evidence expires safely if this acknowledgement is lost.
+				}
+			}
+			return removeOptimisticMessage(stale);
+		};
+		const reloadCanonicalSession = async (): Promise<void> => {
+			if (!ownsUi() || !operation.sessionId) return;
+			try {
+				const session = await nativeBridgeClient.aiEdition.chatSelectSession(
+					projectId,
+					operation.sessionId,
+				);
+				if (!ownsUi()) return;
+				if (!session) {
+					setMessages([]);
+					setSessions((previous) => previous.filter((item) => item.id !== operation.sessionId));
+					if (activeSessionIdRef.current === operation.sessionId) setActiveSessionId(null);
+					return;
+				}
+				sessionRevisionRef.current.set(session.id, session.revision);
+				setMessages(toDisplayMessages(session.messages));
+			} catch {
+				// A process restart is represented by an unavailable/empty in-memory session.
+			}
 		};
 		try {
 			// Mirror axcut's `getOrCreateSession`: the composer works with zero
@@ -1152,10 +1295,9 @@ function ChatStripPanel() {
 				documentSnapshot,
 				localOperationId,
 			);
-			operation.stopHeartbeat = startOperationHeartbeat(projectId, sessionId, localOperationId);
 			const result = await runPromise;
 			if (operation.cancelled || !ownsUi()) {
-				await discardRun(false);
+				await abortRunBeforePersistence(false);
 				return;
 			}
 			const assistant = result.assistantMessage;
@@ -1172,74 +1314,101 @@ function ChatStripPanel() {
 							: message,
 					),
 				);
-				let appliedDocument = false;
+				let persistenceAlreadyCommitted = false;
 				if (result.document) {
 					operation.phase = "persisting";
+					const persistenceStart = await beginPersistenceBounded(
+						projectId,
+						sessionId,
+						localOperationId,
+					);
+					if (persistenceStart === "committed") {
+						persistenceAlreadyCommitted = true;
+					} else if (persistenceStart !== "started") {
+						await reloadCanonicalSession();
+						return;
+					}
 					try {
-						const outcome = await applyAgentDocument(result.document, documentOperation);
-						if (!outcome.success) {
-							if (await discardRun(outcome.status === "stale")) {
+						if (!persistenceAlreadyCommitted) {
+							const outcome = await applyAgentDocument(result.document, documentOperation);
+							if (outcome.success) {
+								// Disk now authoritatively contains the operation result, even if this panel detached.
+							} else if (await resolveNotPersisted(outcome.status === "stale")) {
 								if (outcome.status === "diverged") {
 									toast.error(t("chat.applyEditsFailed"), { description: outcome.error });
 								}
+								return;
 							}
-							return;
 						}
-						appliedDocument = true;
 					} catch (err) {
-						if (await discardRun(false)) {
+						if (ownsUi()) {
 							toast.error(t("chat.applyEditsFailed"), {
 								description: err instanceof Error ? err.message : String(err),
 							});
 						}
+						await reloadCanonicalSession();
 						return;
 					}
-				}
-				if (!documentStillMatches(appliedDocument)) {
-					await discardRun(true);
+				} else if (!documentStillMatches(false)) {
+					await abortRunBeforePersistence(true);
 					return;
 				}
 				operation.phase = "committing";
-				const committed = await retryAmbiguousCommit(() =>
-					nativeBridgeClient.aiEdition.chatCommitRun(projectId, sessionId, localOperationId),
-				);
-				if (!committed.success) {
-					if (await discardRun(false)) {
-						toast.error(t("chat.chatFailed"), { description: committed.error });
+				const resolution = await reconcileAmbiguousCommit<SuccessfulChatCommit>({
+					kind: "chat",
+					commit: () =>
+						nativeBridgeClient.aiEdition.chatCommitRun(projectId, sessionId, localOperationId),
+					status: () =>
+						nativeBridgeClient.aiEdition.chatOperationStatus(
+							projectId,
+							sessionId,
+							localOperationId,
+						),
+				});
+				if (resolution.state !== "committed") {
+					await reloadCanonicalSession();
+					if (resolution.state === "aborted" && ownsUi()) {
+						toast.error(t("chat.chatFailed"), { description: resolution.error });
 					}
 					return;
 				}
-				if (!ownsUi() || !documentStillMatches(appliedDocument)) {
-					return;
+				if (ownsUi()) {
+					const committedMessages = toDisplayMessages(resolution.result.messages);
+					const completedThinking = thinkingTextRef.current;
+					if (completedThinking) {
+						const committedAssistant = committedMessages.find(
+							(message) => message.id === assistant.id,
+						);
+						if (committedAssistant) committedAssistant.thinking = completedThinking;
+					}
+					sessionRevisionRef.current.set(sessionId, resolution.result.sessionRevision);
+					rememberAppliedSessionUpdate(appliedSessionUpdatesRef.current, localOperationId);
+					setMessages(committedMessages);
+					setSessions((previous) =>
+						previous.map((session) =>
+							session.id === sessionId
+								? { ...session, messageCount: resolution.result.messages.length }
+								: session,
+						),
+					);
 				}
-				setMessages((prev) => [
-					...prev,
-					{
-						role: "assistant",
-						content: assistant.content,
-						time: new Date().toLocaleTimeString(),
-						toolCalls: assistant.toolCalls,
-						// ponytail: snapshot the live reasoning trace onto the
-						// finished message so it can be revisited (collapsed by
-						// default, click-to-expand) instead of vanishing. The
-						// live accumulator is cleared in `finally`.
-						thinking: thinkingText || undefined,
-					},
-				]);
 				void refreshSessions(projectId, documentOperation.documentGeneration);
 			} else {
-				if (await discardRun(false)) {
+				if (await abortRunBeforePersistence(false)) {
 					toast.error(result.error ?? t("chat.chatFailed"));
 				}
 			}
 		} catch (err) {
-			if (operation.sessionId && !(await discardRun(false))) return;
+			if (operationMustFinish(operation)) {
+				await reloadCanonicalSession();
+				return;
+			}
+			if (operation.sessionId && !(await abortRunBeforePersistence(false))) return;
 			if (!ownsUi()) return;
 			toast.error(t("chat.chatFailed"), {
 				description: err instanceof Error ? err.message : String(err),
 			});
 		} finally {
-			operation.stopHeartbeat();
 			operation.phase = "settled";
 			if (ownsUi()) {
 				activeOperationRef.current = null;
@@ -1248,6 +1417,7 @@ function ChatStripPanel() {
 				// preview — the snapshot was either attached to the assistant
 				// message above, or there's no message to attach it to (failure).
 				thinkingRunSessionRef.current = null;
+				thinkingTextRef.current = "";
 				setThinkingText("");
 				setThinkingExpanded(false);
 			}
@@ -1314,7 +1484,6 @@ function ChatStripPanel() {
 				cancelled: false,
 				uiAttached: true,
 				abortRequested: false,
-				stopHeartbeat: () => undefined,
 			};
 			activeOperationRef.current = operation;
 			setRewindBusy(true);
@@ -1335,6 +1504,40 @@ function ChatStripPanel() {
 				}
 				return ownsUi();
 			};
+			const resolveNotPersisted = async (): Promise<boolean> => {
+				if (operation.remoteId) {
+					try {
+						await nativeBridgeClient.aiEdition.chatResolvePersistence(
+							projectId,
+							activeSessionId,
+							operation.remoteId,
+						);
+					} catch {
+						// The bounded main-side evidence expires safely if this acknowledgement is lost.
+					}
+				}
+				return ownsUi();
+			};
+			const reloadCanonicalSession = async (): Promise<void> => {
+				if (!ownsUi()) return;
+				try {
+					const session = await nativeBridgeClient.aiEdition.chatSelectSession(
+						projectId,
+						activeSessionId,
+					);
+					if (!ownsUi()) return;
+					if (!session) {
+						setMessages([]);
+						setSessions((previous) => previous.filter((item) => item.id !== activeSessionId));
+						setActiveSessionId(null);
+						return;
+					}
+					sessionRevisionRef.current.set(session.id, session.revision);
+					setMessages(toDisplayMessages(session.messages));
+				} catch {
+					// A restarted main process has no in-memory session to recover.
+				}
+			};
 			try {
 				const prepared = await nativeBridgeClient.aiEdition.chatPrepareRewind(
 					projectId,
@@ -1352,72 +1555,77 @@ function ChatStripPanel() {
 					return;
 				}
 				operation.phase = "persisting";
-				operation.stopHeartbeat = startOperationHeartbeat(
+				const persistenceStart = await beginPersistenceBounded(
 					projectId,
 					activeSessionId,
 					prepared.operationId,
 				);
-
-				const outcome = await applyAgentDocument(prepared.document, documentOperation);
-				if (!outcome.success) {
-					if (await abortPrepared()) {
-						if (outcome.status === "stale") showStaleDocumentResult();
-						else toast.error(t("chat.rewindFailed"), { description: outcome.error });
-					}
+				if (persistenceStart !== "started" && persistenceStart !== "committed") {
+					await reloadCanonicalSession();
 					return;
 				}
-				const current = useProjectStore.getState();
-				if (
-					current.projectId !== documentOperation.projectId ||
-					current.documentGeneration !== documentOperation.documentGeneration ||
-					current.revision !== documentOperation.revision + 1
-				) {
-					if (await abortPrepared()) showStaleDocumentResult();
-					return;
+
+				if (persistenceStart !== "committed") {
+					try {
+						const outcome = await applyAgentDocument(prepared.document, documentOperation);
+						if (!outcome.success) {
+							if (await resolveNotPersisted()) {
+								if (outcome.status === "stale") showStaleDocumentResult();
+								else toast.error(t("chat.rewindFailed"), { description: outcome.error });
+							}
+							return;
+						}
+					} catch (error) {
+						if (ownsUi()) {
+							toast.error(t("chat.rewindFailed"), {
+								description: error instanceof Error ? error.message : String(error),
+							});
+						}
+						await reloadCanonicalSession();
+						return;
+					}
 				}
 				operation.phase = "committing";
-				const committed = await retryAmbiguousCommit(() =>
-					nativeBridgeClient.aiEdition.chatCommitRewind(
-						projectId,
-						activeSessionId,
-						prepared.operationId,
-						prepared.sessionRevision,
-					),
-				);
-				if (!committed.success) {
-					if (await abortPrepared()) {
-						toast.error(committed.error ?? t("chat.rewindFailed"));
+				const resolution = await reconcileAmbiguousCommit<SuccessfulRewindCommit>({
+					kind: "rewind",
+					commit: () =>
+						nativeBridgeClient.aiEdition.chatCommitRewind(
+							projectId,
+							activeSessionId,
+							prepared.operationId,
+							prepared.sessionRevision,
+						),
+					status: () =>
+						nativeBridgeClient.aiEdition.chatOperationStatus(
+							projectId,
+							activeSessionId,
+							prepared.operationId,
+						),
+				});
+				if (resolution.state !== "committed") {
+					await reloadCanonicalSession();
+					if (resolution.state === "aborted" && ownsUi()) {
+						toast.error(resolution.error || t("chat.rewindFailed"));
 					}
 					return;
 				}
-				const afterCommit = useProjectStore.getState();
-				if (
-					!ownsUi() ||
-					afterCommit.projectId !== documentOperation.projectId ||
-					afterCommit.documentGeneration !== documentOperation.documentGeneration ||
-					afterCommit.revision !== documentOperation.revision + 1
-				) {
+				if (ownsUi()) {
+					sessionRevisionRef.current.set(activeSessionId, resolution.result.sessionRevision);
+					rememberAppliedSessionUpdate(appliedSessionUpdatesRef.current, prepared.operationId);
+					setMessages(toDisplayMessages(resolution.result.messages));
+					setInput(resolution.result.prompt);
+					toast.success(t("chat.rewoundSuccess"));
+				}
+			} catch (err) {
+				if (operationMustFinish(operation)) {
+					await reloadCanonicalSession();
 					return;
 				}
-				setMessages(
-					committed.messages.map((m) => ({
-						id: m.id,
-						role: m.role,
-						content: m.content,
-						time: m.createdAt,
-						toolCalls: m.toolCalls,
-						checkpointId: m.checkpointId ?? null,
-					})),
-				);
-				setInput(committed.prompt);
-				toast.success(t("chat.rewoundSuccess"));
-			} catch (err) {
 				if (!(await abortPrepared())) return;
 				toast.error(t("chat.rewindFailed"), {
 					description: err instanceof Error ? err.message : String(err),
 				});
 			} finally {
-				operation.stopHeartbeat();
 				operation.phase = "settled";
 				if (ownsUi()) {
 					activeOperationRef.current = null;

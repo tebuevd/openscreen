@@ -4,7 +4,7 @@ import type { NativeMacRecordingRequest } from "../src/lib/nativeMacRecording";
 import type { NativeWindowsRecordingRequest } from "../src/lib/nativeWindowsRecording";
 import type { RecordingSession, StoreRecordedSessionInput } from "../src/lib/recordingSession";
 import type { ShortcutBinding } from "../src/lib/shortcuts";
-import type { AiEditionChatEvent } from "../src/native/contracts";
+import type { AiEditionChatEvent, AiEditionChatSessionUpdatedEvent } from "../src/native/contracts";
 import { NATIVE_BRIDGE_CHANNEL, type NativeBridgeRequest } from "../src/native/contracts";
 import type { RecordingPrefs } from "./ipc/handlers";
 import type {
@@ -426,6 +426,11 @@ contextBridge.exposeInMainWorld("electronAPI", {
 		const listener = (_e: unknown, payload: AiEditionChatEvent) => callback(payload);
 		ipcRenderer.on("ai-edition.chat-event", listener);
 		return () => ipcRenderer.removeListener("ai-edition.chat-event", listener);
+	},
+	onAiEditionChatSessionUpdated: (callback: (event: AiEditionChatSessionUpdatedEvent) => void) => {
+		const listener = (_e: unknown, payload: AiEditionChatSessionUpdatedEvent) => callback(payload);
+		ipcRenderer.on("ai-edition.chat-session-updated", listener);
+		return () => ipcRenderer.removeListener("ai-edition.chat-session-updated", listener);
 	},
 	stt: {
 		transcribe: (request: SttTranscribeRequest): Promise<SttTranscribeResponse> => {

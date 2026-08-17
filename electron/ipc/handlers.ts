@@ -44,18 +44,21 @@ import type {
 import {
 	abortChatRun,
 	abortRewindToMessage,
+	beginChatOperationPersistence,
 	commitChatRun,
 	commitRewindToMessage,
 	compactSessionNow,
 	createSession,
 	deleteSession,
+	getChatOperationStatus,
 	getSessionContextUsage,
 	listSessions,
 	prepareRewindToMessage,
 	renameSession,
-	renewChatOperation,
+	resolveChatOperationPersistence,
 	runChat,
 	selectSession,
+	subscribeChatSessionUpdates,
 } from "../ai-edition/chat-service";
 import type { CursorTelemetryReader } from "../ai-edition/deep-agent/service";
 import { DocumentService } from "../ai-edition/document-service";
@@ -4138,7 +4141,10 @@ export function registerIpcHandlers(
 			),
 		commitAiEditionChatRun: commitChatRun,
 		abortAiEditionChatRun: abortChatRun,
-		renewAiEditionChatOperation: renewChatOperation,
+		beginAiEditionChatPersistence: beginChatOperationPersistence,
+		resolveAiEditionChatPersistence: resolveChatOperationPersistence,
+		getAiEditionChatOperationStatus: getChatOperationStatus,
+		subscribeAiEditionChatSessionUpdates: subscribeChatSessionUpdates,
 		undoAiEditionToolBatch: (_projectId, _sessionId) => ({
 			success: false,
 			error: "Per-tool-batch undo retired in favor of per-message rewind.",

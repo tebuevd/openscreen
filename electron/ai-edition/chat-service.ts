@@ -17,8 +17,12 @@ import {
 	documentSchema,
 } from "../../src/lib/ai-edition/schema";
 import type {
+	AiEditionChatCommitResult,
 	AiEditionChatMessage,
+	AiEditionChatOperationStatus,
 	AiEditionChatResult,
+	AiEditionChatRewindCommitResult,
+	AiEditionChatSessionUpdatedEvent,
 	AiEditionToolCallSummary,
 } from "../../src/native/contracts";
 import {
@@ -49,28 +53,39 @@ interface MessageCheckpoint {
 }
 const messageCheckpointsBySession = new Map<string, MessageCheckpoint[]>();
 
-const CHAT_OPERATION_TTL_MS = 5 * 60_000;
-const COMPLETED_CHAT_OPERATION_TTL_MS = 10 * 60_000;
-const MAX_COMPLETED_CHAT_OPERATIONS = 256;
+const RUNNING_OPERATION_TTL_MS = 15 * 60_000;
+const PREPARED_OPERATION_TTL_MS = 5 * 60_000;
+const PERSISTENCE_LOCK_TTL_MS = 10 * 60_000;
+const PERSISTENCE_EVIDENCE_TTL_MS = 30 * 60_000;
+const TERMINAL_OPERATION_TTL_MS = 10 * 60_000;
+const MAX_ACTIVE_OPERATIONS = 128;
+const MAX_LATE_PERSISTENCE_OPERATIONS = 128;
+const MAX_TERMINAL_OPERATIONS = 256;
 
 interface LeasedChatOperation {
 	operationId: string;
+	kind: "chat" | "rewind";
 	projectId: string;
 	sessionId: string;
+	createdAt: number;
 	expiresAt: number;
+	persistenceEvidenceExpiresAt?: number;
 }
 
 interface PendingChatRun extends LeasedChatOperation {
-	state: "running" | "prepared";
+	kind: "chat";
+	state: "running" | "prepared" | "persisting";
 	expectedSessionRevision: number;
 	userMessage: AiEditionChatMessage;
 	assistantMessage: AiEditionChatMessage | null;
 	checkpoint: AxcutDocument | null;
+	requiresPersistence: boolean;
 	retainCommitResult: boolean;
 }
 
 interface PendingRewind extends LeasedChatOperation {
-	state: "prepared";
+	kind: "rewind";
+	state: "prepared" | "persisting";
 	targetMessageId: string;
 	expectedSessionRevision: number;
 	prompt: string;
@@ -78,21 +93,36 @@ interface PendingRewind extends LeasedChatOperation {
 	messages: AiEditionChatMessage[];
 }
 
-type CompletedChatOperation = LeasedChatOperation &
+type PendingOperation = PendingChatRun | PendingRewind;
+
+type CompletedChatOperation = Omit<LeasedChatOperation, "expiresAt"> &
 	(
-		| { state: "committed"; kind: "chat"; result: { success: true } }
+		| {
+				state: "committed";
+				kind: "chat";
+				result: Extract<AiEditionChatCommitResult, { success: true }>;
+		  }
 		| {
 				state: "committed";
 				kind: "rewind";
 				sessionRevision: number;
-				result: { success: true; prompt: string; messages: AiEditionChatMessage[] };
+				result: Extract<AiEditionChatRewindCommitResult, { success: true }>;
 		  }
-	);
+	) & { expiresAt: number };
+
+type AbortedChatOperation = Omit<LeasedChatOperation, "expiresAt"> & {
+	state: "aborted";
+	expiresAt: number;
+};
+
+type TerminalChatOperation = CompletedChatOperation | AbortedChatOperation;
 
 const pendingChatRuns = new Map<string, PendingChatRun>();
 const pendingRewinds = new Map<string, PendingRewind>();
-const completedChatOperations = new Map<string, CompletedChatOperation>();
+const latePersistenceOperations = new Map<string, PendingOperation>();
+const terminalChatOperations = new Map<string, TerminalChatOperation>();
 const operationExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const sessionUpdateListeners = new Set<(event: AiEditionChatSessionUpdatedEvent) => void>();
 
 function sessionKey(projectId: string, sessionId: string): string {
 	return `${projectId}::${sessionId}`;
@@ -112,25 +142,22 @@ function cancelOperationExpiry(operationId: string): void {
 	operationExpiryTimers.delete(operationId);
 }
 
-function deleteOperation<T extends LeasedChatOperation>(
-	map: Map<string, T>,
-	operationId: string,
-	expected?: T,
-): void {
-	if (expected && map.get(operationId) !== expected) return;
-	map.delete(operationId);
+function deleteOperationRecord(operationId: string): void {
+	pendingChatRuns.delete(operationId);
+	pendingRewinds.delete(operationId);
+	latePersistenceOperations.delete(operationId);
+	terminalChatOperations.delete(operationId);
 	cancelOperationExpiry(operationId);
 }
 
-function resetOperationLease<T extends LeasedChatOperation>(
-	map: Map<string, T>,
-	operation: T,
-	ttlMs = CHAT_OPERATION_TTL_MS,
+function scheduleOperationDeadline(
+	operation: LeasedChatOperation,
+	expiresAt: number,
+	onExpire: () => void,
 ): void {
 	cancelOperationExpiry(operation.operationId);
-	operation.expiresAt = Date.now() + ttlMs;
+	operation.expiresAt = expiresAt;
 	const expire = () => {
-		if (map.get(operation.operationId) !== operation) return;
 		const remaining = operation.expiresAt - Date.now();
 		if (remaining > 0) {
 			const timeout = setTimeout(expire, remaining);
@@ -138,45 +165,126 @@ function resetOperationLease<T extends LeasedChatOperation>(
 			operationExpiryTimers.set(operation.operationId, timeout);
 			return;
 		}
-		map.delete(operation.operationId);
 		operationExpiryTimers.delete(operation.operationId);
+		onExpire();
 	};
-	const timeout = setTimeout(expire, ttlMs);
+	const timeout = setTimeout(expire, Math.max(0, expiresAt - Date.now()));
 	timeout.unref?.();
 	operationExpiryTimers.set(operation.operationId, timeout);
 }
 
-function rememberCompletedOperation(operation: CompletedChatOperation): void {
-	completedChatOperations.set(operation.operationId, operation);
-	resetOperationLease(completedChatOperations, operation, COMPLETED_CHAT_OPERATION_TTL_MS);
-	while (completedChatOperations.size > MAX_COMPLETED_CHAT_OPERATIONS) {
-		const oldestOperationId = completedChatOperations.keys().next().value;
+function rememberTerminalOperation(operation: TerminalChatOperation): void {
+	deleteOperationRecord(operation.operationId);
+	terminalChatOperations.set(operation.operationId, operation);
+	scheduleOperationDeadline(operation, Date.now() + TERMINAL_OPERATION_TTL_MS, () => {
+		if (terminalChatOperations.get(operation.operationId) === operation) {
+			deleteOperationRecord(operation.operationId);
+		}
+	});
+	while (terminalChatOperations.size > MAX_TERMINAL_OPERATIONS) {
+		const oldestOperationId = terminalChatOperations.keys().next().value;
 		if (typeof oldestOperationId !== "string") break;
-		deleteOperation(completedChatOperations, oldestOperationId);
+		deleteOperationRecord(oldestOperationId);
+	}
+}
+
+function rememberAbortedOperation(operation: PendingOperation): void {
+	rememberTerminalOperation({
+		operationId: operation.operationId,
+		kind: operation.kind,
+		projectId: operation.projectId,
+		sessionId: operation.sessionId,
+		createdAt: operation.createdAt,
+		state: "aborted",
+		expiresAt: 0,
+		persistenceEvidenceExpiresAt: operation.persistenceEvidenceExpiresAt,
+	});
+}
+
+function activeOperationForId(operationId: string): PendingOperation | null {
+	return pendingChatRuns.get(operationId) ?? pendingRewinds.get(operationId) ?? null;
+}
+
+function operationIsActive(operation: PendingOperation): boolean {
+	return activeOperationForId(operation.operationId) === operation;
+}
+
+function expireLatePersistenceOperation(operation: PendingOperation): void {
+	if (latePersistenceOperations.get(operation.operationId) !== operation) return;
+	latePersistenceOperations.delete(operation.operationId);
+	rememberAbortedOperation(operation);
+}
+
+function enforceLatePersistenceBound(): void {
+	while (latePersistenceOperations.size > MAX_LATE_PERSISTENCE_OPERATIONS) {
+		const oldestOperationId = latePersistenceOperations.keys().next().value;
+		if (typeof oldestOperationId !== "string") break;
+		const operation = latePersistenceOperations.get(oldestOperationId);
+		if (!operation) break;
+		expireLatePersistenceOperation(operation);
+	}
+}
+
+function movePersistenceOperationToLateEvidence(operation: PendingOperation): void {
+	if (!operationIsActive(operation)) return;
+	pendingChatRuns.delete(operation.operationId);
+	pendingRewinds.delete(operation.operationId);
+	cancelOperationExpiry(operation.operationId);
+	latePersistenceOperations.set(operation.operationId, operation);
+	enforceLatePersistenceBound();
+	if (latePersistenceOperations.get(operation.operationId) !== operation) return;
+	const evidenceDeadline = operation.persistenceEvidenceExpiresAt ?? Date.now();
+	scheduleOperationDeadline(operation, evidenceDeadline, () =>
+		expireLatePersistenceOperation(operation),
+	);
+}
+
+function expireActiveOperation(operation: PendingOperation): void {
+	if (!operationIsActive(operation)) return;
+	if (operation.state === "persisting") {
+		movePersistenceOperationToLateEvidence(operation);
+		return;
+	}
+	pendingChatRuns.delete(operation.operationId);
+	pendingRewinds.delete(operation.operationId);
+	rememberAbortedOperation(operation);
+}
+
+function scheduleActivePhase(operation: PendingOperation, ttlMs: number): void {
+	scheduleOperationDeadline(operation, Date.now() + ttlMs, () => expireActiveOperation(operation));
+}
+
+function enforceActiveOperationBound(): void {
+	while (pendingChatRuns.size + pendingRewinds.size > MAX_ACTIVE_OPERATIONS) {
+		const operations = [...pendingChatRuns.values(), ...pendingRewinds.values()];
+		const oldest = operations.reduce((candidate, operation) =>
+			operation.createdAt < candidate.createdAt ? operation : candidate,
+		);
+		expireActiveOperation(oldest);
 	}
 }
 
 function pruneExpiredOperations(): void {
 	const now = Date.now();
-	for (const [operationId, operation] of pendingChatRuns) {
-		if (operation.expiresAt <= now) deleteOperation(pendingChatRuns, operationId, operation);
+	for (const operation of [...pendingChatRuns.values(), ...pendingRewinds.values()]) {
+		if (operation.expiresAt <= now) expireActiveOperation(operation);
 	}
-	for (const [operationId, operation] of pendingRewinds) {
-		if (operation.expiresAt <= now) deleteOperation(pendingRewinds, operationId, operation);
-	}
-	for (const [operationId, operation] of completedChatOperations) {
-		if (operation.expiresAt <= now) {
-			deleteOperation(completedChatOperations, operationId, operation);
+	for (const operation of latePersistenceOperations.values()) {
+		if ((operation.persistenceEvidenceExpiresAt ?? operation.expiresAt) <= now) {
+			expireLatePersistenceOperation(operation);
 		}
+	}
+	for (const operation of terminalChatOperations.values()) {
+		if (operation.expiresAt <= now) deleteOperationRecord(operation.operationId);
 	}
 }
 
 function operationIdIsInUse(operationId: string): boolean {
 	pruneExpiredOperations();
 	return (
-		pendingChatRuns.has(operationId) ||
-		pendingRewinds.has(operationId) ||
-		completedChatOperations.has(operationId)
+		activeOperationForId(operationId) !== null ||
+		latePersistenceOperations.has(operationId) ||
+		terminalChatOperations.has(operationId)
 	);
 }
 
@@ -199,38 +307,189 @@ function cloneMessage(message: AiEditionChatMessage): AiEditionChatMessage {
 	};
 }
 
-function cloneRewindCommitResult(result: {
-	success: true;
-	prompt: string;
-	messages: AiEditionChatMessage[];
-}) {
+function cloneChatCommitResult(
+	result: Extract<AiEditionChatCommitResult, { success: true }>,
+): Extract<AiEditionChatCommitResult, { success: true }> {
 	return {
 		success: true as const,
-		prompt: result.prompt,
 		messages: result.messages.map(cloneMessage),
+		sessionRevision: result.sessionRevision,
 	};
 }
 
-export function renewChatOperation(
+function cloneRewindCommitResult(
+	result: Extract<AiEditionChatRewindCommitResult, { success: true }>,
+): Extract<AiEditionChatRewindCommitResult, { success: true }> {
+	return {
+		success: true,
+		prompt: result.prompt,
+		messages: result.messages.map(cloneMessage),
+		sessionRevision: result.sessionRevision,
+	};
+}
+
+export function subscribeChatSessionUpdates(
+	listener: (event: AiEditionChatSessionUpdatedEvent) => void,
+): () => void {
+	sessionUpdateListeners.add(listener);
+	return () => sessionUpdateListeners.delete(listener);
+}
+
+function emitChatSessionUpdate(event: AiEditionChatSessionUpdatedEvent): void {
+	for (const listener of sessionUpdateListeners) {
+		try {
+			listener(event);
+		} catch {
+			// A dead renderer listener must not turn an already-committed operation into a failed RPC.
+		}
+	}
+}
+
+function ownedOperation(
+	projectId: string,
+	sessionId: string,
+	operationId: string,
+): PendingOperation | null {
+	const operation = activeOperationForId(operationId) ?? latePersistenceOperations.get(operationId);
+	return operation && operationBelongsToSession(operation, projectId, sessionId) ? operation : null;
+}
+
+export function beginChatOperationPersistence(
 	projectId: string,
 	sessionId: string,
 	operationId: string,
 ): { success: true } | { success: false; error: string } {
 	pruneExpiredOperations();
-	const pendingChat = pendingChatRuns.get(operationId);
-	if (pendingChat && operationBelongsToSession(pendingChat, projectId, sessionId)) {
-		resetOperationLease(pendingChatRuns, pendingChat);
-		return { success: true };
+	const terminal = terminalChatOperations.get(operationId);
+	if (terminal && operationBelongsToSession(terminal, projectId, sessionId)) {
+		return {
+			success: false,
+			error:
+				terminal.state === "committed"
+					? "Chat operation is already committed."
+					: "Chat operation is already aborted.",
+		};
 	}
-	const pendingRewind = pendingRewinds.get(operationId);
-	if (pendingRewind && operationBelongsToSession(pendingRewind, projectId, sessionId)) {
-		resetOperationLease(pendingRewinds, pendingRewind);
-		return { success: true };
+	const operation = ownedOperation(projectId, sessionId, operationId);
+	if (!operation) {
+		return { success: false, error: "Chat operation not found, expired, or owned elsewhere." };
 	}
-	return {
-		success: false,
-		error: "Chat operation not found, expired, or owned by another session.",
-	};
+	if (operation.state === "persisting") return { success: true };
+	if (operation.state !== "prepared") {
+		return { success: false, error: "Chat operation is not prepared for persistence." };
+	}
+	operation.state = "persisting";
+	operation.persistenceEvidenceExpiresAt = Date.now() + PERSISTENCE_EVIDENCE_TTL_MS;
+	if (operationIsActive(operation)) {
+		scheduleActivePhase(operation, PERSISTENCE_LOCK_TTL_MS);
+	} else {
+		scheduleOperationDeadline(operation, operation.persistenceEvidenceExpiresAt, () =>
+			expireLatePersistenceOperation(operation),
+		);
+	}
+	return { success: true };
+}
+
+export function resolveChatOperationPersistence(
+	projectId: string,
+	sessionId: string,
+	operationId: string,
+): { success: true } | { success: false; error: string } {
+	pruneExpiredOperations();
+	const terminal = terminalChatOperations.get(operationId);
+	if (terminal && operationBelongsToSession(terminal, projectId, sessionId)) {
+		return terminal.state === "aborted"
+			? { success: true }
+			: { success: false, error: "Committed persistence cannot be aborted." };
+	}
+	const operation = ownedOperation(projectId, sessionId, operationId);
+	if (!operation || operation.state !== "persisting") {
+		return { success: false, error: "Persisting chat operation not found or owned elsewhere." };
+	}
+	rememberAbortedOperation(operation);
+	return { success: true };
+}
+
+export function getChatOperationStatus(
+	projectId: string,
+	sessionId: string,
+	operationId: string,
+): AiEditionChatOperationStatus {
+	pruneExpiredOperations();
+	const terminal = terminalChatOperations.get(operationId);
+	if (terminal && operationBelongsToSession(terminal, projectId, sessionId)) {
+		if (terminal.state === "aborted") {
+			return { state: "aborted", kind: terminal.kind, operationId };
+		}
+		return terminal.kind === "chat"
+			? {
+					state: "committed",
+					kind: "chat",
+					operationId,
+					result: cloneChatCommitResult(terminal.result),
+				}
+			: {
+					state: "committed",
+					kind: "rewind",
+					operationId,
+					result: cloneRewindCommitResult(terminal.result),
+				};
+	}
+	const operation = ownedOperation(projectId, sessionId, operationId);
+	if (!operation) return { state: "unknown", operationId };
+	if (latePersistenceOperations.get(operationId) === operation) {
+		return {
+			state: "late-persistence",
+			kind: operation.kind,
+			operationId,
+			expiresAt: operation.expiresAt,
+		};
+	}
+	if (operation.state === "running") {
+		return { state: "running", kind: operation.kind, operationId };
+	}
+	if (operation.state === "persisting") {
+		return {
+			state: "persisting",
+			kind: operation.kind,
+			operationId,
+			expiresAt: operation.expiresAt,
+		};
+	}
+	return { state: operation.state, kind: operation.kind, operationId };
+}
+
+function addActiveOperation(operation: PendingOperation): void {
+	if (operation.kind === "chat") pendingChatRuns.set(operation.operationId, operation);
+	else pendingRewinds.set(operation.operationId, operation);
+	enforceActiveOperationBound();
+	if (operationIsActive(operation)) {
+		scheduleActivePhase(
+			operation,
+			operation.state === "running" ? RUNNING_OPERATION_TTL_MS : PREPARED_OPERATION_TTL_MS,
+		);
+	}
+}
+
+function sessionHasOtherActiveOperation(
+	projectId: string,
+	sessionId: string,
+	operationId: string,
+): boolean {
+	return [...pendingChatRuns.values(), ...pendingRewinds.values()].some(
+		(operation) =>
+			operation.operationId !== operationId &&
+			operationBelongsToSession(operation, projectId, sessionId),
+	);
+}
+
+function rememberCompletedOperation(operation: CompletedChatOperation): void {
+	rememberTerminalOperation(operation);
+}
+
+function abortPendingOperation(operation: PendingOperation): { success: true } {
+	rememberAbortedOperation(operation);
+	return { success: true };
 }
 
 function checkpointsForSession(projectId: string, sessionId: string): MessageCheckpoint[] {
@@ -555,18 +814,20 @@ export async function runChat(
 	}
 	const pendingRun: PendingChatRun = {
 		operationId: runOperationId,
+		kind: "chat",
 		projectId,
 		sessionId: session.id,
+		createdAt: Date.now(),
 		state: "running",
 		expectedSessionRevision: session.revision,
 		userMessage,
 		assistantMessage: null,
 		checkpoint: documentForCheckpoint,
+		requiresPersistence: false,
 		retainCommitResult: operationId !== undefined,
 		expiresAt: 0,
 	};
-	pendingChatRuns.set(runOperationId, pendingRun);
-	resetOperationLease(pendingChatRuns, pendingRun);
+	addActiveOperation(pendingRun);
 
 	const editsAllowed = config.allowAgentEdits !== false;
 
@@ -621,7 +882,10 @@ export async function runChat(
 			cursor: env.cursor,
 		});
 	} catch (error) {
-		deleteOperation(pendingChatRuns, runOperationId, pendingRun);
+		if (pendingChatRuns.get(runOperationId) === pendingRun) {
+			if (pendingRun.retainCommitResult) abortPendingOperation(pendingRun);
+			else deleteOperationRecord(runOperationId);
+		}
 		throw error;
 	}
 	if (pendingChatRuns.get(runOperationId) !== pendingRun) {
@@ -629,7 +893,10 @@ export async function runChat(
 	}
 
 	if (!result.text) {
-		deleteOperation(pendingChatRuns, runOperationId, pendingRun);
+		if (pendingChatRuns.get(runOperationId) === pendingRun) {
+			if (pendingRun.retainCommitResult) abortPendingOperation(pendingRun);
+			else deleteOperationRecord(runOperationId);
+		}
 		// ponytail: surface the deep-agent's diagnostic so the user can see
 		// *why* the model produced no text (e.g. MiniMax streaming only
 		// thinking blocks, or a non-text content shape that our extractor
@@ -649,8 +916,9 @@ export async function runChat(
 		toolCalls: appliedToolCalls.length ? appliedToolCalls : undefined,
 	};
 	pendingRun.assistantMessage = assistantMessage;
+	pendingRun.requiresPersistence = result.mutated && editsAllowed;
 	pendingRun.state = "prepared";
-	resetOperationLease(pendingChatRuns, pendingRun);
+	scheduleActivePhase(pendingRun, PREPARED_OPERATION_TTL_MS);
 
 	// Direct main-process consumers use immediate commit. The renderer supplies an operation id
 	// and commits only after its launch document has been accepted and persisted.
@@ -677,36 +945,43 @@ export function commitChatRun(
 	projectId: string,
 	sessionId: string,
 	operationId: string,
-): { success: true } | { success: false; error: string } {
+): AiEditionChatCommitResult {
 	pruneExpiredOperations();
-	const completed = completedChatOperations.get(operationId);
-	if (completed) {
-		if (completed.kind === "chat" && operationBelongsToSession(completed, projectId, sessionId)) {
-			return completed.result;
+	const terminal = terminalChatOperations.get(operationId);
+	if (terminal) {
+		if (
+			terminal.state === "committed" &&
+			terminal.kind === "chat" &&
+			operationBelongsToSession(terminal, projectId, sessionId)
+		) {
+			return cloneChatCommitResult(terminal.result);
 		}
 		return {
 			success: false,
 			error: "Chat operation belongs to another session or operation kind.",
 		};
 	}
-	const pending = pendingChatRuns.get(operationId);
+	const operation = ownedOperation(projectId, sessionId, operationId);
+	const pending = operation?.kind === "chat" ? operation : null;
 	if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
 		return { success: false, error: "Chat operation not found or expired." };
 	}
-	if (pending.state !== "prepared" || !pending.assistantMessage) {
+	if (pending.state === "running" || !pending.assistantMessage) {
 		return { success: false, error: "Chat operation is still running." };
+	}
+	if (pending.requiresPersistence && pending.retainCommitResult && pending.state !== "persisting") {
+		return { success: false, error: "Chat operation has not begun document persistence." };
+	}
+	if (
+		latePersistenceOperations.get(operationId) === pending &&
+		sessionHasOtherActiveOperation(projectId, sessionId, operationId)
+	) {
+		return { success: false, error: "Another chat operation currently owns this conversation." };
 	}
 	const session = sessionsByProject.get(projectId)?.get(sessionId);
 	if (!session || session.revision !== pending.expectedSessionRevision) {
-		deleteOperation(pendingChatRuns, operationId, pending);
+		abortPendingOperation(pending);
 		return { success: false, error: "Conversation changed before the chat result committed." };
-	}
-	if (
-		[...pendingRewinds.values()].some((operation) =>
-			operationBelongsToSession(operation, projectId, sessionId),
-		)
-	) {
-		return { success: false, error: "A rewind is pending for this conversation." };
 	}
 
 	if (pending.checkpoint) {
@@ -714,20 +989,35 @@ export function commitChatRun(
 	}
 	session.messages.push(cloneMessage(pending.userMessage), cloneMessage(pending.assistantMessage));
 	session.revision++;
-	const result = { success: true as const };
-	deleteOperation(pendingChatRuns, operationId, pending);
+	const result: Extract<AiEditionChatCommitResult, { success: true }> = {
+		success: true,
+		messages: session.messages.map(cloneMessage),
+		sessionRevision: session.revision,
+	};
 	if (pending.retainCommitResult) {
 		rememberCompletedOperation({
 			operationId,
+			createdAt: pending.createdAt,
 			projectId,
 			sessionId,
 			state: "committed",
 			kind: "chat",
 			result,
 			expiresAt: 0,
+			persistenceEvidenceExpiresAt: pending.persistenceEvidenceExpiresAt,
 		});
+	} else {
+		deleteOperationRecord(operationId);
 	}
-	return result;
+	emitChatSessionUpdate({
+		projectId,
+		sessionId,
+		revision: session.revision,
+		operationId,
+		kind: "chat",
+		messages: result.messages.map(cloneMessage),
+	});
+	return cloneChatCommitResult(result);
 }
 
 export function abortChatRun(
@@ -736,19 +1026,28 @@ export function abortChatRun(
 	operationId: string,
 ): { success: true } | { success: false; error: string } {
 	pruneExpiredOperations();
-	const completed = completedChatOperations.get(operationId);
-	if (completed) {
-		if (operationBelongsToSession(completed, projectId, sessionId)) {
-			return { success: false, error: "Chat operation is already committed." };
+	const terminal = terminalChatOperations.get(operationId);
+	if (terminal) {
+		if (operationBelongsToSession(terminal, projectId, sessionId)) {
+			return {
+				success: false,
+				error:
+					terminal.state === "committed"
+						? "Chat operation is already committed."
+						: "Chat operation is already aborted.",
+			};
 		}
 		return { success: false, error: "Chat operation belongs to another session." };
 	}
-	const pending = pendingChatRuns.get(operationId);
+	const operation = ownedOperation(projectId, sessionId, operationId);
+	const pending = operation?.kind === "chat" ? operation : null;
 	if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
 		return { success: false, error: "Chat operation not found or expired." };
 	}
-	deleteOperation(pendingChatRuns, operationId, pending);
-	return { success: true };
+	if (pending.state === "persisting") {
+		return { success: false, error: "Persisting chat operation requires reconciliation." };
+	}
+	return abortPendingOperation(pending);
 }
 
 // Preparation is non-destructive. It locks this session revision until the renderer has
@@ -799,8 +1098,10 @@ export function prepareRewindToMessage(
 	while (operationIdIsInUse(operationId)) operationId = `chat_rewind_${randomUUID()}`;
 	const prepared: PendingRewind = {
 		operationId,
+		kind: "rewind",
 		projectId,
 		sessionId,
+		createdAt: Date.now(),
 		state: "prepared",
 		targetMessageId: messageId,
 		expectedSessionRevision: session.revision,
@@ -809,8 +1110,7 @@ export function prepareRewindToMessage(
 		messages: session.messages.slice(0, messageIndex + 1).map(cloneMessage),
 		expiresAt: 0,
 	};
-	pendingRewinds.set(operationId, prepared);
-	resetOperationLease(pendingRewinds, prepared);
+	addActiveOperation(prepared);
 
 	return {
 		success: true,
@@ -827,31 +1127,40 @@ export function commitRewindToMessage(
 	sessionId: string,
 	operationId: string,
 	sessionRevision: number,
-):
-	| { success: true; prompt: string; messages: AiEditionChatMessage[] }
-	| { success: false; error: string } {
+): AiEditionChatRewindCommitResult {
 	pruneExpiredOperations();
-	const completed = completedChatOperations.get(operationId);
-	if (completed) {
+	const terminal = terminalChatOperations.get(operationId);
+	if (terminal) {
 		if (
-			completed.kind === "rewind" &&
-			completed.sessionRevision === sessionRevision &&
-			operationBelongsToSession(completed, projectId, sessionId)
+			terminal.state === "committed" &&
+			terminal.kind === "rewind" &&
+			terminal.sessionRevision === sessionRevision &&
+			operationBelongsToSession(terminal, projectId, sessionId)
 		) {
-			return cloneRewindCommitResult(completed.result);
+			return cloneRewindCommitResult(terminal.result);
 		}
 		return { success: false, error: "Rewind operation identity does not match its commit." };
 	}
-	const prepared = pendingRewinds.get(operationId);
+	const operation = ownedOperation(projectId, sessionId, operationId);
+	const prepared = operation?.kind === "rewind" ? operation : null;
 	if (!prepared || !operationBelongsToSession(prepared, projectId, sessionId)) {
 		return { success: false, error: "Rewind operation not found or expired." };
+	}
+	if (prepared.state !== "persisting") {
+		return { success: false, error: "Rewind operation has not begun document persistence." };
 	}
 	if (sessionRevision !== prepared.expectedSessionRevision) {
 		return { success: false, error: "Rewind session revision does not match its preparation." };
 	}
+	if (
+		latePersistenceOperations.get(operationId) === prepared &&
+		sessionHasOtherActiveOperation(projectId, sessionId, operationId)
+	) {
+		return { success: false, error: "Another chat operation currently owns this conversation." };
+	}
 	const session = sessionsByProject.get(projectId)?.get(sessionId);
 	if (!session || session.revision !== prepared.expectedSessionRevision) {
-		deleteOperation(pendingRewinds, operationId, prepared);
+		abortPendingOperation(prepared);
 		return { success: false, error: "Conversation changed before rewind commit." };
 	}
 	const target = session.messages.find((message) => message.id === prepared.targetMessageId);
@@ -859,7 +1168,7 @@ export function commitRewindToMessage(
 		!target?.checkpointId ||
 		!findCheckpointForMessage(projectId, sessionId, target.checkpointId)
 	) {
-		deleteOperation(pendingRewinds, operationId, prepared);
+		abortPendingOperation(prepared);
 		return { success: false, error: "Rewind checkpoint is no longer available." };
 	}
 
@@ -869,14 +1178,15 @@ export function commitRewindToMessage(
 	}
 	dropCheckpointsFrom(projectId, sessionId, target.checkpointId);
 	session.revision++;
-	const result = {
+	const result: Extract<AiEditionChatRewindCommitResult, { success: true }> = {
 		success: true,
 		prompt: prepared.prompt,
 		messages: session.messages.map(cloneMessage),
-	} as const;
-	deleteOperation(pendingRewinds, operationId, prepared);
+		sessionRevision: session.revision,
+	};
 	rememberCompletedOperation({
 		operationId,
+		createdAt: prepared.createdAt,
 		projectId,
 		sessionId,
 		state: "committed",
@@ -884,8 +1194,18 @@ export function commitRewindToMessage(
 		sessionRevision,
 		result: cloneRewindCommitResult(result),
 		expiresAt: 0,
+		persistenceEvidenceExpiresAt: prepared.persistenceEvidenceExpiresAt,
 	});
-	return result;
+	emitChatSessionUpdate({
+		projectId,
+		sessionId,
+		revision: session.revision,
+		operationId,
+		kind: "rewind",
+		messages: result.messages.map(cloneMessage),
+		prompt: result.prompt,
+	});
+	return cloneRewindCommitResult(result);
 }
 
 export function abortRewindToMessage(
@@ -894,19 +1214,28 @@ export function abortRewindToMessage(
 	operationId: string,
 ): { success: true } | { success: false; error: string } {
 	pruneExpiredOperations();
-	const completed = completedChatOperations.get(operationId);
-	if (completed) {
-		if (operationBelongsToSession(completed, projectId, sessionId)) {
-			return { success: false, error: "Rewind operation is already committed." };
+	const terminal = terminalChatOperations.get(operationId);
+	if (terminal) {
+		if (operationBelongsToSession(terminal, projectId, sessionId)) {
+			return {
+				success: false,
+				error:
+					terminal.state === "committed"
+						? "Rewind operation is already committed."
+						: "Rewind operation is already aborted.",
+			};
 		}
 		return { success: false, error: "Rewind operation belongs to another session." };
 	}
-	const prepared = pendingRewinds.get(operationId);
+	const operation = ownedOperation(projectId, sessionId, operationId);
+	const prepared = operation?.kind === "rewind" ? operation : null;
 	if (!prepared || !operationBelongsToSession(prepared, projectId, sessionId)) {
 		return { success: false, error: "Rewind operation not found or expired." };
 	}
-	deleteOperation(pendingRewinds, operationId, prepared);
-	return { success: true };
+	if (prepared.state === "persisting") {
+		return { success: false, error: "Persisting rewind requires reconciliation." };
+	}
+	return abortPendingOperation(prepared);
 }
 
 // ponytail: renderer-initiated timeline operation. Reads the doc from disk,

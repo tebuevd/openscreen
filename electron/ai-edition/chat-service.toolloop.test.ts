@@ -18,14 +18,17 @@ vi.mock("./deep-agent/service", () => ({
 import {
 	abortChatRun,
 	abortRewindToMessage,
+	beginChatOperationPersistence,
 	commitChatRun,
 	commitRewindToMessage,
 	createSession,
 	deleteSession,
+	getChatOperationStatus,
 	prepareRewindToMessage,
 	renameSession,
-	renewChatOperation,
+	resolveChatOperationPersistence,
 	runChat,
+	subscribeChatSessionUpdates,
 } from "./chat-service";
 import { invokeOpenScreenAgent } from "./deep-agent/service";
 import type { LlmConfigStore } from "./llm-config-store";
@@ -34,10 +37,12 @@ const invokeMock = vi.mocked(invokeOpenScreenAgent);
 
 function deferred<T>() {
 	let resolve!: (value: T) => void;
-	const promise = new Promise<T>((next) => {
+	let reject!: (reason?: unknown) => void;
+	const promise = new Promise<T>((next, fail) => {
 		resolve = next;
+		reject = fail;
 	});
-	return { promise, resolve };
+	return { promise, resolve, reject };
 }
 
 function fixtureDocument(): AxcutDocument {
@@ -194,12 +199,19 @@ describe("runChat tool loop", () => {
 			"run_commit",
 		);
 		expect(selectSession("proj_staged_chat", session.id)?.messages).toEqual([]);
-		expect(commitChatRun("proj_staged_chat", session.id, "run_commit")).toEqual({
+		const committedRun = commitChatRun("proj_staged_chat", session.id, "run_commit");
+		expect(committedRun).toMatchObject({
 			success: true,
+			sessionRevision: 1,
 		});
 		expect(selectSession("proj_staged_chat", session.id)?.messages).toHaveLength(2);
-		expect(commitChatRun("proj_staged_chat", session.id, "run_commit")).toEqual({
-			success: true,
+		expect(commitChatRun("proj_staged_chat", session.id, "run_commit")).toEqual(committedRun);
+		expect(
+			beginChatOperationPersistence("proj_staged_chat", session.id, "run_commit").success,
+		).toBe(false);
+		expect(getChatOperationStatus("proj_staged_chat", session.id, "run_commit")).toMatchObject({
+			state: "committed",
+			result: committedRun,
 		});
 	});
 
@@ -262,6 +274,9 @@ describe("runChat tool loop", () => {
 		expect(
 			(await import("./chat-service")).selectSession("proj_rewind", session.id)?.messages,
 		).toHaveLength(2);
+		expect(beginChatOperationPersistence("proj_rewind", session.id, prepared.operationId)).toEqual({
+			success: true,
+		});
 
 		const committed = commitRewindToMessage(
 			"proj_rewind",
@@ -294,97 +309,263 @@ describe("runChat tool loop", () => {
 		).toEqual(committed);
 	});
 
-	it("keeps owner-renewed running and prepared operations alive beyond five minutes", async () => {
+	it("keeps persistence valid while renderer timers are suspended beyond five minutes", async () => {
 		vi.useFakeTimers();
-		const agent = deferred<{ text: string; document: AxcutDocument; mutated: boolean }>();
-		invokeMock.mockReturnValueOnce(agent.promise);
-		const session = createSession("proj_long_lease");
-		const running = runChat(
-			"proj_long_lease",
-			session.id,
-			"long edit",
-			stubConfig(),
-			fixtureDocument(),
-			{},
-			{},
-			"run_long_lease",
-		);
-
-		await vi.advanceTimersByTimeAsync(4 * 60_000);
-		expect(renewChatOperation("proj_long_lease", session.id, "run_long_lease")).toEqual({
-			success: true,
-		});
-		await vi.advanceTimersByTimeAsync(2 * 60_000);
-		agent.resolve({ text: "done", document: fixtureDocument(), mutated: false });
-		await expect(running).resolves.toMatchObject({ success: true });
-
-		await vi.advanceTimersByTimeAsync(4 * 60_000);
-		expect(renewChatOperation("proj_long_lease", session.id, "run_long_lease")).toEqual({
-			success: true,
-		});
-		await vi.advanceTimersByTimeAsync(2 * 60_000);
-		expect(commitChatRun("proj_long_lease", session.id, "run_long_lease")).toEqual({
-			success: true,
-		});
-	});
-
-	it("expires an abandoned running operation when its owner stops renewing", async () => {
-		vi.useFakeTimers();
-		const agent = deferred<{ text: string; document: AxcutDocument; mutated: boolean }>();
-		invokeMock.mockReturnValueOnce(agent.promise);
-		const session = createSession("proj_abandoned_lease");
-		const running = runChat(
-			"proj_abandoned_lease",
-			session.id,
-			"abandoned edit",
-			stubConfig(),
-			fixtureDocument(),
-			{},
-			{},
-			"run_abandoned_lease",
-		);
-
-		expect(
-			renewChatOperation("proj_abandoned_lease", "foreign_session", "run_abandoned_lease").success,
-		).toBe(false);
-		await vi.advanceTimersByTimeAsync(5 * 60_000);
-		agent.resolve({ text: "late", document: fixtureDocument(), mutated: false });
-		await expect(running).resolves.toMatchObject({
-			success: false,
-			error: "Chat run was abandoned.",
-		});
-	});
-
-	it("expires an abandoned prepared operation and releases its session lock", async () => {
-		vi.useFakeTimers();
-		const projectId = "proj_abandoned_prepared";
+		invokeMock.mockImplementationOnce(async (args) => ({
+			text: "done",
+			document: args.document,
+			mutated: true,
+		}));
+		const projectId = "proj_suspended_persistence";
 		const session = createSession(projectId);
 		await runChat(
 			projectId,
 			session.id,
-			"prepared edit",
+			"long save",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"run_suspended_persistence",
+		);
+		expect(
+			getChatOperationStatus(projectId, session.id, "run_suspended_persistence"),
+		).toMatchObject({
+			state: "prepared",
+		});
+		expect(
+			beginChatOperationPersistence(projectId, session.id, "run_suspended_persistence"),
+		).toEqual({
+			success: true,
+		});
+
+		await vi.advanceTimersByTimeAsync(6 * 60_000);
+		expect(
+			getChatOperationStatus(projectId, session.id, "run_suspended_persistence"),
+		).toMatchObject({
+			state: "persisting",
+		});
+		expect(commitChatRun(projectId, session.id, "run_suspended_persistence")).toMatchObject({
+			success: true,
+		});
+	});
+
+	it("retains bounded late-persistence evidence after the session lock deadline", async () => {
+		vi.useFakeTimers();
+		invokeMock.mockImplementationOnce(async (args) => ({
+			text: "done",
+			document: args.document,
+			mutated: true,
+		}));
+		const projectId = "proj_late_persistence";
+		const session = createSession(projectId);
+		await runChat(
+			projectId,
+			session.id,
+			"late save",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"run_late_persistence",
+		);
+		beginChatOperationPersistence(projectId, session.id, "run_late_persistence");
+
+		await vi.advanceTimersByTimeAsync(11 * 60_000);
+		expect(getChatOperationStatus(projectId, session.id, "run_late_persistence")).toMatchObject({
+			state: "late-persistence",
+		});
+		expect(commitChatRun(projectId, session.id, "run_late_persistence")).toMatchObject({
+			success: true,
+		});
+	});
+
+	it("resolves confirmed failed persistence and releases the session lock", async () => {
+		invokeMock.mockImplementationOnce(async (args) => ({
+			text: "done",
+			document: args.document,
+			mutated: true,
+		}));
+		const projectId = "proj_failed_persistence";
+		const session = createSession(projectId);
+		await runChat(
+			projectId,
+			session.id,
+			"failed save",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"run_failed_persistence",
+		);
+		expect(beginChatOperationPersistence(projectId, session.id, "run_failed_persistence")).toEqual({
+			success: true,
+		});
+		expect(
+			resolveChatOperationPersistence(projectId, "foreign_session", "run_failed_persistence")
+				.success,
+		).toBe(false);
+		expect(
+			resolveChatOperationPersistence(projectId, session.id, "run_failed_persistence"),
+		).toEqual({
+			success: true,
+		});
+		expect(getChatOperationStatus(projectId, session.id, "run_failed_persistence")).toMatchObject({
+			state: "aborted",
+		});
+		await expect(
+			runChat(
+				projectId,
+				session.id,
+				"replacement",
+				stubConfig(),
+				fixtureDocument(),
+				{},
+				{},
+				"replacement_after_failed_save",
+			),
+		).resolves.toMatchObject({ success: true });
+		expect(abortChatRun(projectId, session.id, "replacement_after_failed_save")).toEqual({
+			success: true,
+		});
+	});
+
+	it("bounds a permanently pending save and eventually releases its lock and evidence", async () => {
+		vi.useFakeTimers();
+		invokeMock.mockImplementationOnce(async (args) => ({
+			text: "done",
+			document: args.document,
+			mutated: true,
+		}));
+		const projectId = "proj_hung_persistence";
+		const session = createSession(projectId);
+		await runChat(
+			projectId,
+			session.id,
+			"hung save",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"run_hung_persistence",
+		);
+		beginChatOperationPersistence(projectId, session.id, "run_hung_persistence");
+
+		await vi.advanceTimersByTimeAsync(10 * 60_000);
+		await expect(
+			runChat(
+				projectId,
+				session.id,
+				"replacement",
+				stubConfig(),
+				fixtureDocument(),
+				{},
+				{},
+				"replacement_after_hung_save",
+			),
+		).resolves.toMatchObject({ success: true });
+		expect(abortChatRun(projectId, session.id, "replacement_after_hung_save")).toEqual({
+			success: true,
+		});
+		expect(getChatOperationStatus(projectId, session.id, "run_hung_persistence")).toMatchObject({
+			state: "late-persistence",
+		});
+
+		await vi.advanceTimersByTimeAsync(20 * 60_000);
+		expect(getChatOperationStatus(projectId, session.id, "run_hung_persistence")).toMatchObject({
+			state: "aborted",
+		});
+		await vi.advanceTimersByTimeAsync(10 * 60_000);
+		expect(getChatOperationStatus(projectId, session.id, "run_hung_persistence")).toEqual({
+			state: "unknown",
+			operationId: "run_hung_persistence",
+		});
+	});
+
+	it("expires abandoned running and prepared operations without renderer renewal", async () => {
+		vi.useFakeTimers();
+		const agent = deferred<{ text: string; document: AxcutDocument; mutated: boolean }>();
+		invokeMock.mockReturnValueOnce(agent.promise);
+		const runningSession = createSession("proj_abandoned_running");
+		const running = runChat(
+			"proj_abandoned_running",
+			runningSession.id,
+			"abandoned",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"run_abandoned_running",
+		);
+		await vi.advanceTimersByTimeAsync(15 * 60_000);
+		agent.resolve({ text: "late", document: fixtureDocument(), mutated: false });
+		await expect(running).resolves.toMatchObject({ success: false });
+
+		const preparedSession = createSession("proj_abandoned_prepared");
+		await runChat(
+			"proj_abandoned_prepared",
+			preparedSession.id,
+			"prepared",
 			stubConfig(),
 			fixtureDocument(),
 			{},
 			{},
 			"run_abandoned_prepared",
 		);
-
 		await vi.advanceTimersByTimeAsync(5 * 60_000);
-		expect(commitChatRun(projectId, session.id, "run_abandoned_prepared").success).toBe(false);
-		await expect(
-			runChat(
-				projectId,
-				session.id,
-				"replacement edit",
-				stubConfig(),
-				fixtureDocument(),
-				{},
-				{},
-				"run_after_expiry",
+		expect(
+			getChatOperationStatus(
+				"proj_abandoned_prepared",
+				preparedSession.id,
+				"run_abandoned_prepared",
 			),
-		).resolves.toMatchObject({ success: true });
-		expect(abortChatRun(projectId, session.id, "run_after_expiry")).toEqual({ success: true });
+		).toMatchObject({ state: "aborted" });
+	});
+
+	it("does not let a late failed run consume a newer reuse of its expired id", async () => {
+		vi.useFakeTimers();
+		const abandoned = deferred<{ text: string; document: AxcutDocument; mutated: boolean }>();
+		const replacement = deferred<{ text: string; document: AxcutDocument; mutated: boolean }>();
+		invokeMock.mockReturnValueOnce(abandoned.promise).mockReturnValueOnce(replacement.promise);
+		const projectId = "proj_reused_operation_id";
+		const session = createSession(projectId);
+		const abandonedRun = runChat(
+			projectId,
+			session.id,
+			"abandoned",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"reused_operation_id",
+		);
+		await vi.advanceTimersByTimeAsync(25 * 60_000);
+		expect(getChatOperationStatus(projectId, session.id, "reused_operation_id")).toEqual({
+			state: "unknown",
+			operationId: "reused_operation_id",
+		});
+
+		const replacementRun = runChat(
+			projectId,
+			session.id,
+			"replacement",
+			stubConfig(),
+			fixtureDocument(),
+			{},
+			{},
+			"reused_operation_id",
+		);
+		abandoned.reject(new Error("late provider failure"));
+		await expect(abandonedRun).rejects.toThrow("late provider failure");
+		expect(getChatOperationStatus(projectId, session.id, "reused_operation_id")).toMatchObject({
+			state: "running",
+		});
+
+		replacement.resolve({ text: "replacement done", document: fixtureDocument(), mutated: false });
+		await expect(replacementRun).resolves.toMatchObject({ success: true });
+		expect(commitChatRun(projectId, session.id, "reused_operation_id")).toMatchObject({
+			success: true,
+		});
 	});
 
 	it("does not let foreign commit or abort calls consume pending or completed operations", async () => {
@@ -405,24 +586,28 @@ describe("runChat tool loop", () => {
 		).toBe(false);
 		expect(renameSession("proj_foreign_operation", session.id, "Blocked rename")).toBeNull();
 		expect(deleteSession("proj_foreign_operation", session.id)).toBe(false);
-		expect(commitChatRun("proj_foreign_operation", session.id, "run_foreign_operation")).toEqual({
-			success: true,
-		});
+		const committed = commitChatRun("proj_foreign_operation", session.id, "run_foreign_operation");
+		expect(committed).toMatchObject({ success: true });
 		expect(
 			commitChatRun("proj_foreign_operation", "foreign_session", "run_foreign_operation").success,
 		).toBe(false);
 		expect(
 			abortChatRun("proj_foreign_operation", "foreign_session", "run_foreign_operation").success,
 		).toBe(false);
-		expect(commitChatRun("proj_foreign_operation", session.id, "run_foreign_operation")).toEqual({
-			success: true,
-		});
+		expect(commitChatRun("proj_foreign_operation", session.id, "run_foreign_operation")).toEqual(
+			committed,
+		);
+		expect(
+			getChatOperationStatus("proj_foreign_operation", "foreign_session", "run_foreign_operation"),
+		).toEqual({ state: "unknown", operationId: "run_foreign_operation" });
 		expect(
 			abortChatRun("proj_foreign_operation", session.id, "run_foreign_operation").success,
 		).toBe(false);
 	});
 
-	it("bounds completed tombstones and expires retained commit results", async () => {
+	it("bounds completed tombstones, expires status, and emits one canonical update", async () => {
+		const updates: unknown[] = [];
+		const unsubscribe = subscribeChatSessionUpdates((update) => updates.push(update));
 		const projectId = "proj_tombstone_bound";
 		const session = createSession(projectId);
 		for (let index = 0; index <= 256; index++) {
@@ -441,6 +626,10 @@ describe("runChat tool loop", () => {
 		}
 		expect(commitChatRun(projectId, session.id, "bounded_run_0").success).toBe(false);
 		expect(commitChatRun(projectId, session.id, "bounded_run_256").success).toBe(true);
+		expect(updates).toHaveLength(257);
+		commitChatRun(projectId, session.id, "bounded_run_256");
+		expect(updates).toHaveLength(257);
+		unsubscribe();
 
 		vi.useFakeTimers();
 		const expiringSession = createSession("proj_tombstone_expiry");
@@ -459,8 +648,8 @@ describe("runChat tool loop", () => {
 		).toBe(true);
 		await vi.advanceTimersByTimeAsync(10 * 60_000);
 		expect(
-			commitChatRun("proj_tombstone_expiry", expiringSession.id, "expiring_tombstone").success,
-		).toBe(false);
+			getChatOperationStatus("proj_tombstone_expiry", expiringSession.id, "expiring_tombstone"),
+		).toEqual({ state: "unknown", operationId: "expiring_tombstone" });
 	});
 
 	it("prepareRewindToMessage refuses when the target has no checkpoint", async () => {
@@ -529,6 +718,9 @@ describe("runChat tool loop", () => {
 		);
 		expect(prepared.success).toBe(true);
 		if (!prepared.success) return;
+		expect(
+			beginChatOperationPersistence("proj_rewind_revision", session.id, prepared.operationId),
+		).toEqual({ success: true });
 
 		const commit = commitRewindToMessage(
 			"proj_rewind_revision",
@@ -538,9 +730,9 @@ describe("runChat tool loop", () => {
 		);
 		expect(commit.success).toBe(false);
 		expect(selectSession("proj_rewind_revision", session.id)?.messages).toEqual(before.messages);
-		expect(abortRewindToMessage("proj_rewind_revision", session.id, prepared.operationId)).toEqual({
-			success: true,
-		});
+		expect(
+			resolveChatOperationPersistence("proj_rewind_revision", session.id, prepared.operationId),
+		).toEqual({ success: true });
 	});
 
 	it("runs text-only when no document snapshot is provided", async () => {

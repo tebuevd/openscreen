@@ -53,10 +53,15 @@ describe("browser chat operation shim", () => {
 				"run-overlap",
 			),
 		).toMatchObject({ success: false });
-		await nativeBridgeClient.aiEdition.chatCommitRun("project", session.id, "run-commit");
+		const committed = await nativeBridgeClient.aiEdition.chatCommitRun(
+			"project",
+			session.id,
+			"run-commit",
+		);
+		expect(committed).toMatchObject({ success: true, sessionRevision: 1 });
 		expect(
 			await nativeBridgeClient.aiEdition.chatCommitRun("project", session.id, "run-commit"),
-		).toEqual({ success: true });
+		).toEqual(committed);
 		expect(
 			(await nativeBridgeClient.aiEdition.chatSelectSession("project", session.id))?.messages,
 		).toHaveLength(2);
@@ -73,20 +78,70 @@ describe("browser chat operation shim", () => {
 		);
 
 		expect(
+			await nativeBridgeClient.aiEdition.chatOperationStatus("foreign", session.id, "owned-run"),
+		).toEqual({ state: "unknown", operationId: "owned-run" });
+		expect(
+			await nativeBridgeClient.aiEdition.chatBeginPersistence(
+				"project",
+				"foreign-session",
+				"owned-run",
+			),
+		).toMatchObject({ success: false });
+		expect(
 			await nativeBridgeClient.aiEdition.chatCommitRun("foreign", session.id, "owned-run"),
 		).toMatchObject({ success: false });
 		expect(
 			await nativeBridgeClient.aiEdition.chatAbortRun("project", "foreign", "owned-run"),
 		).toMatchObject({ success: false });
-		expect(
-			await nativeBridgeClient.aiEdition.chatCommitRun("project", session.id, "owned-run"),
-		).toEqual({ success: true });
+		const committed = await nativeBridgeClient.aiEdition.chatCommitRun(
+			"project",
+			session.id,
+			"owned-run",
+		);
+		expect(committed).toMatchObject({ success: true });
 		expect(
 			await nativeBridgeClient.aiEdition.chatAbortRun("foreign", session.id, "owned-run"),
 		).toMatchObject({ success: false });
 		expect(
 			await nativeBridgeClient.aiEdition.chatCommitRun("project", session.id, "owned-run"),
+		).toEqual(committed);
+	});
+
+	it("resolves confirmed failed persistence without consuming another owner", async () => {
+		const session = await nativeBridgeClient.aiEdition.chatCreateSession("project");
+		await nativeBridgeClient.aiEdition.chatRun(
+			"project",
+			session.id,
+			"failed persistence",
+			undefined,
+			"failed-persistence-run",
+		);
+		await nativeBridgeClient.aiEdition.chatBeginPersistence(
+			"project",
+			session.id,
+			"failed-persistence-run",
+		);
+		expect(
+			await nativeBridgeClient.aiEdition.chatResolvePersistence(
+				"foreign",
+				session.id,
+				"failed-persistence-run",
+			),
+		).toMatchObject({ success: false });
+		expect(
+			await nativeBridgeClient.aiEdition.chatResolvePersistence(
+				"project",
+				session.id,
+				"failed-persistence-run",
+			),
 		).toEqual({ success: true });
+		expect(
+			await nativeBridgeClient.aiEdition.chatOperationStatus(
+				"project",
+				session.id,
+				"failed-persistence-run",
+			),
+		).toMatchObject({ state: "aborted" });
 	});
 
 	it("rejects rename and delete while their session has a prepared run", async () => {
@@ -111,14 +166,18 @@ describe("browser chat operation shim", () => {
 				session.id,
 				"pending-mutation-run",
 			),
-		).toEqual({ success: true });
+		).toMatchObject({ success: true });
 		expect(
 			await nativeBridgeClient.aiEdition.chatRenameSession("project", session.id, "Renamed"),
 		).toMatchObject({ title: "Renamed" });
 	});
 
-	it("renews active runs and expires abandoned runs and completed tombstones", async () => {
+	it("transitions persistence without heartbeats and emits one canonical update", async () => {
 		vi.useFakeTimers();
+		const updates: unknown[] = [];
+		const unsubscribe = window.electronAPI.onAiEditionChatSessionUpdated((event) =>
+			updates.push(event),
+		);
 		const session = await nativeBridgeClient.aiEdition.chatCreateSession("project");
 		await nativeBridgeClient.aiEdition.chatRun(
 			"project",
@@ -127,19 +186,72 @@ describe("browser chat operation shim", () => {
 			undefined,
 			"renewed-run",
 		);
-		await vi.advanceTimersByTimeAsync(4 * 60_000);
 		expect(
-			await nativeBridgeClient.aiEdition.chatRenewOperation("project", session.id, "renewed-run"),
+			await nativeBridgeClient.aiEdition.chatOperationStatus("project", session.id, "renewed-run"),
+		).toMatchObject({ state: "prepared" });
+		expect(
+			await nativeBridgeClient.aiEdition.chatBeginPersistence("project", session.id, "renewed-run"),
 		).toEqual({ success: true });
-		await vi.advanceTimersByTimeAsync(2 * 60_000);
+		await vi.advanceTimersByTimeAsync(6 * 60_000);
+		expect(
+			await nativeBridgeClient.aiEdition.chatOperationStatus("project", session.id, "renewed-run"),
+		).toMatchObject({ state: "persisting" });
+		const committed = await nativeBridgeClient.aiEdition.chatCommitRun(
+			"project",
+			session.id,
+			"renewed-run",
+		);
+		expect(committed).toMatchObject({ success: true, sessionRevision: 1 });
 		expect(
 			await nativeBridgeClient.aiEdition.chatCommitRun("project", session.id, "renewed-run"),
-		).toEqual({ success: true });
+		).toEqual(committed);
+		expect(updates).toHaveLength(1);
 		await vi.advanceTimersByTimeAsync(10 * 60_000);
 		expect(
-			await nativeBridgeClient.aiEdition.chatCommitRun("project", session.id, "renewed-run"),
-		).toMatchObject({ success: false });
+			await nativeBridgeClient.aiEdition.chatOperationStatus("project", session.id, "renewed-run"),
+		).toEqual({ state: "unknown", operationId: "renewed-run" });
+		unsubscribe();
+	});
 
+	it("releases a hung persistence lock while retaining bounded late evidence", async () => {
+		vi.useFakeTimers();
+		const session = await nativeBridgeClient.aiEdition.chatCreateSession("project");
+		await nativeBridgeClient.aiEdition.chatRun(
+			"project",
+			session.id,
+			"hung",
+			undefined,
+			"hung-run",
+		);
+		await nativeBridgeClient.aiEdition.chatBeginPersistence("project", session.id, "hung-run");
+		await vi.advanceTimersByTimeAsync(10 * 60_000);
+
+		await expect(
+			nativeBridgeClient.aiEdition.chatRun(
+				"project",
+				session.id,
+				"replacement",
+				undefined,
+				"replacement-run",
+			),
+		).resolves.toMatchObject({ success: true });
+		expect(
+			await nativeBridgeClient.aiEdition.chatOperationStatus("project", session.id, "hung-run"),
+		).toMatchObject({ state: "late-persistence" });
+		await nativeBridgeClient.aiEdition.chatAbortRun("project", session.id, "replacement-run");
+		await vi.advanceTimersByTimeAsync(20 * 60_000);
+		expect(
+			await nativeBridgeClient.aiEdition.chatOperationStatus("project", session.id, "hung-run"),
+		).toMatchObject({ state: "aborted" });
+		await vi.advanceTimersByTimeAsync(10 * 60_000);
+		expect(
+			await nativeBridgeClient.aiEdition.chatOperationStatus("project", session.id, "hung-run"),
+		).toEqual({ state: "unknown", operationId: "hung-run" });
+	});
+
+	it("expires an abandoned prepared operation without renderer renewal", async () => {
+		vi.useFakeTimers();
+		const session = await nativeBridgeClient.aiEdition.chatCreateSession("project");
 		await nativeBridgeClient.aiEdition.chatRun(
 			"project",
 			session.id,
@@ -149,8 +261,57 @@ describe("browser chat operation shim", () => {
 		);
 		await vi.advanceTimersByTimeAsync(5 * 60_000);
 		expect(
-			await nativeBridgeClient.aiEdition.chatCommitRun("project", session.id, "abandoned-run"),
-		).toMatchObject({ success: false });
+			await nativeBridgeClient.aiEdition.chatOperationStatus(
+				"project",
+				session.id,
+				"abandoned-run",
+			),
+		).toMatchObject({ state: "aborted" });
+		await vi.advanceTimersByTimeAsync(10 * 60_000);
+		expect(
+			await nativeBridgeClient.aiEdition.chatOperationStatus(
+				"project",
+				session.id,
+				"abandoned-run",
+			),
+		).toEqual({ state: "unknown", operationId: "abandoned-run" });
+	});
+
+	it("recovers committed evidence when the browser renderer is reinstalled", async () => {
+		const session = await nativeBridgeClient.aiEdition.chatCreateSession("restart-project");
+		await nativeBridgeClient.aiEdition.chatRun(
+			"restart-project",
+			session.id,
+			"survive renderer restart",
+			undefined,
+			"restart-run",
+		);
+		const committed = await nativeBridgeClient.aiEdition.chatCommitRun(
+			"restart-project",
+			session.id,
+			"restart-run",
+		);
+		expect(committed).toMatchObject({ success: true });
+
+		// Recreate the shim as a renderer reload would, while localStorage stands in for main ownership.
+		// biome-ignore lint/suspicious/noExplicitAny: test-only browser bridge restart
+		delete (window as any).electronAPI;
+		installBrowserShims();
+
+		expect(
+			await nativeBridgeClient.aiEdition.chatOperationStatus(
+				"restart-project",
+				session.id,
+				"restart-run",
+			),
+		).toMatchObject({ state: "committed", result: committed });
+		expect(
+			await nativeBridgeClient.aiEdition.chatCommitRun(
+				"restart-project",
+				session.id,
+				"restart-run",
+			),
+		).toEqual(committed);
 	});
 
 	it("bounds browser commit tombstones without evicting the newest replay result", async () => {
@@ -180,7 +341,7 @@ describe("browser chat operation shim", () => {
 				session.id,
 				"browser-bounded-256",
 			),
-		).toEqual({ success: true });
+		).toMatchObject({ success: true });
 	});
 
 	it("exposes non-destructive rewind protocol failures when checkpoints are unavailable", async () => {

@@ -21,7 +21,11 @@ export interface DocumentOperationToken {
 }
 
 export type DocumentResultApplyOutcome =
-	| { success: true; status: "applied" | "reconciled" }
+	| {
+			success: true;
+			status: "applied" | "reconciled" | "persisted-detached" | "reconciled-detached";
+			appliedToCurrent: boolean;
+	  }
 	| { success: false; status: "stale" }
 	| { success: false; status: "diverged"; error: string };
 
@@ -645,19 +649,22 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 					if (!authoritative || authoritative.project.id !== expected.projectId) {
 						throw new Error("Authoritative project document is unavailable");
 					}
-					const current = get();
-					if (
-						current.documentGeneration !== expected.documentGeneration ||
-						current.projectId !== expected.projectId ||
-						current.revision !== expected.revision
-					) {
-						return { success: false, status: "stale" };
-					}
-
 					const beforeJson = JSON.stringify(before.document);
 					const authoritativeJson = JSON.stringify(authoritative);
 					const message = error instanceof Error ? error.message : String(error);
 					if (serializeSaveContent(authoritative) === serializeSaveContent(parsed)) {
+						const current = get();
+						if (
+							current.documentGeneration !== expected.documentGeneration ||
+							current.projectId !== expected.projectId ||
+							current.revision !== expected.revision
+						) {
+							return {
+								success: true,
+								status: "reconciled-detached",
+								appliedToCurrent: false,
+							};
+						}
 						const { pushHistory } = await import("./undo");
 						const latest = get();
 						if (
@@ -665,7 +672,11 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 							latest.projectId !== expected.projectId ||
 							latest.revision !== expected.revision
 						) {
-							return { success: false, status: "stale" };
+							return {
+								success: true,
+								status: "reconciled-detached",
+								appliedToCurrent: false,
+							};
 						}
 						pushHistory({
 							projectId: expected.projectId,
@@ -677,9 +688,17 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 							dirty: false,
 							lastSavedAt: new Date(),
 						});
-						return { success: true, status: "reconciled" };
+						return { success: true, status: "reconciled", appliedToCurrent: true };
 					}
 
+					const current = get();
+					if (
+						current.documentGeneration !== expected.documentGeneration ||
+						current.projectId !== expected.projectId ||
+						current.revision !== expected.revision
+					) {
+						return { success: false, status: "diverged", error: message };
+					}
 					if (authoritativeJson !== beforeJson) {
 						const { clearHistory } = await import("./undo");
 						const latest = get();
@@ -688,7 +707,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 							latest.projectId !== expected.projectId ||
 							latest.revision !== expected.revision
 						) {
-							return { success: false, status: "stale" };
+							return { success: false, status: "diverged", error: message };
 						}
 						clearHistory();
 						set({
@@ -715,7 +734,11 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				current.projectId !== expected.projectId ||
 				current.revision !== expected.revision
 			) {
-				return { success: false, status: "stale" };
+				return {
+					success: true,
+					status: "persisted-detached",
+					appliedToCurrent: false,
+				};
 			}
 			pushHistory({ projectId: expected.projectId, doc: structuredClone(before.document) });
 			set({
@@ -724,7 +747,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				dirty: false,
 				lastSavedAt: new Date(),
 			});
-			return { success: true, status: "applied" };
+			return { success: true, status: "applied", appliedToCurrent: true };
 		});
 	},
 

@@ -6,6 +6,9 @@
 import { PROVIDER_DEFINITIONS } from "../../electron/ai-edition/provider-registry";
 import { axcutSchemaVersion, migrateRawDocumentToCurrent } from "../lib/ai-edition/schema";
 import { nativeBridgeClient as realClient } from "./client";
+import type { AiEditionChatSessionUpdatedEvent } from "./contracts";
+
+const BROWSER_CHAT_SESSION_UPDATED_EVENT = "openscreen:chat-session-updated";
 
 function detectBrowserMode(): boolean {
 	if (typeof window === "undefined") return false;
@@ -144,6 +147,14 @@ function createShimElectronAPI() {
 		// browser-shim test fails at boot, not just the chat ones. Nothing streams
 		// in shim mode; the unsubscribe is what the effect's cleanup returns.
 		onAiEditionChatEvent: () => () => undefined,
+		onAiEditionChatSessionUpdated: (
+			callback: (event: AiEditionChatSessionUpdatedEvent) => void,
+		) => {
+			const listener = (event: Event) =>
+				callback((event as CustomEvent<AiEditionChatSessionUpdatedEvent>).detail);
+			window.addEventListener(BROWSER_CHAT_SESSION_UPDATED_EVENT, listener);
+			return () => window.removeEventListener(BROWSER_CHAT_SESSION_UPDATED_EVENT, listener);
+		},
 		invokeNativeBridge: (req: { domain: string; action: string; payload?: unknown }) => {
 			console.info("[browser-shim] invokeNativeBridge", req.domain, req.action, req.payload);
 			return Promise.resolve({
@@ -282,9 +293,8 @@ function createShimBridgeClient() {
 		})),
 	});
 
-	// ponytail: chat sessions per project, persisted to localStorage so a
-	// reload doesn't blank the active conversation. Matches the real chat
-	// service's on-disk behavior (the renderer treats these the same).
+	// Browser mode has no long-lived main process, so localStorage stands in for
+	// the process-local chat owner and keeps sessions across renderer reloads.
 	type ShimSession = {
 		id: string;
 		projectId: string;
@@ -294,27 +304,42 @@ function createShimBridgeClient() {
 		revision: number;
 	};
 	const chatStorageKey = "browser-shim-chat-v1";
-	const chatOperationTtlMs = 5 * 60_000;
-	const completedOperationTtlMs = 10 * 60_000;
-	const maxCompletedOperations = 256;
+	const terminalOperationStorageKey = "browser-shim-chat-operations-v1";
+	const preparedOperationTtlMs = 5 * 60_000;
+	const persistenceLockTtlMs = 10 * 60_000;
+	const persistenceEvidenceTtlMs = 30 * 60_000;
+	const terminalOperationTtlMs = 10 * 60_000;
+	const maxActiveOperations = 128;
+	const maxLateOperations = 128;
+	const maxTerminalOperations = 256;
 	const sessionsByProject = new Map<string, Map<string, ShimSession>>();
 	type ShimOperation = {
 		operationId: string;
+		kind: "chat";
 		projectId: string;
 		sessionId: string;
+		createdAt: number;
 		expiresAt: number;
+		persistenceEvidenceExpiresAt?: number;
 	};
 	type PendingShimChatRun = ShimOperation & {
-		state: "prepared";
+		state: "prepared" | "persisting";
 		expectedRevision: number;
 		messages: ShimSession["messages"];
 	};
 	type CompletedShimChatRun = ShimOperation & {
 		state: "committed";
-		result: { success: true };
+		result: {
+			success: true;
+			messages: ShimSession["messages"];
+			sessionRevision: number;
+		};
 	};
+	type AbortedShimChatRun = ShimOperation & { state: "aborted" };
+	type TerminalShimChatRun = CompletedShimChatRun | AbortedShimChatRun;
 	const pendingChatRuns = new Map<string, PendingShimChatRun>();
-	const completedChatRuns = new Map<string, CompletedShimChatRun>();
+	const lateChatRuns = new Map<string, PendingShimChatRun>();
+	const terminalChatRuns = new Map<string, TerminalShimChatRun>();
 	const operationExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 	const operationBelongsToSession = (
 		operation: ShimOperation,
@@ -326,57 +351,130 @@ function createShimBridgeClient() {
 		if (timeout) clearTimeout(timeout);
 		operationExpiryTimers.delete(operationId);
 	};
-	const deleteOperation = <T extends ShimOperation>(
-		map: Map<string, T>,
-		operationId: string,
-		expected?: T,
-	) => {
-		if (expected && map.get(operationId) !== expected) return;
-		map.delete(operationId);
+	const deleteOperation = (operationId: string) => {
+		pendingChatRuns.delete(operationId);
+		lateChatRuns.delete(operationId);
+		terminalChatRuns.delete(operationId);
 		cancelOperationExpiry(operationId);
 	};
-	const resetOperationLease = <T extends ShimOperation>(
-		map: Map<string, T>,
-		operation: T,
-		ttlMs: number,
+	const scheduleOperationDeadline = (
+		operation: ShimOperation,
+		expiresAt: number,
+		onExpire: () => void,
 	) => {
 		cancelOperationExpiry(operation.operationId);
-		operation.expiresAt = Date.now() + ttlMs;
+		operation.expiresAt = expiresAt;
 		const expire = () => {
-			if (map.get(operation.operationId) !== operation) return;
 			const remaining = operation.expiresAt - Date.now();
 			if (remaining > 0) {
 				operationExpiryTimers.set(operation.operationId, setTimeout(expire, remaining));
 				return;
 			}
-			map.delete(operation.operationId);
 			operationExpiryTimers.delete(operation.operationId);
+			onExpire();
 		};
-		operationExpiryTimers.set(operation.operationId, setTimeout(expire, ttlMs));
+		operationExpiryTimers.set(
+			operation.operationId,
+			setTimeout(expire, Math.max(0, expiresAt - Date.now())),
+		);
+	};
+	const persistTerminalOperations = () => {
+		try {
+			localStorage.setItem(
+				terminalOperationStorageKey,
+				JSON.stringify(
+					[...terminalChatRuns.values()].filter((operation) => operation.state === "committed"),
+				),
+			);
+		} catch {
+			// localStorage may be full or unavailable.
+		}
+	};
+	const rememberTerminalRun = (operation: TerminalShimChatRun) => {
+		deleteOperation(operation.operationId);
+		terminalChatRuns.set(operation.operationId, operation);
+		scheduleOperationDeadline(operation, Date.now() + terminalOperationTtlMs, () => {
+			if (terminalChatRuns.get(operation.operationId) === operation) {
+				deleteOperation(operation.operationId);
+				persistTerminalOperations();
+			}
+		});
+		while (terminalChatRuns.size > maxTerminalOperations) {
+			const oldest = terminalChatRuns.keys().next().value;
+			if (typeof oldest !== "string") break;
+			deleteOperation(oldest);
+		}
+		persistTerminalOperations();
+	};
+	const rememberAbortedRun = (operation: PendingShimChatRun) =>
+		rememberTerminalRun({ ...operation, state: "aborted", expiresAt: 0 });
+	const expireLateRun = (operation: PendingShimChatRun) => {
+		if (lateChatRuns.get(operation.operationId) !== operation) return;
+		lateChatRuns.delete(operation.operationId);
+		rememberAbortedRun(operation);
+	};
+	const enforceLateBound = () => {
+		while (lateChatRuns.size > maxLateOperations) {
+			const oldest = lateChatRuns.keys().next().value;
+			if (typeof oldest !== "string") break;
+			const operation = lateChatRuns.get(oldest);
+			if (!operation) break;
+			expireLateRun(operation);
+		}
+	};
+	const moveToLateEvidence = (operation: PendingShimChatRun) => {
+		if (pendingChatRuns.get(operation.operationId) !== operation) return;
+		pendingChatRuns.delete(operation.operationId);
+		cancelOperationExpiry(operation.operationId);
+		lateChatRuns.set(operation.operationId, operation);
+		enforceLateBound();
+		if (lateChatRuns.get(operation.operationId) !== operation) return;
+		scheduleOperationDeadline(operation, operation.persistenceEvidenceExpiresAt ?? Date.now(), () =>
+			expireLateRun(operation),
+		);
+	};
+	const expirePendingRun = (operation: PendingShimChatRun) => {
+		if (pendingChatRuns.get(operation.operationId) !== operation) return;
+		if (operation.state === "persisting") moveToLateEvidence(operation);
+		else rememberAbortedRun(operation);
+	};
+	const addPendingRun = (operation: PendingShimChatRun) => {
+		pendingChatRuns.set(operation.operationId, operation);
+		scheduleOperationDeadline(operation, Date.now() + preparedOperationTtlMs, () =>
+			expirePendingRun(operation),
+		);
+		while (pendingChatRuns.size > maxActiveOperations) {
+			const oldest = pendingChatRuns.keys().next().value;
+			if (typeof oldest !== "string") break;
+			const pending = pendingChatRuns.get(oldest);
+			if (!pending) break;
+			expirePendingRun(pending);
+		}
 	};
 	const pruneExpiredOperations = () => {
 		const now = Date.now();
-		for (const [operationId, operation] of pendingChatRuns) {
-			if (operation.expiresAt <= now) deleteOperation(pendingChatRuns, operationId, operation);
+		let terminalChanged = false;
+		for (const operation of pendingChatRuns.values()) {
+			if (operation.expiresAt <= now) expirePendingRun(operation);
 		}
-		for (const [operationId, operation] of completedChatRuns) {
-			if (operation.expiresAt <= now) deleteOperation(completedChatRuns, operationId, operation);
+		for (const operation of lateChatRuns.values()) {
+			if ((operation.persistenceEvidenceExpiresAt ?? operation.expiresAt) <= now) {
+				expireLateRun(operation);
+			}
 		}
+		for (const operation of terminalChatRuns.values()) {
+			if (operation.expiresAt <= now) {
+				deleteOperation(operation.operationId);
+				terminalChanged = true;
+			}
+		}
+		if (terminalChanged) persistTerminalOperations();
 	};
 	const sessionHasPendingOperation = (projectId: string, sessionId: string) => {
 		pruneExpiredOperations();
 		return [...pendingChatRuns.values()].some((operation) =>
 			operationBelongsToSession(operation, projectId, sessionId),
 		);
-	};
-	const rememberCompletedRun = (operation: CompletedShimChatRun) => {
-		completedChatRuns.set(operation.operationId, operation);
-		resetOperationLease(completedChatRuns, operation, completedOperationTtlMs);
-		while (completedChatRuns.size > maxCompletedOperations) {
-			const oldestOperationId = completedChatRuns.keys().next().value;
-			if (typeof oldestOperationId !== "string") break;
-			deleteOperation(completedChatRuns, oldestOperationId);
-		}
 	};
 	(() => {
 		try {
@@ -396,6 +494,32 @@ function createShimBridgeClient() {
 			}
 		} catch {
 			// ponytail: corrupt/unavailable localStorage — start fresh.
+		}
+	})();
+	(() => {
+		try {
+			const raw = localStorage.getItem(terminalOperationStorageKey);
+			if (!raw) return;
+			const parsed = JSON.parse(raw) as CompletedShimChatRun[];
+			for (const operation of parsed.slice(-maxTerminalOperations)) {
+				if (
+					operation.state !== "committed" ||
+					operation.kind !== "chat" ||
+					operation.expiresAt <= Date.now()
+				) {
+					continue;
+				}
+				terminalChatRuns.set(operation.operationId, operation);
+				scheduleOperationDeadline(operation, operation.expiresAt, () => {
+					if (terminalChatRuns.get(operation.operationId) === operation) {
+						deleteOperation(operation.operationId);
+						persistTerminalOperations();
+					}
+				});
+			}
+			persistTerminalOperations();
+		} catch {
+			localStorage.removeItem(terminalOperationStorageKey);
 		}
 	})();
 	const persistChat = () => {
@@ -565,7 +689,9 @@ function createShimBridgeClient() {
 				if (
 					sessionHasPendingOperation(projectId, s.id) ||
 					(operationId !== undefined &&
-						(pendingChatRuns.has(operationId) || completedChatRuns.has(operationId)))
+						(pendingChatRuns.has(operationId) ||
+							lateChatRuns.has(operationId) ||
+							terminalChatRuns.has(operationId)))
 				) {
 					return Promise.resolve({
 						success: false,
@@ -592,15 +718,16 @@ function createShimBridgeClient() {
 				if (operationId) {
 					const pending: PendingShimChatRun = {
 						operationId,
+						kind: "chat",
 						projectId,
 						sessionId: s.id,
+						createdAt: Date.now(),
 						state: "prepared",
 						expectedRevision: s.revision,
 						messages: stagedMessages,
 						expiresAt: 0,
 					};
-					pendingChatRuns.set(operationId, pending);
-					resetOperationLease(pendingChatRuns, pending, chatOperationTtlMs);
+					addPendingRun(pending);
 				} else {
 					s.messages.push(...stagedMessages);
 					s.revision++;
@@ -610,15 +737,19 @@ function createShimBridgeClient() {
 			},
 			chatCommitRun: (projectId: string, sessionId: string, operationId: string) => {
 				pruneExpiredOperations();
-				const completed = completedChatRuns.get(operationId);
-				if (completed) {
+				const terminal = terminalChatRuns.get(operationId);
+				if (terminal) {
 					return Promise.resolve(
-						operationBelongsToSession(completed, projectId, sessionId)
-							? completed.result
+						terminal.state === "committed" &&
+							operationBelongsToSession(terminal, projectId, sessionId)
+							? {
+									...terminal.result,
+									messages: terminal.result.messages.map((message) => ({ ...message })),
+								}
 							: { success: false as const, error: "Chat operation belongs to another session." },
 					);
 				}
-				const pending = pendingChatRuns.get(operationId);
+				const pending = pendingChatRuns.get(operationId) ?? lateChatRuns.get(operationId);
 				const session = sessionsByProject.get(projectId)?.get(sessionId);
 				if (
 					!pending ||
@@ -628,47 +759,151 @@ function createShimBridgeClient() {
 				) {
 					return Promise.resolve({ success: false, error: "Chat operation is stale." });
 				}
+				if (
+					lateChatRuns.get(operationId) === pending &&
+					sessionHasPendingOperation(projectId, sessionId)
+				) {
+					return Promise.resolve({ success: false, error: "Another operation owns this session." });
+				}
 				session.messages.push(...pending.messages);
 				session.revision++;
-				const result = { success: true as const };
-				deleteOperation(pendingChatRuns, operationId, pending);
-				rememberCompletedRun({
+				const result = {
+					success: true as const,
+					messages: session.messages.map((message) => ({ ...message })),
+					sessionRevision: session.revision,
+				};
+				rememberTerminalRun({
 					operationId,
+					kind: "chat",
 					projectId,
 					sessionId,
+					createdAt: pending.createdAt,
 					state: "committed",
 					result,
 					expiresAt: 0,
+					persistenceEvidenceExpiresAt: pending.persistenceEvidenceExpiresAt,
 				});
 				persistChat();
+				window.dispatchEvent(
+					new CustomEvent<AiEditionChatSessionUpdatedEvent>(BROWSER_CHAT_SESSION_UPDATED_EVENT, {
+						detail: {
+							projectId,
+							sessionId,
+							revision: session.revision,
+							operationId,
+							kind: "chat",
+							messages: result.messages,
+						},
+					}),
+				);
 				return Promise.resolve(result);
 			},
 			chatAbortRun: (projectId: string, sessionId: string, operationId: string) => {
 				pruneExpiredOperations();
-				const completed = completedChatRuns.get(operationId);
-				if (completed) {
+				const terminal = terminalChatRuns.get(operationId);
+				if (terminal) {
 					return Promise.resolve({
 						success: false,
-						error: operationBelongsToSession(completed, projectId, sessionId)
-							? "Chat operation is already committed."
+						error: operationBelongsToSession(terminal, projectId, sessionId)
+							? `Chat operation is already ${terminal.state}.`
 							: "Chat operation belongs to another session.",
 					});
 				}
-				const pending = pendingChatRuns.get(operationId);
+				const pending = pendingChatRuns.get(operationId) ?? lateChatRuns.get(operationId);
 				if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
 					return Promise.resolve({ success: false, error: "Chat operation is stale." });
 				}
-				deleteOperation(pendingChatRuns, operationId, pending);
+				if (pending.state === "persisting") {
+					return Promise.resolve({ success: false, error: "Persistence requires reconciliation." });
+				}
+				rememberAbortedRun(pending);
 				return Promise.resolve({ success: true });
 			},
-			chatRenewOperation: (projectId: string, sessionId: string, operationId: string) => {
+			chatBeginPersistence: (projectId: string, sessionId: string, operationId: string) => {
 				pruneExpiredOperations();
-				const pending = pendingChatRuns.get(operationId);
+				const terminal = terminalChatRuns.get(operationId);
+				if (terminal && operationBelongsToSession(terminal, projectId, sessionId)) {
+					return Promise.resolve({
+						success: false,
+						error:
+							terminal.state === "committed"
+								? "Operation is already committed."
+								: "Operation is aborted.",
+					});
+				}
+				const pending = pendingChatRuns.get(operationId) ?? lateChatRuns.get(operationId);
 				if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
 					return Promise.resolve({ success: false, error: "Chat operation is stale." });
 				}
-				resetOperationLease(pendingChatRuns, pending, chatOperationTtlMs);
+				if (pending.state === "persisting") return Promise.resolve({ success: true });
+				pending.state = "persisting";
+				pending.persistenceEvidenceExpiresAt = Date.now() + persistenceEvidenceTtlMs;
+				scheduleOperationDeadline(pending, Date.now() + persistenceLockTtlMs, () =>
+					moveToLateEvidence(pending),
+				);
 				return Promise.resolve({ success: true });
+			},
+			chatResolvePersistence: (projectId: string, sessionId: string, operationId: string) => {
+				pruneExpiredOperations();
+				const terminal = terminalChatRuns.get(operationId);
+				if (terminal && operationBelongsToSession(terminal, projectId, sessionId)) {
+					return Promise.resolve(
+						terminal.state === "aborted"
+							? { success: true }
+							: { success: false, error: "Committed persistence cannot be aborted." },
+					);
+				}
+				const pending = pendingChatRuns.get(operationId) ?? lateChatRuns.get(operationId);
+				if (
+					!pending ||
+					pending.state !== "persisting" ||
+					!operationBelongsToSession(pending, projectId, sessionId)
+				) {
+					return Promise.resolve({ success: false, error: "Persisting operation is stale." });
+				}
+				rememberAbortedRun(pending);
+				return Promise.resolve({ success: true });
+			},
+			chatOperationStatus: (projectId: string, sessionId: string, operationId: string) => {
+				pruneExpiredOperations();
+				const terminal = terminalChatRuns.get(operationId);
+				if (terminal && operationBelongsToSession(terminal, projectId, sessionId)) {
+					return Promise.resolve(
+						terminal.state === "committed"
+							? {
+									state: "committed" as const,
+									kind: "chat" as const,
+									operationId,
+									result: {
+										...terminal.result,
+										messages: terminal.result.messages.map((message) => ({ ...message })),
+									},
+								}
+							: { state: "aborted" as const, kind: "chat" as const, operationId },
+					);
+				}
+				const pending = pendingChatRuns.get(operationId) ?? lateChatRuns.get(operationId);
+				if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
+					return Promise.resolve({ state: "unknown" as const, operationId });
+				}
+				if (lateChatRuns.get(operationId) === pending) {
+					return Promise.resolve({
+						state: "late-persistence" as const,
+						kind: "chat" as const,
+						operationId,
+						expiresAt: pending.expiresAt,
+					});
+				}
+				return Promise.resolve(
+					pending.state === "persisting"
+						? {
+								state: "persisting" as const,
+								kind: "chat" as const,
+								operationId,
+								expiresAt: pending.expiresAt,
+							}
+						: { state: "prepared" as const, kind: "chat" as const, operationId },
+				);
 			},
 			chatPrepareRewind: () =>
 				Promise.resolve({

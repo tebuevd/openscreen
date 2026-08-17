@@ -1,5 +1,10 @@
 import { app, ipcMain, webContents } from "electron";
-import type { AiEditionChatEvent } from "../../src/native/contracts";
+import type {
+	AiEditionChatCommitResult,
+	AiEditionChatEvent,
+	AiEditionChatOperationStatus,
+	AiEditionChatSessionUpdatedEvent,
+} from "../../src/native/contracts";
 import {
 	NATIVE_BRIDGE_CHANNEL,
 	NATIVE_BRIDGE_VERSION,
@@ -67,17 +72,30 @@ export interface NativeBridgeContext {
 		projectId: string,
 		sessionId: string,
 		operationId: string,
-	) => import("../../src/native/contracts").AiEditionChatOperationResult;
+	) => AiEditionChatCommitResult;
 	abortAiEditionChatRun: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
 	) => import("../../src/native/contracts").AiEditionChatOperationResult;
-	renewAiEditionChatOperation: (
+	beginAiEditionChatPersistence: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
 	) => import("../../src/native/contracts").AiEditionChatOperationResult;
+	resolveAiEditionChatPersistence: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => import("../../src/native/contracts").AiEditionChatOperationResult;
+	getAiEditionChatOperationStatus: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => AiEditionChatOperationStatus;
+	subscribeAiEditionChatSessionUpdates: (
+		listener: (event: AiEditionChatSessionUpdatedEvent) => void,
+	) => () => void;
 	undoAiEditionToolBatch: (
 		projectId: string,
 		sessionId: string,
@@ -215,6 +233,8 @@ function buildChatEventSink(
 	};
 }
 
+let unsubscribeChatSessionUpdates: (() => void) | null = null;
+
 export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 	ipcMain.removeHandler(NATIVE_BRIDGE_CHANNEL);
 
@@ -264,7 +284,9 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		runChat: context.runAiEditionChat,
 		commitChatRun: context.commitAiEditionChatRun,
 		abortChatRun: context.abortAiEditionChatRun,
-		renewChatOperation: context.renewAiEditionChatOperation,
+		beginChatOperationPersistence: context.beginAiEditionChatPersistence,
+		resolveChatOperationPersistence: context.resolveAiEditionChatPersistence,
+		getChatOperationStatus: context.getAiEditionChatOperationStatus,
 		undoLastToolBatch: context.undoAiEditionToolBatch,
 		prepareRewindToMessage: context.prepareRewindToMessage,
 		commitRewindToMessage: context.commitRewindToMessage,
@@ -276,6 +298,17 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		selectSession: context.selectAiEditionChatSession,
 		renameSession: context.renameAiEditionChatSession,
 		deleteSession: context.deleteAiEditionChatSession,
+	});
+	unsubscribeChatSessionUpdates?.();
+	unsubscribeChatSessionUpdates = context.subscribeAiEditionChatSessionUpdates((update) => {
+		for (const contents of webContents.getAllWebContents()) {
+			if (contents.isDestroyed()) continue;
+			try {
+				contents.send("ai-edition.chat-session-updated", update);
+			} catch {
+				// A renderer may disappear between enumeration and send.
+			}
+		}
 	});
 
 	ipcMain.handle(NATIVE_BRIDGE_CHANNEL, async (event, request: unknown) => {
@@ -660,10 +693,28 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.operationId,
 								),
 							);
-						case "chat.operation.renew":
+						case "chat.operation.beginPersistence":
 							return createSuccessResponse(
 								requestId,
-								aiEditionService.chatRenewOperation(
+								aiEditionService.chatBeginPersistence(
+									request.payload.projectId,
+									request.payload.sessionId,
+									request.payload.operationId,
+								),
+							);
+						case "chat.operation.resolvePersistence":
+							return createSuccessResponse(
+								requestId,
+								aiEditionService.chatResolvePersistence(
+									request.payload.projectId,
+									request.payload.sessionId,
+									request.payload.operationId,
+								),
+							);
+						case "chat.operation.status":
+							return createSuccessResponse(
+								requestId,
+								aiEditionService.chatOperationStatus(
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.operationId,

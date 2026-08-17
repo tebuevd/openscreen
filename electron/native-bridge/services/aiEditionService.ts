@@ -3,9 +3,11 @@ import type {
 	AiEditionAssetResult,
 	AiEditionCaptionTranslateResult,
 	AiEditionChatBudget,
+	AiEditionChatCommitResult,
 	AiEditionChatCompactResult,
 	AiEditionChatMessage,
 	AiEditionChatOperationResult,
+	AiEditionChatOperationStatus,
 	AiEditionChatResult,
 	AiEditionChatRewindCommitResult,
 	AiEditionChatRewindPrepareResult,
@@ -58,17 +60,27 @@ export interface AiEditionServiceOptions {
 		projectId: string,
 		sessionId: string,
 		operationId: string,
-	) => AiEditionChatOperationResult;
+	) => AiEditionChatCommitResult;
 	abortChatRun: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
 	) => AiEditionChatOperationResult;
-	renewChatOperation: (
+	beginChatOperationPersistence: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
 	) => AiEditionChatOperationResult;
+	resolveChatOperationPersistence: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => AiEditionChatOperationResult;
+	getChatOperationStatus: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	) => AiEditionChatOperationStatus;
 	prepareRewindToMessage: (
 		projectId: string,
 		sessionId: string,
@@ -301,7 +313,7 @@ export class AiEditionService {
 		projectId: string,
 		sessionId: string,
 		operationId: string,
-	): AiEditionChatOperationResult {
+	): AiEditionChatCommitResult {
 		return this.options.commitChatRun(projectId, sessionId, operationId);
 	}
 
@@ -313,12 +325,28 @@ export class AiEditionService {
 		return this.options.abortChatRun(projectId, sessionId, operationId);
 	}
 
-	chatRenewOperation(
+	chatBeginPersistence(
 		projectId: string,
 		sessionId: string,
 		operationId: string,
 	): AiEditionChatOperationResult {
-		return this.options.renewChatOperation(projectId, sessionId, operationId);
+		return this.options.beginChatOperationPersistence(projectId, sessionId, operationId);
+	}
+
+	chatResolvePersistence(
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	): AiEditionChatOperationResult {
+		return this.options.resolveChatOperationPersistence(projectId, sessionId, operationId);
+	}
+
+	chatOperationStatus(
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+	): AiEditionChatOperationStatus {
+		return this.options.getChatOperationStatus(projectId, sessionId, operationId);
 	}
 
 	chatUndoLastBatch(_projectId: string, _sessionId: string): AiEditionChatResult {

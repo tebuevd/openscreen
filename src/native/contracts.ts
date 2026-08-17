@@ -322,6 +322,14 @@ export interface AiEditionChatResult {
 
 export type AiEditionChatOperationResult = { success: true } | { success: false; error: string };
 
+export type AiEditionChatCommitResult =
+	| {
+			success: true;
+			messages: AiEditionChatMessage[];
+			sessionRevision: number;
+	  }
+	| { success: false; error: string };
+
 export type AiEditionChatRewindPrepareResult =
 	| {
 			success: true;
@@ -339,8 +347,50 @@ export type AiEditionChatRewindCommitResult =
 			success: true;
 			messages: AiEditionChatMessage[];
 			prompt: string;
+			sessionRevision: number;
 	  }
 	| { success: false; error: string };
+
+export type AiEditionChatOperationStatus =
+	| {
+			state: "running" | "prepared";
+			kind: "chat" | "rewind";
+			operationId: string;
+	  }
+	| {
+			state: "persisting" | "late-persistence";
+			kind: "chat" | "rewind";
+			operationId: string;
+			expiresAt: number;
+	  }
+	| {
+			state: "committed";
+			kind: "chat";
+			operationId: string;
+			result: Extract<AiEditionChatCommitResult, { success: true }>;
+	  }
+	| {
+			state: "committed";
+			kind: "rewind";
+			operationId: string;
+			result: Extract<AiEditionChatRewindCommitResult, { success: true }>;
+	  }
+	| {
+			state: "aborted";
+			kind: "chat" | "rewind";
+			operationId: string;
+	  }
+	| { state: "unknown"; operationId: string };
+
+export interface AiEditionChatSessionUpdatedEvent {
+	projectId: string;
+	sessionId: string;
+	revision: number;
+	operationId: string;
+	kind: "chat" | "rewind";
+	messages: AiEditionChatMessage[];
+	prompt?: string;
+}
 
 export interface AiEditionChatSessionSummary {
 	id: string;
@@ -356,6 +406,7 @@ export interface AiEditionChatSession {
 	title: string;
 	createdAt: string;
 	messages: AiEditionChatMessage[];
+	revision: number;
 }
 
 export interface AiEditionChatBudget {
@@ -622,8 +673,19 @@ export type NativeBridgeRequest =
 	  }
 	| {
 			domain: "aiEdition";
-			action: "chat.operation.renew";
+			action: "chat.operation.beginPersistence" | "chat.operation.status";
 			payload: { projectId: string; sessionId: string; operationId: string };
+			requestId?: string;
+	  }
+	| {
+			domain: "aiEdition";
+			action: "chat.operation.resolvePersistence";
+			payload: {
+				projectId: string;
+				sessionId: string;
+				operationId: string;
+				outcome: "not-persisted";
+			};
 			requestId?: string;
 	  }
 	| {
@@ -880,7 +942,8 @@ export type NativeBridgeEventName =
 	| "project.contextChanged"
 	| "cursor.providerChanged"
 	| "cursor.telemetryLoaded"
-	| "ai-edition.chat-event";
+	| "ai-edition.chat-event"
+	| "ai-edition.chat-session-updated";
 
 // streamed chat-progress event broadcast by runChat so the renderer
 // can render text deltas + tool ops live instead of waiting for the final RPC

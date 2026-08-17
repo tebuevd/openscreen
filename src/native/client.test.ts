@@ -16,7 +16,7 @@ describe("native chat operation client", () => {
 		delete (window as any).electronAPI;
 	});
 
-	it("sends staged chat run commit and abort identities", async () => {
+	it("sends staged chat run and persistence operation identities", async () => {
 		await nativeBridgeClient.aiEdition.chatRun(
 			"project",
 			"session",
@@ -26,7 +26,9 @@ describe("native chat operation client", () => {
 		);
 		await nativeBridgeClient.aiEdition.chatCommitRun("project", "session", "run-1");
 		await nativeBridgeClient.aiEdition.chatAbortRun("project", "session", "run-2");
-		await nativeBridgeClient.aiEdition.chatRenewOperation("project", "session", "run-3");
+		await nativeBridgeClient.aiEdition.chatBeginPersistence("project", "session", "run-3");
+		await nativeBridgeClient.aiEdition.chatOperationStatus("project", "session", "run-4");
+		await nativeBridgeClient.aiEdition.chatResolvePersistence("project", "session", "run-5");
 
 		expect(invoke.mock.calls.map(([request]) => request)).toEqual([
 			expect.objectContaining({
@@ -48,8 +50,21 @@ describe("native chat operation client", () => {
 				payload: { projectId: "project", sessionId: "session", operationId: "run-2" },
 			}),
 			expect.objectContaining({
-				action: "chat.operation.renew",
+				action: "chat.operation.beginPersistence",
 				payload: { projectId: "project", sessionId: "session", operationId: "run-3" },
+			}),
+			expect.objectContaining({
+				action: "chat.operation.status",
+				payload: { projectId: "project", sessionId: "session", operationId: "run-4" },
+			}),
+			expect.objectContaining({
+				action: "chat.operation.resolvePersistence",
+				payload: {
+					projectId: "project",
+					sessionId: "session",
+					operationId: "run-5",
+					outcome: "not-persisted",
+				},
 			}),
 		]);
 	});

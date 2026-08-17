@@ -2,8 +2,10 @@ import {
 	type AiEditionAssetResult,
 	type AiEditionCaptionTranslateResult,
 	type AiEditionChatBudget,
+	type AiEditionChatCommitResult,
 	type AiEditionChatCompactResult,
 	type AiEditionChatOperationResult,
+	type AiEditionChatOperationStatus,
 	type AiEditionChatResult,
 	type AiEditionChatRewindCommitResult,
 	type AiEditionChatRewindPrepareResult,
@@ -243,7 +245,7 @@ export const nativeBridgeClient = {
 				payload: { projectId, sessionId, message, document, operationId },
 			}),
 		chatCommitRun: (projectId: string, sessionId: string, operationId: string) =>
-			requireNativeBridgeData<AiEditionChatOperationResult>({
+			requireNativeBridgeData<AiEditionChatCommitResult>({
 				domain: "aiEdition",
 				action: "chat.run.commit",
 				payload: { projectId, sessionId, operationId },
@@ -254,11 +256,23 @@ export const nativeBridgeClient = {
 				action: "chat.run.abort",
 				payload: { projectId, sessionId, operationId },
 			}),
-		chatRenewOperation: (projectId: string, sessionId: string, operationId: string) =>
+		chatBeginPersistence: (projectId: string, sessionId: string, operationId: string) =>
 			requireNativeBridgeData<AiEditionChatOperationResult>({
 				domain: "aiEdition",
-				action: "chat.operation.renew",
+				action: "chat.operation.beginPersistence",
 				payload: { projectId, sessionId, operationId },
+			}),
+		chatOperationStatus: (projectId: string, sessionId: string, operationId: string) =>
+			requireNativeBridgeData<AiEditionChatOperationStatus>({
+				domain: "aiEdition",
+				action: "chat.operation.status",
+				payload: { projectId, sessionId, operationId },
+			}),
+		chatResolvePersistence: (projectId: string, sessionId: string, operationId: string) =>
+			requireNativeBridgeData<AiEditionChatOperationResult>({
+				domain: "aiEdition",
+				action: "chat.operation.resolvePersistence",
+				payload: { projectId, sessionId, operationId, outcome: "not-persisted" },
 			}),
 		chatUndoLastBatch: (projectId: string, sessionId: string) =>
 			requireNativeBridgeData<AiEditionChatResult>({
