@@ -60,7 +60,7 @@ of those are local React state, with the document itself read through
 | **Floating inspector** | `src/components/ai-edition/v4/FloatingInspector.tsx` | Floating facet rail over the stage; the open panel either shows the `FacetBody` for the current facet (`background` / `effects` / `layout` / `cursor` / `captions` / `transcript`) or, when a region is selected, a `SelectionPane` (`:444`) that edits the selected pill by id. The "pencil" rail button opens `EditClipModal` for crop + trim. |
 | **Left chat column** | `src/components/ai-edition/LeftPanel.tsx` | Only mounted when `mode === "edit"` and `chatOpen` is true (`NewEditorShell.tsx` `:1133-1151`). Sends user messages to the LLM via IPC. Resize handle is `v4.chatResizeHandle`; width persists in `localStorage` as `os-editor-chat-width`. |
 | **Modals** | `src/components/ai-edition/Modals.tsx` | `OpenProjectModal`, `NewProjectModal`, `EditClipModal` (per-clip crop + in/out), `UnsavedChangesModal`. Mounted at the shell level (`:1286-1332`) so every trigger site reuses the same instance. |
-| **Export dialog** | `src/components/ai-edition/ExportDialog.tsx` | Format / quality / frame-rate / codec / size; calls `exportAxcutDocument` (GIF path, WebCodecs) or `exportMultiNative` (MP4 path, native D3D compositor). The MP4 path is the one that goes through `src/lib/ai-edition/exporter/documentExporter.ts`'s `projectRegionsToSourceTime` and the multi-clip native bridge. |
+| **Export dialog** | `src/components/ai-edition/ExportDialog.tsx` | Format / quality / frame-rate / codec / size; resolves the visible clips and output geometry, builds their shared `SceneDescription`, then calls `exportMultiNative` for MP4 or `exportGifNative` for GIF. Both formats use the native Rust compositor and shared timeline walk: Direct3D 11 on Windows, Metal on macOS, and wgpu/Vulkan on Linux. GIF performs native RGBA readback and writes through the Rust GIF encoder. See [export-pipeline.md](export-pipeline.md). |
 | **Captions pane** | `src/components/ai-edition/CaptionsPane.tsx` | Mounted as a facet body from `FloatingInspector.tsx` (`:1077`). Controls caption appearance + translations; the cues themselves are a derived view over `document.transcripts` (see [`src/lib/ai-edition/captions/`](../../src/lib/ai-edition/captions/)). |
 
 ## Modes and facets
@@ -151,24 +151,32 @@ switches on it is checked below. Each path has been verified on this branch.
    an `if (selection.kind === "xxx") { ... }` branch alongside `:513, :612,
    :629, :956` that reads `tl.xxxRegions`, calls the store's `updateXxx*`
    methods, and renders a delete button matching the existing style.
-6. **Preview path** — `src/components/ai-edition/Preview.tsx` mounts only
-   zoom, annotation, speed, camera-fullscreen, and trim regions (see
-   `NewEditorShell.tsx` `:1185-1189`). Add the new array to `Preview`'s
-   props, pass it through, and have the renderer consume it from
-   `tl.xxxRegions`.
-7. **Native preview scene** —
-   `src/native/sceneDescription.ts`. Add a `projectedXxxRegions = projectRegionsToSource(...)`
-   call next to the existing four (`:489, :508, :517, :531`) and serialize
-   the result into `SceneDescription`.
+6. **Preview interaction path** — `src/components/ai-edition/Preview.tsx` receives
+   region arrays used by interactive-only overlays such as handles and selection
+   affordances. If the new kind needs one, pass `tl.xxxRegions` through `Preview` and
+   `PreviewCanvas`; do not implement the final rendered pixels in that DOM overlay.
+7. **Shared scene serialization** — `src/native/sceneDescription.ts`. Project the
+   new regions to source time with `projectRegionsToSource(...)` and serialize them
+   into `SceneDescription`. `NativeCompositorOverlay` and `ExportDialog` both call
+   `buildSceneDescription`, so this is the common TypeScript boundary for preview
+   and export rather than a preview-only mapping.
 8. **Native playback sync** — only needed if the new region affects the
    active clip selection. `src/native/useNativePlaybackSync.ts` already calls
    `resolveNativePosition` (`:22, :39`) which is region-agnostic; add a region
    query here only if the modifier gates a transition.
-9. **Multi-clip export** —
-   `src/lib/ai-edition/exporter/documentExporter.ts`. Add a
-   `xxxRegions = projectRegionsToSourceTime(...)` line alongside `:223, :238,
-   :260, :265` and pass the result to the render plan / `exportAxcutDocument`.
-   Identity single-clip projects need no change (source == virtual).
+9. **Native render and output geometry** — extend the Rust scene contract in
+   `crates/compositor/src/scene.rs` and put backend-neutral placement/math in
+   `crates/compositor/src/frame_geometry.rs`. Add only the required draw plumbing
+   to `crates/compositor/src/compositor_windows.rs`,
+   `crates/compositor/src/compositor_macos.rs`, and
+   `crates/compositor/src/compositor_linux.rs`; implementing one backend does not
+   validate the others. If the feature changes frame shape or export sizing, update
+   `src/lib/ai-edition/document/outputFormat.ts` and
+   `src/lib/exporter/mp4ExportSettings.ts`. Do not create a separate renderer export
+   plan: preview and MP4/GIF export retain parity by consuming the same
+   `SceneDescription` and native compositor behavior. See
+   [export-pipeline.md](export-pipeline.md) and
+   [native-compositor.md](native-compositor.md).
 10. **Captions layer** — only if the kind affects cue placement. Captions are
     a derived view over `document.transcripts`; if the new region must
     intersect captions, add the projection in
