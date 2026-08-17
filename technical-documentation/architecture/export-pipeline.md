@@ -3,9 +3,11 @@
 MP4 and GIF export use the same native Rust compositor and `SceneDescription` as
 the live preview ([preview.md](preview.md) /
 [native-compositor.md](native-compositor.md)). The renderer sends an ordered clip
-list, scene JSON, and format parameters through the `compositor` IPC domain to the
-napi-rs addon; a libuv worker performs the render while the renderer reports
-progress. The platform implementation is selected at build time:
+list, scene JSON, format parameters, and the selected destination through the
+`compositor` IPC domain. `CompositorViewService` normalizes the native inputs and
+opens a destination transaction before the napi-rs addon receives a private staging
+path; a libuv worker performs the render while the renderer reports progress. The
+platform implementation is selected at build time:
 
 | Platform | Compositing and decode | MP4 encoding |
 | --- | --- | --- |
@@ -25,13 +27,17 @@ flowchart LR
     DOC["AxcutDocument"]
     TSD["src/native/sceneDescription.ts<br/>resolveVisibleClips / buildSceneDescription"]
     RP["clips + SceneDescription JSON<br/>layout + effects + background + zoom + cursor + webcam"]
+    SERVICE["CompositorViewService<br/>input normalization + destination transaction"]
     ADDON["compositor_view.node addon<br/>exportMulti / exportGif"]
     NATIVE["platform compositor<br/>shared timeline walk"]
     MP4["platform MP4 encoder + muxer"]
     GIF["RGBA readback + Rust GIF writer"]
-    DOC --> TSD --> RP --> ADDON --> NATIVE
-    NATIVE --> MP4
-    NATIVE --> GIF
+    STAGE["private same-directory stage"]
+    INSTALL["validated single-rename install"]
+    DOC --> TSD --> RP --> SERVICE --> ADDON --> NATIVE
+    NATIVE --> MP4 --> STAGE
+    NATIVE --> GIF --> STAGE
+    STAGE --> INSTALL
 ```
 
 ## Segment loop
@@ -61,39 +67,87 @@ one encoder and muxer for the whole output; GIF keeps one Rust GIF writer.
   the native walk feed MP4 audio's matching integer accumulation
   (`AudioConcatPlan`).
 
-- **MP4 audio and video junctions are seamless.** Audio is decoded per
-  segment up front (`audio.rs::decode_clip_audio`), WSOLA stretches each
-  speed sub-segment to its output sample count, and
-  `assemble_concatenated_pcm` concatenates the per-segment PCM at the
-  integer sample offsets the video loop just produced — never
-  `round(cumulativeSec * sampleRate)`, because that compounds per-segment
-  rounding error into audible A/V drift across a long multi-segment
-  timeline. A short equal-power fade (`cos` on the tail, `sin` on the
-  head, `cos² + sin² = 1`) covers each internal boundary to suppress the
-  click where two recordings meet butt-joined, without shifting timing.
-  The WSOLA stretch is kicked off before the video loop so it overlaps
-  the encode and does not add to the wall.
+- **MP4 audio follows each clip's video, then encodes once.** The shared walk first
+  composes all video frames for a clip, then calls `on_clip_end` with that clip's
+  clamped source end, actual output-frame count, and speed segments. Each platform
+  callback then runs `audio.rs::decode_clip_audio` for that source window and WSOLA
+  stretches its speed sub-segments. Audio is therefore neither decoded up front nor
+  overlapped with that clip's video encode. After the full video walk (and the
+  platform's final video drain/flush), `build_audio_concat_plan` converts the actual
+  per-clip frame counts to integer sample offsets and `assemble_concatenated_pcm`
+  copies each clip into its slot. This never uses
+  `round(cumulativeSec * sampleRate)`, which would compound per-clip rounding error
+  into A/V drift. A short equal-power fade (`cos` on the tail, `sin` on the head,
+  `cos² + sin² = 1`) suppresses clicks at internal boundaries without shifting
+  timing, then the assembled PCM is passed to the AAC encoder once before the MP4
+  trailer is written.
 
 - **Clip filtering and geometry hydration are separate.** `resolveVisibleClips`
   first omits timeline segments whose asset is dangling or has no non-empty
   `originalPath`. `hydrateExportDocumentDimensions` then processes only the asset
   IDs retained by that filter, reuses practical stored dimensions, and probes
-  missing or invalid dimensions into an export-only document clone. A required
-  probe failure blocks output sizing and scene construction rather than using an
-  implicit `1920x1080` source. This is not general path validation: a retained
-  stale path with already-valid stored dimensions is left for native media open
-  to accept or reject. The explicit `nothingToExport` guard itself runs after
-  scene JSON is built, although MP4 output sizing can reject some empty
-  submissions earlier. No empty submission reaches a native export call.
+  missing or invalid dimensions into an export-only document clone. The editor and
+  CLI resolve one ordered visible-clip list from that prepared clone and pass that
+  same list to crop-aware dimension collection, aspect-ratio resolution, and
+  `buildSceneDescription`; sizing cannot inspect clips that the native scene omits,
+  or omit clips that native will render. A required probe failure blocks output
+  sizing and scene construction rather than using an implicit `1920x1080` source.
+  This is not general path validation: a retained stale path with already-valid
+  stored dimensions is left for native media open to accept or reject. An empty
+  retained stream is rejected before scene construction and no empty submission
+  reaches a native export call.
 
 - **Output** honours the timeline's selected aspect ratio
-  (`resolveAspectRatioValue` over `getEditorSettings(document).aspectRatio` —
-  the same typed façade `buildSceneDescription` reads, so the dialog cannot
-  drift from the compositor). The hydrated, crop-aware clip dimensions feed
+  (`resolveAspectRatioValue` over `getEditorSettings(document).aspectRatio` -
+  the same typed facade `buildSceneDescription` reads, so the dialog cannot
+  drift from the compositor). The hydrated, crop-aware dimensions of every retained
+  clip feed
   [`resolveMp4ExportSettings`](../../src/lib/exporter/mp4ExportSettings.ts),
   which resolves a complete width / height / bitrate tuple before submission.
-  Only "Source" quality targets source dimensions; 720p / 1080p target a fixed
-  short side regardless.
+  "Source" chooses the largest frame at the selected output ratio into which every
+  clip can be contain-fitted at scale at most 1, then applies the native allocation
+  limits. It does not collapse a mixed-resolution or differently cropped timeline
+  to one area-based representative. The fixed 720p / 1080p tiers retain their fixed
+  short side and may upscale a smaller clip.
+
+## Destination transaction
+
+Native MP4 and GIF writers never receive the user-selected destination. Before
+rendering, [`CompositorViewService`](../../electron/native-bridge/services/compositorViewService.ts)
+normalizes only the local fields native can open: screen and webcam media, cursor
+sidecars and sprites, image backgrounds and annotations, plus explicit post-process
+inputs such as a CLI voiceover. The transaction rejects a destination that aliases
+any of them by canonical path or existing-file identity. This covers relative and
+`file:` spellings, case aliases on case-insensitive platforms, symlinks, and hard
+links, and the check runs both before rendering and immediately before commit.
+
+[`ExportDestinationTransactionManager`](../../electron/native-bridge/services/exportDestinationTransaction.ts)
+serializes each canonical destination with in-process keys and deterministic
+filesystem lock directories beside the destination. It creates a same-directory
+workspace, requests private workspace/stage permissions, exclusively reserves a
+single-link regular stage file with the final container extension, and rechecks the
+workspace, lock, and stage identities across every state transition. Unknown stale
+locks are never removed automatically, because their ownership cannot be proved.
+
+Commit requires a non-empty, still-owned stage file. On non-Windows platforms it
+copies the existing destination's POSIX permission bits to the stage, syncs and
+closes the stage, verifies its path identity once more, and performs exactly one
+`rename(stage, destination)`. It never moves, backs up, or unlinks the old
+destination first. If the filesystem cannot perform that replacement, the rename
+fails and the old destination remains at its original path. This is an atomic
+installation policy, not a crash-durability guarantee: the parent directory is not
+synced, and ACLs and extended attributes are not copied.
+
+The staged MP4 path used for CLI voiceover post-processing remains inside the same
+transaction. Its opaque ID is bound to one committed main-frame document owner;
+navigation, renderer loss, or sender destruction revokes that owner and aborts its
+transactions. The default post-process lease is five minutes and the CLI renews it
+once per minute; a missed lease aborts the stage. Cleanup removes only resources
+whose identities still match. If installation succeeded but cleanup remains
+pending, export still reports the saved output with an `EXPORT_CLEANUP_PENDING`
+warning. A lock that could not be removed remains held rather than admitting another
+writer. An unknown lock left by an app-process crash blocks that destination instead
+of being guessed stale; there is no automatic crash-recovery protocol.
 
 ## Output formats and codecs
 

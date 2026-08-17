@@ -294,6 +294,7 @@ The agent may only call the fixed tool set in [ai-agent.md](../architecture/ai-a
 - [ ] Start an MP4 export and confirm the native rendering progress reports advancing frames or percentage.
 - [ ] Confirm the export dialog reports a saved output path after MP4 completes.
 - [ ] Open the exported MP4 outside the app and confirm it plays through the expected duration with audio when the source has audio.
+- [ ] Import a disposable copy of an MP4, record its content hash, choose that same file as the MP4 export destination, and confirm export is rejected before native progress and the source hash remains unchanged.
 - [ ] Start a GIF export and confirm frame rendering and file writing complete without an unhandled error.
 - [ ] Open the exported GIF outside the app and confirm it contains the expected motion and loop behavior.
 - [ ] Export a GIF from colour-rich footage long enough to exhaust the encoder's first code widths, and confirm no frame degrades into corrupted stripes or shifted colours partway through.

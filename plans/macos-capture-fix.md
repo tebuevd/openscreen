@@ -41,12 +41,27 @@ criterion is marked passed, and the manual macOS run is still required.
   overwritten by a concurrent stale save.
 - Export hydrates dimensions for source clips retained by `resolveVisibleClips`. Missing or invalid
   dimensions are probed into an export-only document clone, and a required probe failure blocks
-  export instead of silently falling back to `1920x1080`. Existing dangling-asset and absent
-  `originalPath` clip filtering is separate; hydration is not general file-existence validation.
+  export instead of silently falling back to `1920x1080`. The editor and CLI then use one ordered
+  visible-clip list from that clone for crop-aware dimensions, aspect-ratio resolution, and scene
+  construction. Existing dangling-asset and absent `originalPath` filtering remains separate;
+  hydration is not general file-existence validation.
+- Source sizing now retains every visible clip footprint. It chooses the largest output frame at
+  the selected aspect ratio into which every clip can be contain-fitted without upscaling, rather
+  than choosing one smallest-area representative; fixed 720p and 1080p tiers may still upscale.
 - MP4 export requires explicit positive even dimensions, with an `8192` maximum per axis and a
   `35,389,440`-pixel area limit. The native contract also accepts an optional bitrate override in
   bits per second (up to `200,000,000`); omission retains the area-based native fallback with a
   `2 Mbps` floor.
+- All three MP4 pipelines render each clip's video first. The shared timeline walk then supplies
+  that clip's actual frame count and speed segments to `on_clip_end`, where audio is decoded and
+  WSOLA-stretched. After the complete walk and video flush, the per-clip PCM is assembled from those
+  frame counts and AAC-encoded once. Audio is not decoded up front or overlapped with video encode.
+- MP4 and GIF native writers receive only a private same-directory stage path. Electron rejects a
+  destination that aliases any declared native input, validates the non-empty stage, and installs
+  it with one rename without first moving or deleting an existing destination. Staged CLI
+  post-processing is owner-bound and lease-backed. Cleanup failures after installation surface as
+  warnings; a lock-removal failure retains that lock, and unknown crash leftovers are not reclaimed
+  automatically.
 
 ## Conclusion
 
@@ -257,11 +272,30 @@ Add or extend tests for:
 
 ### Verification commands
 
+The Rust tests and compositor addon build require a linkable macOS ffmpeg SDK. For a
+release-compatible local run, `npm run fetch:ffmpeg:mac` builds the pinned LGPL shared tree used
+below. A different SDK can be supplied with `MAC_FFMPEG_DIR`; the test binary also needs that SDK's
+`lib` directory in `DYLD_LIBRARY_PATH`. CI may use Homebrew ffmpeg as compile/test input, but its GPL
+formula is not a packageable substitute for the LGPL tree.
+
 ```sh
 swift test --package-path electron/native/screencapturekit
 npm run build:native:mac
+npm run fetch:ffmpeg:mac
+export MAC_FFMPEG_DIR="$PWD/crates/thirdparty/ffmpeg-n8.1.2-macos64-lgpl-shared"
+export DYLD_LIBRARY_PATH="$MAC_FFMPEG_DIR/lib"
+cd crates
+cargo test -p openscreen-compositor --lib --tests
+cargo test -p compositor-view-napi --lib
+cd ..
+npm run build:native:compositor:mac
 npx vitest --run src/lib/ai-edition/store/useTimeline.test.ts
 npx vitest --run src/lib/exporter/mp4ExportSettings.test.ts
+npx vitest --run src/components/ai-edition/ExportDialog.submission.test.tsx
+npx vitest --run src/cli/CliExportRunner.test.tsx
+npx vitest --run electron/native-bridge/services/exportDestinationTransaction.test.ts
+npx vitest --run electron/native-bridge/services/compositorExportSafety.test.ts
+npx vitest --run electron/ipc/exportTransactionOwnerRegistry.test.ts
 npx tsc --noEmit
 npx tsc -p tsconfig.test.json --noEmit
 npm run lint
@@ -272,8 +306,10 @@ contract change.
 
 ## Manual macOS Validation
 
-Use a freshly rebuilt helper. `npm run dev` does not rebuild native helpers automatically, so
-confirm the running binary contains the new implementation before trusting a result.
+Use a freshly rebuilt helper and compositor addon. `npm run dev` does not rebuild either native
+artifact automatically, so confirm the running helper contains the capture implementation and the
+app loads the addon built by `npm run build:native:compositor:mac` before trusting capture or Source
+export results.
 
 On the built-in 2x Retina display:
 
