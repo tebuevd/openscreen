@@ -717,6 +717,168 @@ describe("LeftPanel async document results", () => {
 		expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(1);
 	});
 
+	it("commits Project A chat history while Project B is still loading", async () => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectB = deferred<{ success: true; document: AxcutDocument }>();
+		const resultDocument = withTitle(sampleDoc, "Persisted while Project B loads");
+		const projectB: AxcutDocument = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, id: "proj_b", title: "Project B" },
+		};
+		const committed = canonicalChatCommit();
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockImplementation((projectId: string) =>
+			projectId === "proj_b"
+				? loadingProjectB.promise
+				: Promise.resolve({ success: true as const, document: resultDocument }),
+		);
+		bridgeMocks.chatCommitRun.mockImplementation(
+			async (_projectId: string, _sessionId: string, operationId: string) => {
+				chatSessionUpdateListener?.({
+					projectId: "proj_a",
+					sessionId: "session_1",
+					revision: committed.sessionRevision,
+					operationId,
+					kind: "chat",
+					messages: committed.messages,
+				});
+				return committed;
+			},
+		);
+		const run = deferred<ReturnType<typeof chatResult>>();
+		await startPendingChat(run.promise);
+		await act(async () => {
+			run.resolve(chatResult(resultDocument));
+			await run.promise;
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(resultDocument));
+
+		const selectCalls = bridgeMocks.chatSelectSession.mock.calls.length;
+		let loading!: Promise<void>;
+		await act(async () => {
+			loading = useProjectStore.getState().loadProject("proj_b");
+			await Promise.resolve();
+		});
+		await waitFor(() =>
+			expect(bridgeMocks.chatSelectSession.mock.calls.length).toBeGreaterThan(selectCalls),
+		);
+		await act(async () => {
+			saving.resolve({ success: true, document: resultDocument });
+			await saving.promise;
+		});
+
+		await waitFor(() => expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(1));
+		expect(screen.getAllByText("The edit is ready.")).toHaveLength(1);
+		expect(bridgeMocks.chatResolvePersistence).not.toHaveBeenCalled();
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_a",
+			document: sampleDoc,
+			status: "loading",
+		});
+
+		await act(async () => {
+			loadingProjectB.resolve({ success: true, document: projectB });
+			await loading;
+		});
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_b",
+			document: projectB,
+			status: "ready",
+		});
+	});
+
+	it("keeps one canonical Project A checkpoint when owner teardown wins during a failed Project B load", async () => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectB = deferred<{ success: false; error: string }>();
+		const resultDocument = withTitle(sampleDoc, "Owner-reconciled edit");
+		const committed = canonicalChatCommit();
+		let ownerCommitted = false;
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockImplementation((projectId: string) =>
+			projectId === "proj_b"
+				? loadingProjectB.promise
+				: Promise.resolve({ success: true as const, document: resultDocument }),
+		);
+		bridgeMocks.chatCommitRun.mockResolvedValue({
+			success: false,
+			error: "Owner teardown already committed this operation.",
+		});
+		bridgeMocks.chatOperationStatus.mockImplementation(
+			async (_projectId: string, _sessionId: string, operationId: string) =>
+				ownerCommitted
+					? {
+							state: "committed" as const,
+							kind: "chat" as const,
+							operationId,
+							result: committed,
+						}
+					: { state: "persisting" as const, kind: "chat" as const, operationId },
+		);
+		const run = deferred<ReturnType<typeof chatResult>>();
+		await startPendingChat(run.promise);
+		await act(async () => {
+			run.resolve(chatResult(resultDocument));
+			await run.promise;
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(resultDocument));
+
+		const selectCalls = bridgeMocks.chatSelectSession.mock.calls.length;
+		let loading!: Promise<void>;
+		await act(async () => {
+			loading = useProjectStore.getState().loadProject("proj_b");
+			await Promise.resolve();
+		});
+		await waitFor(() =>
+			expect(bridgeMocks.chatSelectSession.mock.calls.length).toBeGreaterThan(selectCalls),
+		);
+		const operationId = bridgeMocks.chatRun.mock.calls[0][4] as string;
+		ownerCommitted = true;
+		act(() => {
+			chatSessionUpdateListener?.({
+				projectId: "proj_a",
+				sessionId: "session_1",
+				revision: committed.sessionRevision,
+				operationId,
+				kind: "chat",
+				messages: committed.messages,
+			});
+		});
+		await act(async () => {
+			saving.resolve({ success: true, document: resultDocument });
+			await saving.promise;
+		});
+
+		await waitFor(() => expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(1));
+		expect(screen.getAllByText("The edit is ready.")).toHaveLength(1);
+		expect(bridgeMocks.chatResolvePersistence).not.toHaveBeenCalled();
+		expect(bridgeMocks.chatAbortRun).not.toHaveBeenCalled();
+
+		await act(async () => {
+			loadingProjectB.resolve({ success: false, error: "Project B unavailable" });
+			await loading;
+		});
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_a",
+			document: resultDocument,
+			status: "error",
+			error: "Project B unavailable",
+			dirty: false,
+		});
+		expect(screen.getAllByText("The edit is ready.")).toHaveLength(1);
+
+		act(() => useProjectStore.setState({ status: "ready", error: null }));
+		bridgeMocks.chatPrepareRewind.mockResolvedValue({ success: false, error: "stop" });
+		fireEvent.click(screen.getByRole("button", { name: "Rewind to this message" }));
+		fireEvent.click(screen.getByRole("button", { name: "Rewind" }));
+		await waitFor(() =>
+			expect(bridgeMocks.chatPrepareRewind).toHaveBeenCalledWith(
+				"proj_a",
+				"session_1",
+				"canonical_user_1",
+			),
+		);
+	});
+
 	it("recovers two lost chat commit replies from canonical status without duplication", async () => {
 		const committed = canonicalChatCommit();
 		bridgeMocks.chatCommitRun
@@ -1595,6 +1757,76 @@ describe("LeftPanel async document results", () => {
 			),
 		);
 		expect(bridgeMocks.chatCommitRewind).toHaveBeenCalledTimes(1);
+	});
+
+	it("commits Project A rewind history while a failing Project B load retains it", async () => {
+		const prepared = preparedRewind("rewind_while_project_b_loads");
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const loadingProjectB = deferred<{ success: false; error: string }>();
+		const committed = {
+			success: true as const,
+			messages: prepared.messages,
+			sessionRevision: prepared.sessionRevision + 1,
+			pendingComposerRestoration: { revision: prepared.sessionRevision + 1 },
+		};
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockImplementation((projectId: string) =>
+			projectId === "proj_b"
+				? loadingProjectB.promise
+				: Promise.resolve({ success: true as const, document: prepared.document }),
+		);
+		bridgeMocks.chatCommitRewind.mockImplementation(async () => {
+			chatSessionUpdateListener?.({
+				projectId: "proj_a",
+				sessionId: "session_1",
+				revision: committed.sessionRevision,
+				operationId: prepared.operationId,
+				kind: "rewind",
+				messages: committed.messages,
+				pendingComposerRestoration: committed.pendingComposerRestoration,
+			});
+			return committed;
+		});
+		await startPendingRewind(Promise.resolve(prepared));
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(prepared.document));
+
+		const selectCalls = bridgeMocks.chatSelectSession.mock.calls.length;
+		let loading!: Promise<void>;
+		await act(async () => {
+			loading = useProjectStore.getState().loadProject("proj_b");
+			await Promise.resolve();
+		});
+		await waitFor(() =>
+			expect(bridgeMocks.chatSelectSession.mock.calls.length).toBeGreaterThan(selectCalls),
+		);
+		await act(async () => {
+			saving.resolve({ success: true, document: prepared.document });
+			await saving.promise;
+		});
+
+		await waitFor(() => expect(bridgeMocks.chatCommitRewind).toHaveBeenCalledTimes(1));
+		await waitFor(() =>
+			expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue(
+				"Try this edit",
+			),
+		);
+		expect(bridgeMocks.chatResolvePersistence).not.toHaveBeenCalled();
+		expect(bridgeMocks.chatAbortRewind).not.toHaveBeenCalled();
+		expect(screen.queryByText("Applied the old edit.")).not.toBeInTheDocument();
+
+		await act(async () => {
+			loadingProjectB.resolve({ success: false, error: "Project B unavailable" });
+			await loading;
+		});
+		expect(useProjectStore.getState()).toMatchObject({
+			projectId: "proj_a",
+			document: prepared.document,
+			status: "error",
+			error: "Project B unavailable",
+			dirty: false,
+		});
+		expect(bridgeMocks.chatCommitRewind).toHaveBeenCalledTimes(1);
+		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("Try this edit");
 	});
 
 	it("adopts a differing authoritative save and resolves rewind history", async () => {

@@ -60,6 +60,7 @@ export class DocumentSaveError extends Error {
 // replaced, then opened again with the same id; project id alone cannot distinguish them.
 let nextDocumentGeneration = 0;
 const saveQueues = new Map<number, Promise<void>>();
+const retainedLoadingAuthorities = new Map<number, AxcutDocument>();
 
 function allocateDocumentGeneration(): number {
 	return ++nextDocumentGeneration;
@@ -103,6 +104,10 @@ export interface ProjectState {
 	document: AxcutDocument | null;
 	/** Changes for every load/create/clear, including reopening the same project id. */
 	documentGeneration: number;
+	/** Target being loaded while the previous document remains rendered. */
+	loadingTargetProjectId: string | null;
+	/** Explicit owner of that retained document; null outside a load handoff. */
+	loadingRetainedProjectId: string | null;
 	revision: number;
 	status: ProjectStatus;
 	error: string | null;
@@ -215,6 +220,8 @@ async function reconcileLifecycleFailure(
 		set({
 			projectId: document.project.id,
 			document,
+			loadingTargetProjectId: null,
+			loadingRetainedProjectId: null,
 			revision: get().revision + 1,
 			status: "ready",
 			error: null,
@@ -235,6 +242,8 @@ async function reconcileLifecycleFailure(
 		set({
 			projectId: options.fallbackDocument?.project.id ?? options.activeProjectId,
 			document: options.fallbackDocument,
+			loadingTargetProjectId: null,
+			loadingRetainedProjectId: null,
 			revision: get().revision + 1,
 			status: "error",
 			error: `${operationMessage} Recovery failed: ${reconciliationMessage}`,
@@ -247,6 +256,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	projectId: null,
 	document: null,
 	documentGeneration: 0,
+	loadingTargetProjectId: null,
+	loadingRetainedProjectId: null,
 	revision: 0,
 	status: "idle",
 	error: null,
@@ -257,18 +268,37 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	lastSavedAt: null,
 
 	async loadProject(projectId) {
+		const before = get();
+		retainedLoadingAuthorities.delete(before.documentGeneration);
+		const retainedProjectId =
+			before.projectId && before.document?.project.id === before.projectId
+				? before.projectId
+				: null;
+		const retainedDocumentGeneration = before.documentGeneration;
 		const documentGeneration = allocateDocumentGeneration();
-		set({ documentGeneration, status: "loading", error: null });
+		set({
+			documentGeneration,
+			loadingTargetProjectId: projectId,
+			loadingRetainedProjectId: retainedProjectId,
+			status: "loading",
+			error: null,
+		});
 		try {
 			const result = await nativeBridgeClient.aiEdition.get(projectId);
 			if (!result.success || !result.document) {
 				throw new Error(result.error ?? "Failed to load project");
 			}
 			const document = parseDocument(result.document);
-			if (get().documentGeneration !== documentGeneration) return;
+			if (get().documentGeneration !== documentGeneration) {
+				retainedLoadingAuthorities.delete(documentGeneration);
+				return;
+			}
+			retainedLoadingAuthorities.delete(documentGeneration);
 			set({
 				projectId,
 				document,
+				loadingTargetProjectId: null,
+				loadingRetainedProjectId: null,
 				revision: get().revision + 1,
 				status: "ready",
 				error: null,
@@ -277,8 +307,34 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			});
 			void import("./undo").then(({ clearHistory }) => clearHistory());
 		} catch (error) {
-			if (get().documentGeneration !== documentGeneration) return;
+			await (saveQueues.get(retainedDocumentGeneration) ?? Promise.resolve());
+			const current = get();
+			if (current.documentGeneration !== documentGeneration) {
+				retainedLoadingAuthorities.delete(documentGeneration);
+				return;
+			}
+			const retainedAuthority = retainedLoadingAuthorities.get(documentGeneration) ?? null;
+			retainedLoadingAuthorities.delete(documentGeneration);
+			const canRestoreAuthority =
+				retainedAuthority !== null &&
+				current.loadingTargetProjectId === projectId &&
+				current.loadingRetainedProjectId === retainedProjectId &&
+				current.projectId === retainedProjectId &&
+				current.document?.project.id === retainedProjectId &&
+				before.document !== null &&
+				documentsHaveEquivalentSaveContent(current.document, before.document);
 			set({
+				...(canRestoreAuthority
+					? {
+							projectId: retainedAuthority.project.id,
+							document: retainedAuthority,
+							revision: current.revision + 1,
+							dirty: false,
+							lastSavedAt: new Date(),
+						}
+					: {}),
+				loadingTargetProjectId: null,
+				loadingRetainedProjectId: null,
 				status: "error",
 				error: error instanceof Error ? error.message : String(error),
 			});
@@ -286,8 +342,15 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	async createProject(title) {
+		retainedLoadingAuthorities.delete(get().documentGeneration);
 		const documentGeneration = allocateDocumentGeneration();
-		set({ documentGeneration, status: "loading", error: null });
+		set({
+			documentGeneration,
+			loadingTargetProjectId: null,
+			loadingRetainedProjectId: null,
+			status: "loading",
+			error: null,
+		});
 		try {
 			const result = await nativeBridgeClient.aiEdition.create(title);
 			if (!result.success || !result.document) {
@@ -298,6 +361,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			set({
 				projectId: document.project.id,
 				document,
+				loadingTargetProjectId: null,
+				loadingRetainedProjectId: null,
 				revision: get().revision + 1,
 				status: "ready",
 				error: null,
@@ -309,6 +374,8 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 		} catch (error) {
 			if (get().documentGeneration === documentGeneration) {
 				set({
+					loadingTargetProjectId: null,
+					loadingRetainedProjectId: null,
 					status: "error",
 					error: error instanceof Error ? error.message : String(error),
 				});
@@ -320,14 +387,23 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	async importProject(document) {
 		const imported = parseDocument(document);
 		const before = get();
+		retainedLoadingAuthorities.delete(before.documentGeneration);
 		const documentGeneration = allocateDocumentGeneration();
-		set({ documentGeneration, status: "loading", error: null });
+		set({
+			documentGeneration,
+			loadingTargetProjectId: null,
+			loadingRetainedProjectId: null,
+			status: "loading",
+			error: null,
+		});
 		try {
 			const persisted = await persistDocument(imported);
 			if (get().documentGeneration !== documentGeneration) return false;
 			set({
 				projectId: persisted.project.id,
 				document: persisted,
+				loadingTargetProjectId: null,
+				loadingRetainedProjectId: null,
 				revision: get().revision + 1,
 				status: "ready",
 				error: null,
@@ -354,9 +430,16 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 		const deletingActiveProject = before.projectId === projectId;
 		const documentGeneration = deletingActiveProject ? allocateDocumentGeneration() : null;
 		if (documentGeneration !== null) {
+			retainedLoadingAuthorities.delete(before.documentGeneration);
 			// Invalidate first so saves waiting in the old generation never dispatch
 			// after the main process has queued this deletion.
-			set({ documentGeneration, status: "loading", error: null });
+			set({
+				documentGeneration,
+				loadingTargetProjectId: null,
+				loadingRetainedProjectId: null,
+				status: "loading",
+				error: null,
+			});
 		}
 
 		try {
@@ -748,6 +831,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			) {
 				return { success: false, status: "stale" };
 			}
+			const retainedDocument = before.document;
 
 			const parsed = parseDocument(document);
 			if (parsed.project.id !== expected.projectId) {
@@ -767,14 +851,26 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			};
 			const detachedOutcome = (authoritative: AxcutDocument): DocumentResultApplyOutcome => {
 				const current = get();
+				const currentDocumentMatches =
+					current.projectId === expected.projectId &&
+					current.document?.project.id === expected.projectId &&
+					documentsHaveEquivalentSaveContent(current.document, parsed);
+				const retainedLoadingDocumentMatches =
+					current.status === "loading" &&
+					current.documentGeneration === expected.documentGeneration + 1 &&
+					current.loadingTargetProjectId !== null &&
+					current.loadingRetainedProjectId === expected.projectId &&
+					current.projectId === expected.projectId &&
+					current.document?.project.id === expected.projectId &&
+					documentsHaveEquivalentSaveContent(current.document, retainedDocument);
 				if (
 					authoritative.project.id === expected.projectId &&
 					documentsHaveEquivalentSaveContent(authoritative, parsed) &&
-					current.projectId === expected.projectId &&
-					current.status === "ready" &&
-					current.document?.project.id === expected.projectId &&
-					documentsHaveEquivalentSaveContent(current.document, parsed)
+					((current.status === "ready" && currentDocumentMatches) || retainedLoadingDocumentMatches)
 				) {
+					if (retainedLoadingDocumentMatches) {
+						retainedLoadingAuthorities.set(current.documentGeneration, authoritative);
+					}
 					return {
 						success: true,
 						status: "authoritative-detached",
@@ -862,7 +958,11 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	setDocument(document) {
-		const prev = get().document;
+		const state = get();
+		const prev = state.document;
+		if (state.status === "loading") {
+			retainedLoadingAuthorities.delete(state.documentGeneration);
+		}
 		if (prev && prev !== document) {
 			// ponytail: push snapshot to undo history. Defer import to avoid
 			// pulling the undo module into the store at module-load time.
@@ -904,10 +1004,13 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 	},
 
 	clear() {
+		retainedLoadingAuthorities.clear();
 		set({
 			projectId: null,
 			document: null,
 			documentGeneration: allocateDocumentGeneration(),
+			loadingTargetProjectId: null,
+			loadingRetainedProjectId: null,
 			revision: 0,
 			status: "idle",
 			error: null,
