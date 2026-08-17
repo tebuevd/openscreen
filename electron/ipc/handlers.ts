@@ -2946,8 +2946,9 @@ export function registerIpcHandlers(
 				helperExitedAfterFailure = stopResult.exited;
 				throw stopResult.error;
 			}
-			if (proc.exitCode !== 0 || proc.signalCode !== null) {
-				throw new Error("Native macOS capture reported success before a clean helper exit.");
+			const closeEvent = processOutput.closeEvent;
+			if (!closeEvent || closeEvent.code !== 0 || closeEvent.signal !== null) {
+				throw new Error("Native macOS capture reported success before a clean helper close.");
 			}
 			const screenVideoPath = stopResult.screenVideoPath;
 
@@ -3034,7 +3035,7 @@ export function registerIpcHandlers(
 				processOutput.isolate();
 				const releaseOnClose = () => releaseOwnedCaptureState();
 				proc.once("close", releaseOnClose);
-				if (proc.exitCode !== null || proc.signalCode !== null) {
+				if (processOutput.closeEvent) {
 					proc.off("close", releaseOnClose);
 					releaseOwnedCaptureState();
 				}

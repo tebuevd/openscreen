@@ -129,6 +129,24 @@ describe("NativeMacCaptureOutput", () => {
 });
 
 describe("terminateNativeMacCapture", () => {
+	it("waits for close when the helper has exited but its pipes are still draining", async () => {
+		const helper = new FakeMacHelper();
+		const output = captureOutput(helper);
+		helper.exitCode = 0;
+		let settled = false;
+
+		const pending = terminateNativeMacCapture(asProc(helper), 100, output).then((closed) => {
+			settled = true;
+			return closed;
+		});
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(settled).toBe(false);
+		expect(helper.killSignals).toEqual([]);
+		helper.emit("close", 0, null);
+		await expect(pending).resolves.toBe(true);
+	});
+
 	it("escalates to SIGKILL when the helper ignores SIGTERM", async () => {
 		const helper = new FakeMacHelper();
 		helper.diesOnTerm = false;
@@ -154,32 +172,38 @@ describe("terminateNativeMacCapture", () => {
 });
 
 describe("stopNativeMacCapture", () => {
-	it("rejects immediately when a clean helper exit has no terminal event", async () => {
+	it("waits for close before rejecting an exited helper with no terminal event", async () => {
 		const helper = new FakeMacHelper();
 		const output = captureOutput(helper);
 		const write = vi.spyOn(helper.stdin, "write");
 		helper.exitCode = 0;
-		const baselineCloseListeners = helper.listenerCount("close");
-		const baselineErrorListeners = helper.listenerCount("error");
-		const baselineStdinErrorListeners = helper.stdin.listenerCount("error");
+		let settled = false;
 
-		const result = await stopNativeMacCapture({
+		const pending = stopNativeMacCapture({
 			proc: asProc(helper),
 			output,
 			targetPath: "/recordings/complete.mp4",
 			timeoutMs: 100,
+		}).then((result) => {
+			settled = true;
+			return result;
 		});
+		await vi.advanceTimersByTimeAsync(0);
+		expect(settled).toBe(false);
+		expect(write).not.toHaveBeenCalled();
+
+		helper.emit("close", 0, null);
+		const result = await pending;
 
 		expect(result).toMatchObject({ ok: false, exited: true });
 		if (!result.ok) expect(result.error.message).toMatch(/authoritative recording-stopped event/);
-		expect(write).not.toHaveBeenCalled();
-		expect(helper.listenerCount("close")).toBe(baselineCloseListeners);
-		expect(helper.listenerCount("error")).toBe(baselineErrorListeners);
-		expect(helper.stdin.listenerCount("error")).toBe(baselineStdinErrorListeners);
+		expect(helper.listenerCount("close")).toBe(0);
+		expect(helper.listenerCount("error")).toBe(0);
+		expect(helper.stdin.listenerCount("error")).toBe(0);
 		expect(vi.getTimerCount()).toBe(0);
 	});
 
-	it("retains a terminal event received before stop waiter registration", async () => {
+	it("retains terminal and close events received before stop waiter registration", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-mac-stop-"));
 		temporaryDirectories.push(directory);
 		const targetPath = path.join(directory, "complete.mp4");
@@ -191,6 +215,7 @@ describe("stopNativeMacCapture", () => {
 			`${JSON.stringify({ event: "recording-stopped", screenPath: targetPath })}\n`,
 		);
 		helper.exitCode = 0;
+		helper.emit("close", 0, null);
 
 		await expect(
 			stopNativeMacCapture({
@@ -278,6 +303,7 @@ describe("stopNativeMacCapture", () => {
 			`${JSON.stringify({ event: "recording-stopped", screenPath: targetPath })}\n`,
 		);
 		helper.exitCode = 0;
+		helper.emit("close", 0, null);
 
 		await expect(
 			stopNativeMacCapture({
@@ -316,6 +342,7 @@ describe("stopNativeMacCapture", () => {
 			settled = true;
 			return result;
 		});
+		helper.exitCode = 0;
 		helper.stdout.write(
 			`${JSON.stringify({ event: "recording-stopped", screenPath: targetPath })}\n`,
 		);
@@ -323,7 +350,6 @@ describe("stopNativeMacCapture", () => {
 		await vi.advanceTimersByTimeAsync(0);
 		expect(settled).toBe(false);
 
-		helper.exitCode = 0;
 		helper.emit("close", 0, null);
 		await expect(pending).resolves.toEqual({ ok: true, screenVideoPath: targetPath });
 	});
@@ -359,7 +385,7 @@ describe("stopNativeMacCapture", () => {
 		await vi.advanceTimersByTimeAsync(50);
 		const result = await pending;
 		expect(result).toMatchObject({ ok: false, exited: true });
-		if (!result.ok) expect(result.error.message).toMatch(/helper did not exit within 100ms/);
+		if (!result.ok) expect(result.error.message).toMatch(/helper did not close within 100ms/);
 		expect(helper.killSignals).toEqual(["SIGTERM", "SIGKILL"]);
 	});
 
@@ -797,7 +823,7 @@ describe("teardownFailedNativeMacCapture", () => {
 		expect(output.output).toBe(outputBeforeTeardown);
 		expect(removeFile).toHaveBeenCalledWith("/recordings/partial.mp4");
 		expect(warn).toHaveBeenCalledWith(
-			"[native-sck] helper survived failed-start termination",
+			"[native-sck] helper did not close after failed-start termination",
 			4242,
 		);
 	});

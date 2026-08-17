@@ -14,6 +14,11 @@ type NativeMacCaptureTerminalEvent =
 	| NativeMacHelperRecordingStoppedEvent
 	| NativeMacHelperErrorEvent;
 
+type NativeMacProcessClose = {
+	readonly code: number | null;
+	readonly signal: NodeJS.Signals | null;
+};
+
 export const NATIVE_MAC_CAPTURE_KILL_GRACE_MS = 1_000;
 export const NATIVE_MAC_CAPTURE_STOP_TIMEOUT_MS = 30_000;
 export const NATIVE_MAC_CAPTURE_POST_FINALIZATION_TIMEOUT_MS = 2_000;
@@ -84,6 +89,7 @@ export class NativeMacCaptureOutput {
 	private outputBuffer = "";
 	private terminalEvent: NativeMacCaptureTerminalEvent | null = null;
 	private readonly nonterminalErrorEvents: NativeMacHelperErrorEvent[] = [];
+	private processClose: NativeMacProcessClose | null = null;
 	private isolated = false;
 	private disposed = false;
 
@@ -95,7 +101,8 @@ export class NativeMacCaptureOutput {
 		this.drain(chunk, "stderr");
 	};
 
-	private readonly handleClose = () => {
+	private readonly handleClose = (code: number | null, signal: NodeJS.Signals | null) => {
+		this.processClose = { code, signal };
 		this.dispose();
 	};
 
@@ -146,6 +153,10 @@ export class NativeMacCaptureOutput {
 
 	get nonterminalErrors() {
 		return [...this.nonterminalErrorEvents];
+	}
+
+	get closeEvent() {
+		return this.processClose;
 	}
 
 	onEvent(listener: NativeMacHelperEventListener) {
@@ -253,19 +264,23 @@ function hasExited(proc: ChildProcessWithoutNullStreams) {
 	return proc.exitCode !== null || proc.signalCode !== null;
 }
 
-function waitForExit(proc: ChildProcessWithoutNullStreams, timeoutMs: number) {
-	if (hasExited(proc)) return Promise.resolve(true);
+function waitForClose(
+	proc: ChildProcessWithoutNullStreams,
+	output: NativeMacCaptureOutput | undefined,
+	timeoutMs: number,
+) {
+	if (output?.closeEvent) return Promise.resolve(true);
 
 	return new Promise<boolean>((resolve) => {
-		const settle = (exited: boolean) => {
+		const settle = (closed: boolean) => {
 			clearTimeout(timer);
 			proc.off("close", onClose);
-			resolve(exited);
+			resolve(closed);
 		};
 		const onClose = () => settle(true);
 		const timer = setTimeout(() => settle(false), timeoutMs);
 		proc.once("close", onClose);
-		if (hasExited(proc)) settle(true);
+		if (output?.closeEvent) settle(true);
 	});
 }
 
@@ -286,7 +301,7 @@ function requestNativeMacCaptureStop(options: {
 		let settled = false;
 		let validatingTerminalEvent = false;
 		let validatedScreenPath: string | null = null;
-		let processExit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
+		let processClose: NativeMacProcessClose | null = null;
 		let timer: ReturnType<typeof setTimeout> | null = null;
 		let postFinalizationTimer: ReturnType<typeof setTimeout> | null = null;
 		const cleanup = () => {
@@ -310,11 +325,11 @@ function requestNativeMacCaptureStop(options: {
 			reject(toError(error));
 		};
 		const maybeSucceed = () => {
-			if (!validatedScreenPath || !processExit) return;
-			if (processExit.code !== 0 || processExit.signal !== null) {
+			if (!validatedScreenPath || !processClose) return;
+			if (processClose.code !== 0 || processClose.signal !== null) {
 				fail(
 					new Error(
-						`Native macOS capture finalized its output but exited unsuccessfully (code=${processExit.code ?? "unknown"}, signal=${processExit.signal ?? "none"}).`,
+						`Native macOS capture finalized its output but exited unsuccessfully (code=${processClose.code ?? "unknown"}, signal=${processClose.signal ?? "none"}).`,
 					),
 				);
 				return;
@@ -331,12 +346,12 @@ function requestNativeMacCaptureStop(options: {
 			}
 
 			validatingTerminalEvent = true;
-			if (!processExit && postFinalizationTimer === null) {
+			if (!processClose && postFinalizationTimer === null) {
 				postFinalizationTimer = setTimeout(
 					() =>
 						fail(
 							new Error(
-								`Native macOS capture finalized its output but the helper did not exit within ${postFinalizationTimeoutMs}ms.`,
+								`Native macOS capture finalized its output but the helper did not close within ${postFinalizationTimeoutMs}ms.`,
 							),
 						),
 					postFinalizationTimeoutMs,
@@ -371,9 +386,9 @@ function requestNativeMacCaptureStop(options: {
 				}
 			}
 		};
-		const recordProcessExit = (code: number | null, signal: NodeJS.Signals | null) => {
-			if (processExit) return;
-			processExit = { code, signal };
+		const recordProcessClose = (code: number | null, signal: NodeJS.Signals | null) => {
+			if (processClose) return;
+			processClose = { code, signal };
 			if (postFinalizationTimer !== null) {
 				clearTimeout(postFinalizationTimer);
 				postFinalizationTimer = null;
@@ -396,14 +411,15 @@ function requestNativeMacCaptureStop(options: {
 			}
 			maybeSucceed();
 		};
-		const settleFromProcessState = () => {
-			if (!hasExited(proc)) return false;
-			recordProcessExit(proc.exitCode, proc.signalCode);
+		const settleFromRetainedClose = () => {
+			const closeEvent = output.closeEvent;
+			if (!closeEvent) return false;
+			recordProcessClose(closeEvent.code, closeEvent.signal);
 			return true;
 		};
 		const onOutput = (event: NativeMacHelperEvent) => inspect(event);
 		const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
-			recordProcessExit(code, signal);
+			recordProcessClose(code, signal);
 		};
 		const onProcessError = (error: Error) => {
 			if (!validatingTerminalEvent) fail(error);
@@ -435,9 +451,10 @@ function requestNativeMacCaptureStop(options: {
 		settleFromTerminalEvent();
 		if (settled) return;
 
-		// The retained terminal event and process state cover output/close races around registration.
-		settleFromProcessState();
+		// Retained terminal and close events cover output/close races around registration.
+		settleFromRetainedClose();
 		if (settled || validatingTerminalEvent) return;
+		if (hasExited(proc)) return;
 		if (!proc.stdin.writable || proc.stdin.destroyed || proc.stdin.writableEnded) {
 			fail(new Error("Native macOS capture command channel is closed."));
 			return;
@@ -456,26 +473,31 @@ function requestNativeMacCaptureStop(options: {
 	});
 }
 
-/** Sends SIGTERM, then bounds a SIGKILL escalation and reports whether the helper exited. */
+/** Sends SIGTERM, then bounds a SIGKILL escalation and reports whether the helper closed. */
 export async function terminateNativeMacCapture(
 	proc: ChildProcessWithoutNullStreams,
 	graceMs = NATIVE_MAC_CAPTURE_KILL_GRACE_MS,
+	output?: NativeMacCaptureOutput,
 ) {
-	if (hasExited(proc)) return true;
+	if (output?.closeEvent) return true;
+	if (hasExited(proc)) return waitForClose(proc, output, graceMs);
 
+	const closeAfterTerm = waitForClose(proc, output, graceMs);
 	try {
 		proc.kill("SIGTERM");
 	} catch {
 		// The process may have exited between the state check and the signal.
 	}
-	if (await waitForExit(proc, graceMs)) return true;
+	if (await closeAfterTerm) return true;
+	if (hasExited(proc)) return false;
 
+	const closeAfterKill = waitForClose(proc, output, graceMs);
 	try {
 		proc.kill("SIGKILL");
 	} catch {
 		// A second exit race is harmless; the bounded wait below confirms it.
 	}
-	return waitForExit(proc, graceMs);
+	return closeAfterKill;
 }
 
 export async function teardownFailedNativeMacStop(options: {
@@ -495,6 +517,7 @@ export async function teardownFailedNativeMacStop(options: {
 		exited = await terminateNativeMacCapture(
 			options.proc,
 			options.graceMs ?? NATIVE_MAC_CAPTURE_KILL_GRACE_MS,
+			options.output,
 		);
 	} catch (error) {
 		reportCleanupFailure(
@@ -506,7 +529,7 @@ export async function teardownFailedNativeMacStop(options: {
 	if (!exited) {
 		reportCleanupFailure(
 			options.warn,
-			"[native-sck] helper survived failed-stop termination",
+			"[native-sck] helper did not close after failed-stop termination",
 			options.proc.pid,
 		);
 	}
@@ -571,6 +594,7 @@ export async function teardownFailedNativeMacCapture(options: {
 		exited = await terminateNativeMacCapture(
 			options.proc,
 			options.graceMs ?? NATIVE_MAC_CAPTURE_KILL_GRACE_MS,
+			options.output ?? undefined,
 		);
 	} catch (error) {
 		reportCleanupFailure(
@@ -582,7 +606,7 @@ export async function teardownFailedNativeMacCapture(options: {
 	if (!exited) {
 		reportCleanupFailure(
 			options.warn,
-			"[native-sck] helper survived failed-start termination",
+			"[native-sck] helper did not close after failed-start termination",
 			options.proc.pid,
 		);
 	}
