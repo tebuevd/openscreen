@@ -20,22 +20,34 @@ final class HelperErrorEventTests: XCTestCase {
 		}
 	}
 
-	func testCaptureFailureReportsNonterminalDiagnosticBeforeFinalization() async {
-		var actions: [String] = []
-
-		await CaptureFailureFinalization.run(
-			message: "capture disconnected",
-			report: { code, message in
-				actions.append("\(code.rawValue):\(code.isTerminal):\(message)")
-			},
-			finalize: {
-				actions.append("finalize")
+	func testCaptureFailureReportsOutputBeforeExactlyOneProcessExit() async {
+		for (outcome, exitCode) in [(CaptureStopOutcome.finalized, Int32(0)), (.failed, 1)] {
+			var actions: [String] = []
+			let exitCoordinator = CaptureProcessExitCoordinator {
+				actions.append("exit:\($0)")
 			}
-		)
 
-		XCTAssertEqual(
-			actions,
-			["capture-stopped-with-error:false:capture disconnected", "finalize"]
-		)
+			await CaptureFailureFinalization.run(
+				message: "capture disconnected",
+				report: { code, message in
+					actions.append("\(code.rawValue):\(code.isTerminal):\(message)")
+				},
+				finalize: {
+					actions.append("terminal-output")
+					return outcome
+				},
+				terminate: { result in exitCoordinator.terminate(after: result) }
+			)
+			exitCoordinator.terminate(after: .failed)
+
+			XCTAssertEqual(
+				actions,
+				[
+					"capture-stopped-with-error:false:capture disconnected",
+					"terminal-output",
+					"exit:\(exitCode)",
+				]
+			)
+		}
 	}
 }

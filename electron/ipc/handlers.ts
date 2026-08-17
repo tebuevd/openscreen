@@ -2946,6 +2946,9 @@ export function registerIpcHandlers(
 				helperExitedAfterFailure = stopResult.exited;
 				throw stopResult.error;
 			}
+			if (proc.exitCode !== 0 || proc.signalCode !== null) {
+				throw new Error("Native macOS capture reported success before a clean helper exit.");
+			}
 			const screenVideoPath = stopResult.screenVideoPath;
 
 			if (cursorCaptureMode === "editable-overlay") {

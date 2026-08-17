@@ -146,8 +146,8 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	private var didEmitRecordingStarted = false
 	private var didReportWriterFailure = false
 	private var isStopping = false
-	private var didFinishStopping = false
-	private var stopWaiters: [CheckedContinuation<Void, Never>] = []
+	private var stopOutcome: CaptureStopOutcome?
+	private var stopWaiters: [CheckedContinuation<CaptureStopOutcome, Never>] = []
 	private var isPaused = false
 	private var pauseStartedAt: CMTime?
 	private var totalPausedDuration = CMTime.zero
@@ -164,9 +164,11 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 	private var captureFrame = CGRect.zero
 	private let microphoneOutputTypeRawValue = 2
 	private let hostClock = CMClockGetHostTimeClock()
+	private let processExitCoordinator: CaptureProcessExitCoordinator
 
-	init(request: RecordingRequest) {
+	init(request: RecordingRequest, processExitCoordinator: CaptureProcessExitCoordinator) {
 		self.request = request
+		self.processExitCoordinator = processExitCoordinator
 	}
 
 	func start() async throws {
@@ -208,7 +210,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		try await stream.startCapture()
 	}
 
-	func stop() async {
+	func stop() async -> CaptureStopOutcome {
 		let shouldStop = stateQueue.sync {
 			if isStopping {
 				return false
@@ -217,8 +219,7 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			return true
 		}
 		if !shouldStop {
-			await waitForStopCompletion()
-			return
+			return await waitForStopCompletion()
 		}
 
 		do {
@@ -231,34 +232,35 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			])
 		}
 
-		await finishWriter()
-		completeStop()
+		let outcome = await finishWriter()
+		completeStop(with: outcome)
+		return outcome
 	}
 
-	private func waitForStopCompletion() async {
+	private func waitForStopCompletion() async -> CaptureStopOutcome {
 		await withCheckedContinuation { continuation in
-			let shouldResume = stateQueue.sync {
-				if didFinishStopping {
-					return true
+			let completedOutcome: CaptureStopOutcome? = stateQueue.sync {
+				if let stopOutcome {
+					return stopOutcome
 				}
 				stopWaiters.append(continuation)
-				return false
+				return nil
 			}
-			if shouldResume {
-				continuation.resume()
+			if let completedOutcome {
+				continuation.resume(returning: completedOutcome)
 			}
 		}
 	}
 
-	private func completeStop() {
+	private func completeStop(with outcome: CaptureStopOutcome) {
 		let waiters = stateQueue.sync {
-			didFinishStopping = true
+			stopOutcome = outcome
 			let waiters = stopWaiters
 			stopWaiters.removeAll()
 			return waiters
 		}
 		for waiter in waiters {
-			waiter.resume()
+			waiter.resume(returning: outcome)
 		}
 	}
 
@@ -312,7 +314,8 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			await CaptureFailureFinalization.run(
 				message: "\(error)",
 				report: { code, message in emitError(code: code, message: message) },
-				finalize: { await self.stop() }
+				finalize: { await self.stop() },
+				terminate: { outcome in self.processExitCoordinator.terminate(after: outcome) }
 			)
 		}
 	}
@@ -696,9 +699,9 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		}
 	}
 
-	private func finishWriter() async {
+	private func finishWriter() async -> CaptureStopOutcome {
 		guard let writer, didStartWriting else {
-			return
+			return .noRecording
 		}
 
 		// Capture has stopped, so nothing is in flight on the sample queue any more; hopping
@@ -721,11 +724,13 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 				"event": "recording-stopped",
 				"screenPath": request.outputs.screenPath,
 			])
+			return .finalized
 		} else {
 			emitError(
 				code: .writerFailed,
 				message: writer.error.map { "\($0)" } ?? "AVAssetWriter failed with status \(writer.status.rawValue)."
 			)
+			return .failed
 		}
 	}
 
@@ -889,7 +894,11 @@ struct OpenScreenScreenCaptureKitHelper {
 			let requestData = Data(CommandLine.arguments[1].utf8)
 			let decoder = JSONDecoder()
 			let request = try decoder.decode(RecordingRequest.self, from: requestData)
-			let recorder = ScreenCaptureRecorder(request: request)
+			let processExitCoordinator = CaptureProcessExitCoordinator { code in exit(code) }
+			let recorder = ScreenCaptureRecorder(
+				request: request,
+				processExitCoordinator: processExitCoordinator
+			)
 
 			try await recorder.start()
 			let stopTask = Task.detached {
@@ -897,7 +906,8 @@ struct OpenScreenScreenCaptureKitHelper {
 					nextLine: { readLine() },
 					pause: { recorder.pause() },
 					resume: { recorder.resume() },
-					stopAndFinalize: { await recorder.stop() }
+					stopAndFinalize: { await recorder.stop() },
+					terminate: { outcome in processExitCoordinator.terminate(after: outcome) }
 				)
 			}
 

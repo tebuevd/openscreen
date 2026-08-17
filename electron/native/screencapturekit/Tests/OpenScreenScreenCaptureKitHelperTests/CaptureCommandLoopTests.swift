@@ -7,6 +7,7 @@ final class CaptureCommandLoopTests: XCTestCase {
 		for lines in [["stop"], []] {
 			var pendingLines = lines
 			var finalizationCount = 0
+			var exitCodes: [Int32] = []
 
 			await CaptureCommandLoop.run(
 				nextLine: { pendingLines.isEmpty ? nil : pendingLines.removeFirst() },
@@ -15,10 +16,13 @@ final class CaptureCommandLoopTests: XCTestCase {
 				stopAndFinalize: {
 					await Task.yield()
 					finalizationCount += 1
-				}
+					return .finalized
+				},
+				terminate: { exitCodes.append($0.exitCode) }
 			)
 
 			XCTAssertEqual(finalizationCount, 1)
+			XCTAssertEqual(exitCodes, [0])
 		}
 	}
 
@@ -30,9 +34,24 @@ final class CaptureCommandLoopTests: XCTestCase {
 			nextLine: { pendingLines.isEmpty ? nil : pendingLines.removeFirst() },
 			pause: { actions.append("pause") },
 			resume: { actions.append("resume") },
-			stopAndFinalize: { actions.append("stop") }
+			stopAndFinalize: {
+				actions.append("stop")
+				return .finalized
+			},
+			terminate: { actions.append("exit:\($0.exitCode)") }
 		)
 
-		XCTAssertEqual(actions, ["pause", "resume", "stop"])
+		XCTAssertEqual(actions, ["pause", "resume", "stop", "exit:0"])
+	}
+
+	func testConcurrentTerminationRequestsExitOnlyOnce() {
+		var exitCodes: [Int32] = []
+		let coordinator = CaptureProcessExitCoordinator { exitCodes.append($0) }
+
+		DispatchQueue.concurrentPerform(iterations: 10) { index in
+			coordinator.terminate(after: index.isMultiple(of: 2) ? .finalized : .failed)
+		}
+
+		XCTAssertEqual(exitCodes.count, 1)
 	}
 }

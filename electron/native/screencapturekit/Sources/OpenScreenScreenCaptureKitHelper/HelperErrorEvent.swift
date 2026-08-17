@@ -22,9 +22,11 @@ enum CaptureFailureFinalization {
 	static func run(
 		message: String,
 		report: (HelperErrorCode, String) -> Void,
-		finalize: () async -> Void
+		finalize: () async -> CaptureStopOutcome,
+		terminate: (CaptureStopOutcome) -> Void
 	) async {
 		report(.captureStoppedWithError, message)
-		await finalize()
+		let outcome = await finalize()
+		terminate(outcome)
 	}
 }

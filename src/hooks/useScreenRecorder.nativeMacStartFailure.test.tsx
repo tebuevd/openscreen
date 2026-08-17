@@ -211,17 +211,26 @@ describe("useScreenRecorder native macOS start failure", () => {
 describe("useScreenRecorder native macOS stop finalization", () => {
 	it("keeps and attaches the webcam sidecar after recovered screen finalization", async () => {
 		const screenVideoPath = "/recordings/recording-42.mp4";
-		const session = {
+		const screenSession = {
 			screenVideoPath,
-			webcamVideoPath: "/recordings/recording-42-webcam.webm",
 			createdAt: 42,
 			cursorCaptureMode: "editable-overlay",
 		};
-		api.stopNativeMacRecording.mockResolvedValue({
-			success: true,
-			path: screenVideoPath,
-			session: { screenVideoPath, createdAt: 42, cursorCaptureMode: "editable-overlay" },
-		});
+		const session = {
+			...screenSession,
+			webcamVideoPath: "/recordings/recording-42-webcam.webm",
+		};
+		let resolveStop: (result: {
+			success: true;
+			path: string;
+			session: typeof screenSession;
+		}) => void = () => undefined;
+		api.stopNativeMacRecording.mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					resolveStop = resolve;
+				}),
+		);
 		api.attachNativeMacWebcamRecording.mockResolvedValue({ success: true, session });
 		const view = renderHook(() => useScreenRecorder());
 		await enableWebcam(view);
@@ -232,6 +241,14 @@ describe("useScreenRecorder native macOS stop finalization", () => {
 		expect(view.result.current.recording).toBe(true);
 		await act(async () => {
 			view.result.current.toggleRecording();
+		});
+		await waitFor(() => expect(api.stopNativeMacRecording).toHaveBeenCalledTimes(1));
+		expect(fakeHandles[0].stop).toHaveBeenCalledTimes(1);
+		expect(api.attachNativeMacWebcamRecording).not.toHaveBeenCalled();
+
+		await act(async () => {
+			resolveStop({ success: true, path: screenVideoPath, session: screenSession });
+			await Promise.resolve();
 		});
 		await waitFor(() => expect(api.switchToEditor).toHaveBeenCalledTimes(1));
 

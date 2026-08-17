@@ -16,6 +16,7 @@ type NativeMacCaptureTerminalEvent =
 
 export const NATIVE_MAC_CAPTURE_KILL_GRACE_MS = 1_000;
 export const NATIVE_MAC_CAPTURE_STOP_TIMEOUT_MS = 30_000;
+export const NATIVE_MAC_CAPTURE_POST_FINALIZATION_TIMEOUT_MS = 2_000;
 
 function reportCleanupFailure(
 	warn: WarningReporter | undefined,
@@ -273,8 +274,9 @@ function requestNativeMacCaptureStop(options: {
 	output: NativeMacCaptureOutput;
 	targetPath: string | null;
 	timeoutMs: number;
+	postFinalizationTimeoutMs: number;
 }) {
-	const { proc, output, targetPath, timeoutMs } = options;
+	const { proc, output, targetPath, timeoutMs, postFinalizationTimeoutMs } = options;
 	if (!targetPath || output.targetPath !== targetPath) {
 		return Promise.reject(
 			new Error("Native macOS capture process does not own the requested output path."),
@@ -283,9 +285,13 @@ function requestNativeMacCaptureStop(options: {
 	return new Promise<string>((resolve, reject) => {
 		let settled = false;
 		let validatingTerminalEvent = false;
+		let validatedScreenPath: string | null = null;
+		let processExit: { code: number | null; signal: NodeJS.Signals | null } | null = null;
 		let timer: ReturnType<typeof setTimeout> | null = null;
+		let postFinalizationTimer: ReturnType<typeof setTimeout> | null = null;
 		const cleanup = () => {
 			if (timer !== null) clearTimeout(timer);
+			if (postFinalizationTimer !== null) clearTimeout(postFinalizationTimer);
 			output.offEvent(onOutput);
 			proc.off("close", onClose);
 			proc.off("error", onProcessError);
@@ -303,6 +309,18 @@ function requestNativeMacCaptureStop(options: {
 			cleanup();
 			reject(toError(error));
 		};
+		const maybeSucceed = () => {
+			if (!validatedScreenPath || !processExit) return;
+			if (processExit.code !== 0 || processExit.signal !== null) {
+				fail(
+					new Error(
+						`Native macOS capture finalized its output but exited unsuccessfully (code=${processExit.code ?? "unknown"}, signal=${processExit.signal ?? "none"}).`,
+					),
+				);
+				return;
+			}
+			succeed(validatedScreenPath);
+		};
 		const settleFromTerminalEvent = () => {
 			if (settled || validatingTerminalEvent) return validatingTerminalEvent;
 			const terminalEvent = output.stopTerminalEvent;
@@ -313,8 +331,22 @@ function requestNativeMacCaptureStop(options: {
 			}
 
 			validatingTerminalEvent = true;
+			if (!processExit && postFinalizationTimer === null) {
+				postFinalizationTimer = setTimeout(
+					() =>
+						fail(
+							new Error(
+								`Native macOS capture finalized its output but the helper did not exit within ${postFinalizationTimeoutMs}ms.`,
+							),
+						),
+					postFinalizationTimeoutMs,
+				);
+			}
 			void validateFinalizedCaptureFile(terminalEvent.screenPath).then(
-				() => succeed(terminalEvent.screenPath),
+				() => {
+					validatedScreenPath = terminalEvent.screenPath;
+					maybeSucceed();
+				},
 				(error) => fail(error),
 			);
 			return true;
@@ -339,24 +371,39 @@ function requestNativeMacCaptureStop(options: {
 				}
 			}
 		};
-		const settleFromTerminalState = () => {
+		const recordProcessExit = (code: number | null, signal: NodeJS.Signals | null) => {
+			if (processExit) return;
+			processExit = { code, signal };
+			if (postFinalizationTimer !== null) {
+				clearTimeout(postFinalizationTimer);
+				postFinalizationTimer = null;
+			}
+			if (!settleFromTerminalEvent()) {
+				fail(
+					new Error(
+						`Native macOS capture exited without an authoritative recording-stopped event (code=${code ?? "unknown"}, signal=${signal ?? "none"}).${nonterminalErrorContext(output)} Output: ${output.output.trim()}`,
+					),
+				);
+				return;
+			}
+			if (code !== 0 || signal !== null) {
+				fail(
+					new Error(
+						`Native macOS capture finalized its output but exited unsuccessfully (code=${code ?? "unknown"}, signal=${signal ?? "none"}).`,
+					),
+				);
+				return;
+			}
+			maybeSucceed();
+		};
+		const settleFromProcessState = () => {
 			if (!hasExited(proc)) return false;
-			if (settleFromTerminalEvent()) return true;
-			fail(
-				new Error(
-					`Native macOS capture exited without an authoritative recording-stopped event (code=${proc.exitCode ?? "unknown"}, signal=${proc.signalCode ?? "none"}).${nonterminalErrorContext(output)} Output: ${output.output.trim()}`,
-				),
-			);
+			recordProcessExit(proc.exitCode, proc.signalCode);
 			return true;
 		};
 		const onOutput = (event: NativeMacHelperEvent) => inspect(event);
 		const onClose = (code: number | null, signal: NodeJS.Signals | null) => {
-			if (settleFromTerminalEvent()) return;
-			fail(
-				new Error(
-					`Native macOS capture exited without an authoritative recording-stopped event (code=${code ?? "unknown"}, signal=${signal ?? "none"}).${nonterminalErrorContext(output)} Output: ${output.output.trim()}`,
-				),
-			);
+			recordProcessExit(code, signal);
 		};
 		const onProcessError = (error: Error) => {
 			if (!validatingTerminalEvent) fail(error);
@@ -382,12 +429,15 @@ function requestNativeMacCaptureStop(options: {
 		proc.stdin.once("error", onStdinError);
 		for (const event of output.events) {
 			inspect(event);
-			if (settled || validatingTerminalEvent) return;
+			if (settled || validatingTerminalEvent) break;
 		}
-		if (settleFromTerminalEvent()) return;
+		if (settled) return;
+		settleFromTerminalEvent();
+		if (settled) return;
 
 		// The retained terminal event and process state cover output/close races around registration.
-		if (settleFromTerminalState()) return;
+		settleFromProcessState();
+		if (settled || validatingTerminalEvent) return;
 		if (!proc.stdin.writable || proc.stdin.destroyed || proc.stdin.writableEnded) {
 			fail(new Error("Native macOS capture command channel is closed."));
 			return;
@@ -472,6 +522,7 @@ export async function stopNativeMacCapture(options: {
 	output: NativeMacCaptureOutput;
 	targetPath: string | null;
 	timeoutMs?: number;
+	postFinalizationTimeoutMs?: number;
 	killGraceMs?: number;
 	warn?: WarningReporter;
 }): Promise<NativeMacCaptureStopResult> {
@@ -481,6 +532,8 @@ export async function stopNativeMacCapture(options: {
 			output: options.output,
 			targetPath: options.targetPath,
 			timeoutMs: options.timeoutMs ?? NATIVE_MAC_CAPTURE_STOP_TIMEOUT_MS,
+			postFinalizationTimeoutMs:
+				options.postFinalizationTimeoutMs ?? NATIVE_MAC_CAPTURE_POST_FINALIZATION_TIMEOUT_MS,
 		});
 		return { ok: true, screenVideoPath };
 	} catch (error) {
