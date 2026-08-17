@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { ExportDestinationTransactionManager } from "../native-bridge/services/exportDestinationTransaction";
-import { ExportTransactionOwnerRegistry } from "./exportTransactionOwnerRegistry";
+import { RendererDocumentOwnerRegistry } from "./rendererDocumentOwnerRegistry";
 
 class FakeFrame {
 	readonly frameToken: string;
@@ -76,10 +76,10 @@ function commitMainNavigation(sender: FakeSender, frame: FakeFrame, url = "https
 	sender.emit("did-frame-navigate", {}, url, 200, "OK", true, frame.processId, frame.routingId);
 }
 
-describe("ExportTransactionOwnerRegistry", () => {
+describe("RendererDocumentOwnerRegistry", () => {
 	it("rejects outgoing IPC after navigation start and accepts only the committed new document", async () => {
-		const abortOwner = vi.fn(async () => undefined);
-		const registry = new ExportTransactionOwnerRegistry({ abortOwner });
+		const releaseOwner = vi.fn(async () => undefined);
+		const registry = new RendererDocumentOwnerRegistry({ releaseOwner });
 		const sender = new FakeSender(7);
 		const outgoingFrame = sender.mainFrame;
 		const outgoingOwner = registry.ownerFor(request(sender) as never);
@@ -99,7 +99,7 @@ describe("ExportTransactionOwnerRegistry", () => {
 		expect(() => registry.ownerFor(request(sender, outgoingFrame) as never)).toThrow(
 			/navigation is pending/,
 		);
-		expect(abortOwner).toHaveBeenCalledWith(outgoingOwner);
+		expect(releaseOwner).toHaveBeenCalledWith(outgoingOwner);
 
 		const committedFrame = new FakeFrame(207, 9, "document-7-2");
 		commitMainNavigation(sender, committedFrame);
@@ -112,8 +112,8 @@ describe("ExportTransactionOwnerRegistry", () => {
 	});
 
 	it("recovers a failed main-frame navigation with a fresh owner for the surviving document", () => {
-		const abortOwner = vi.fn(async () => undefined);
-		const registry = new ExportTransactionOwnerRegistry({ abortOwner });
+		const releaseOwner = vi.fn(async () => undefined);
+		const registry = new RendererDocumentOwnerRegistry({ releaseOwner });
 		const sender = new FakeSender(8);
 		const survivingFrame = sender.mainFrame;
 		const outgoingOwner = registry.ownerFor(request(sender) as never);
@@ -133,11 +133,11 @@ describe("ExportTransactionOwnerRegistry", () => {
 
 		const recoveredOwner = registry.ownerFor(request(sender) as never);
 		expect(recoveredOwner).not.toBe(outgoingOwner);
-		expect(abortOwner).toHaveBeenCalledTimes(1);
+		expect(releaseOwner).toHaveBeenCalledTimes(1);
 	});
 
 	it("does not recover a cancelled navigation while a second main navigation is pending", () => {
-		const registry = new ExportTransactionOwnerRegistry({ abortOwner: async () => undefined });
+		const registry = new RendererDocumentOwnerRegistry({ releaseOwner: async () => undefined });
 		const sender = new FakeSender(9);
 		registry.ownerFor(request(sender) as never);
 		startMainNavigation(sender, "https://first.test");
@@ -161,8 +161,8 @@ describe("ExportTransactionOwnerRegistry", () => {
 	});
 
 	it("keeps ownership for in-page and subframe navigation and rejects subframe IPC", () => {
-		const abortOwner = vi.fn(async () => undefined);
-		const registry = new ExportTransactionOwnerRegistry({ abortOwner });
+		const releaseOwner = vi.fn(async () => undefined);
+		const registry = new RendererDocumentOwnerRegistry({ releaseOwner });
 		const sender = new FakeSender(10);
 		const owner = registry.ownerFor(request(sender) as never);
 
@@ -180,7 +180,7 @@ describe("ExportTransactionOwnerRegistry", () => {
 		});
 
 		expect(registry.ownerFor(request(sender) as never)).toBe(owner);
-		expect(abortOwner).not.toHaveBeenCalled();
+		expect(releaseOwner).not.toHaveBeenCalled();
 		const subframe = new FakeFrame(500, 2, "subframe", sender.mainFrame);
 		expect(() => registry.ownerFor(request(sender, subframe) as never)).toThrow(
 			/committed main document/,
@@ -188,7 +188,7 @@ describe("ExportTransactionOwnerRegistry", () => {
 	});
 
 	it("waits for a committed frame when observation begins during loading", () => {
-		const registry = new ExportTransactionOwnerRegistry({ abortOwner: async () => undefined });
+		const registry = new RendererDocumentOwnerRegistry({ releaseOwner: async () => undefined });
 		const sender = new FakeSender(11);
 		sender.loadingMainFrame = true;
 		registry.observe(sender as never);
@@ -200,39 +200,55 @@ describe("ExportTransactionOwnerRegistry", () => {
 	});
 
 	it("keeps renderer-process replacement pending until its new main frame commits", () => {
-		const abortOwner = vi.fn(async () => undefined);
-		const registry = new ExportTransactionOwnerRegistry({ abortOwner });
+		const releaseOwner = vi.fn(async () => undefined);
+		const registry = new RendererDocumentOwnerRegistry({ releaseOwner });
 		const sender = new FakeSender(12);
 		const owner = registry.ownerFor(request(sender) as never);
 
 		sender.emit("render-process-gone");
 		expect(() => registry.ownerFor(request(sender) as never)).toThrow(/navigation is pending/);
-		expect(abortOwner).toHaveBeenCalledWith(owner);
+		expect(releaseOwner).toHaveBeenCalledWith(owner);
 
 		const replacement = new FakeFrame(312, 1, "document-12-2");
 		commitMainNavigation(sender, replacement);
 		expect(registry.ownerFor(request(sender) as never)).not.toBe(owner);
 	});
 
-	it("aborts ownership and rejects future IPC when the sender is destroyed", () => {
-		const abortOwner = vi.fn(async () => undefined);
-		const registry = new ExportTransactionOwnerRegistry({ abortOwner });
+	it("releases ownership and rejects future IPC when the sender is destroyed", () => {
+		const releaseOwner = vi.fn(async () => undefined);
+		const registry = new RendererDocumentOwnerRegistry({ releaseOwner });
 		const sender = new FakeSender(13);
 		const owner = registry.ownerFor(request(sender) as never);
 		sender.destroyed = true;
 
 		sender.emit("destroyed");
 
-		expect(abortOwner).toHaveBeenCalledWith(owner);
+		expect(releaseOwner).toHaveBeenCalledWith(owner);
 		expect(() => registry.ownerFor(request(sender) as never)).toThrow(/destroyed/);
 	});
 
-	it("sender destruction aborts and cleans its real staged transaction", async () => {
+	it("releases only the destroyed WebContents document owner", () => {
+		const releaseOwner = vi.fn(async () => undefined);
+		const registry = new RendererDocumentOwnerRegistry({ releaseOwner });
+		const firstSender = new FakeSender(20);
+		const secondSender = new FakeSender(21);
+		const firstOwner = registry.ownerFor(request(firstSender) as never);
+		const secondOwner = registry.ownerFor(request(secondSender) as never);
+
+		firstSender.destroyed = true;
+		firstSender.emit("destroyed");
+
+		expect(releaseOwner).toHaveBeenCalledTimes(1);
+		expect(releaseOwner).toHaveBeenCalledWith(firstOwner);
+		expect(registry.ownerFor(request(secondSender) as never)).toBe(secondOwner);
+	});
+
+	it("sender destruction releases and cleans its real staged transaction", async () => {
 		const directory = await fs.mkdtemp(path.join(os.tmpdir(), "openscreen-owner-registry-"));
 		try {
 			const manager = new ExportDestinationTransactionManager();
-			const registry = new ExportTransactionOwnerRegistry({
-				abortOwner: (owner) => manager.abortOwner(owner),
+			const registry = new RendererDocumentOwnerRegistry({
+				releaseOwner: (owner) => manager.abortOwner(owner),
 			});
 			const sender = new FakeSender(14);
 			const owner = registry.ownerFor(request(sender) as never);

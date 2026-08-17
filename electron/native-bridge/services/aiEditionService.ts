@@ -24,7 +24,7 @@ import {
 	type CaptionTranslateSegment,
 	translateCaptionSegments,
 } from "../../ai-edition/caption-translate";
-import type { ChatEventSink } from "../../ai-edition/chat-service";
+import type { ChatEventSink, ChatOperationOwner } from "../../ai-edition/chat-service";
 import { DocumentNotFoundError, type DocumentService } from "../../ai-edition/document-service";
 import type { LlmConfigStore, LlmCredential } from "../../ai-edition/llm-config-store";
 import {
@@ -53,30 +53,35 @@ export interface AiEditionServiceOptions {
 		projectId: string,
 		sessionId: string,
 		message: string,
-		document?: unknown,
-		operationId?: string,
-		sink?: ChatEventSink,
+		document: unknown | undefined,
+		operationId: string,
+		owner: ChatOperationOwner,
+		sink: ChatEventSink,
 	) => Promise<AiEditionChatResult>;
 	commitChatRun: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	) => AiEditionChatCommitResult;
 	abortChatRun: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	) => AiEditionChatOperationResult;
 	beginChatOperationPersistence: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	) => AiEditionChatOperationResult;
 	resolveChatOperationPersistence: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
 		outcome: AiEditionChatPersistenceResolution,
+		owner: ChatOperationOwner,
 	) => AiEditionChatOperationResult;
 	getChatOperationStatus: (
 		projectId: string,
@@ -87,18 +92,29 @@ export interface AiEditionServiceOptions {
 		projectId: string,
 		sessionId: string,
 		messageId: string,
+		owner: ChatOperationOwner,
 	) => AiEditionChatRewindPrepareResult;
 	commitRewindToMessage: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
 		sessionRevision: number,
+		owner: ChatOperationOwner,
 	) => AiEditionChatRewindCommitResult;
 	abortRewindToMessage: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	) => AiEditionChatOperationResult;
+	handleChatOwnerTeardown: (owner: ChatOperationOwner, documents: DocumentService) => Promise<void>;
+	reconcileChatProject: (projectId: string, documents: DocumentService) => Promise<void>;
+	reconcileChatOperation: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+		documents: DocumentService,
+	) => Promise<void>;
 	compactNow: (projectId: string, sessionId: string) => Promise<AiEditionChatCompactResult | null>;
 	getContextUsage: (
 		projectId: string,
@@ -304,35 +320,39 @@ export class AiEditionService {
 		projectId: string,
 		sessionId: string,
 		message: string,
-		document?: unknown,
-		operationId?: string,
-		sink?: ChatEventSink,
+		document: unknown | undefined,
+		operationId: string,
+		owner: ChatOperationOwner,
+		sink: ChatEventSink,
 	): Promise<AiEditionChatResult> {
-		return this.options.runChat(projectId, sessionId, message, document, operationId, sink);
+		return this.options.runChat(projectId, sessionId, message, document, operationId, owner, sink);
 	}
 
 	chatCommitRun(
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	): AiEditionChatCommitResult {
-		return this.options.commitChatRun(projectId, sessionId, operationId);
+		return this.options.commitChatRun(projectId, sessionId, operationId, owner);
 	}
 
 	chatAbortRun(
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	): AiEditionChatOperationResult {
-		return this.options.abortChatRun(projectId, sessionId, operationId);
+		return this.options.abortChatRun(projectId, sessionId, operationId, owner);
 	}
 
 	chatBeginPersistence(
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	): AiEditionChatOperationResult {
-		return this.options.beginChatOperationPersistence(projectId, sessionId, operationId);
+		return this.options.beginChatOperationPersistence(projectId, sessionId, operationId, owner);
 	}
 
 	chatResolvePersistence(
@@ -340,16 +360,30 @@ export class AiEditionService {
 		sessionId: string,
 		operationId: string,
 		outcome: AiEditionChatPersistenceResolution,
+		owner: ChatOperationOwner,
 	): AiEditionChatOperationResult {
-		return this.options.resolveChatOperationPersistence(projectId, sessionId, operationId, outcome);
+		return this.options.resolveChatOperationPersistence(
+			projectId,
+			sessionId,
+			operationId,
+			outcome,
+			owner,
+		);
 	}
 
-	chatOperationStatus(
+	async chatOperationStatus(
 		projectId: string,
 		sessionId: string,
 		operationId: string,
-	): AiEditionChatOperationStatus {
+	): Promise<AiEditionChatOperationStatus> {
+		void this.options
+			.reconcileChatOperation(projectId, sessionId, operationId, this.options.documents)
+			.catch((error) => console.warn("[ai-edition] could not request chat reconciliation:", error));
 		return this.options.getChatOperationStatus(projectId, sessionId, operationId);
+	}
+
+	chatOwnerDestroyed(owner: ChatOperationOwner): Promise<void> {
+		return this.options.handleChatOwnerTeardown(owner, this.options.documents);
 	}
 
 	chatUndoLastBatch(_projectId: string, _sessionId: string): AiEditionChatResult {
@@ -360,8 +394,9 @@ export class AiEditionService {
 		projectId: string,
 		sessionId: string,
 		messageId: string,
+		owner: ChatOperationOwner,
 	): AiEditionChatRewindPrepareResult {
-		return this.options.prepareRewindToMessage(projectId, sessionId, messageId);
+		return this.options.prepareRewindToMessage(projectId, sessionId, messageId, owner);
 	}
 
 	chatCommitRewind(
@@ -369,16 +404,24 @@ export class AiEditionService {
 		sessionId: string,
 		operationId: string,
 		sessionRevision: number,
+		owner: ChatOperationOwner,
 	): AiEditionChatRewindCommitResult {
-		return this.options.commitRewindToMessage(projectId, sessionId, operationId, sessionRevision);
+		return this.options.commitRewindToMessage(
+			projectId,
+			sessionId,
+			operationId,
+			sessionRevision,
+			owner,
+		);
 	}
 
 	chatAbortRewind(
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	): AiEditionChatOperationResult {
-		return this.options.abortRewindToMessage(projectId, sessionId, operationId);
+		return this.options.abortRewindToMessage(projectId, sessionId, operationId, owner);
 	}
 
 	chatContextUsage(projectId: string, sessionId: string): AiEditionChatBudget | null {
@@ -389,7 +432,12 @@ export class AiEditionService {
 		return this.options.compactNow(projectId, sessionId);
 	}
 
-	chatListSessions(projectId: string): AiEditionChatSessionSummary[] {
+	async chatListSessions(projectId: string): Promise<AiEditionChatSessionSummary[]> {
+		void this.options
+			.reconcileChatProject(projectId, this.options.documents)
+			.catch((error) =>
+				console.warn("[ai-edition] could not request project reconciliation:", error),
+			);
 		return this.options.listSessions(projectId);
 	}
 
@@ -397,7 +445,15 @@ export class AiEditionService {
 		return this.options.createSession(projectId, title);
 	}
 
-	chatSelectSession(projectId: string, sessionId: string): AiEditionChatSession | null {
+	async chatSelectSession(
+		projectId: string,
+		sessionId: string,
+	): Promise<AiEditionChatSession | null> {
+		void this.options
+			.reconcileChatProject(projectId, this.options.documents)
+			.catch((error) =>
+				console.warn("[ai-edition] could not request project reconciliation:", error),
+			);
 		return this.options.selectSession(projectId, sessionId);
 	}
 

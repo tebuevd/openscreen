@@ -19,15 +19,20 @@ import {
 	abortChatRun,
 	abortRewindToMessage,
 	beginChatOperationPersistence,
+	type ChatDocumentAuthority,
 	commitChatRun,
 	commitRewindToMessage,
 	createSession,
 	deleteSession,
 	getChatOperationStatus,
+	handleChatOperationOwnerTeardown,
 	prepareRewindToMessage,
+	reconcileDetachedChatOperation,
+	reconcileDetachedChatOperationsForProject,
 	renameSession,
 	resolveChatOperationPersistence,
 	runChat,
+	selectSession,
 	subscribeChatSessionUpdates,
 } from "./chat-service";
 import { invokeOpenScreenAgent } from "./deep-agent/service";
@@ -76,6 +81,40 @@ function fixtureDocument(): AxcutDocument {
 			],
 		},
 	});
+}
+
+function projectDocument(projectId: string, title: string): AxcutDocument {
+	const document = fixtureDocument();
+	return documentSchema.parse({
+		...document,
+		project: { ...document.project, id: projectId, title },
+	});
+}
+
+async function stageOwnedPersistence(projectId: string, operationId: string, owner: object) {
+	const launchDocument = projectDocument(projectId, "Before agent edit");
+	const intendedDocument = projectDocument(projectId, "Agent edit");
+	invokeMock.mockImplementationOnce(async () => ({
+		text: "done",
+		document: intendedDocument,
+		mutated: true,
+	}));
+	const session = createSession(projectId);
+	await runChat(
+		projectId,
+		session.id,
+		"edit",
+		stubConfig(),
+		launchDocument,
+		{},
+		{},
+		operationId,
+		owner,
+	);
+	expect(beginChatOperationPersistence(projectId, session.id, operationId, owner)).toEqual({
+		success: true,
+	});
+	return { session, launchDocument, intendedDocument };
 }
 
 function stubConfig(overrides: Record<string, unknown> = {}): LlmConfigStore {
@@ -556,6 +595,308 @@ describe("runChat tool loop", () => {
 				"failed",
 			);
 		}
+	});
+
+	it("aborts an owned persistence fence when teardown happens before its save dispatch", async () => {
+		const owner = {};
+		const projectId = "proj_owner_before_dispatch";
+		const operationId = "owner_before_dispatch";
+		const { session, launchDocument } = await stageOwnedPersistence(projectId, operationId, owner);
+		const getProject = vi.fn(async () => launchDocument);
+
+		await handleChatOperationOwnerTeardown(owner, { getProject });
+
+		expect(getProject).toHaveBeenCalledWith(projectId);
+		expect(getChatOperationStatus(projectId, session.id, operationId)).toMatchObject({
+			state: "aborted",
+		});
+		expect(selectSession(projectId, session.id)?.messages).toEqual([]);
+		const replacementOwner = {};
+		await expect(
+			runChat(
+				projectId,
+				session.id,
+				"replacement",
+				stubConfig(),
+				launchDocument,
+				{},
+				{},
+				"replacement_after_owner_abort",
+				replacementOwner,
+			),
+		).resolves.toMatchObject({ success: true });
+		expect(
+			abortChatRun(projectId, session.id, "replacement_after_owner_abort", replacementOwner),
+		).toEqual({ success: true });
+	});
+
+	it("aborts owned running and non-writing prepared operations without authoritative reads", async () => {
+		const owner = {};
+		const documents: ChatDocumentAuthority = { getProject: vi.fn() };
+		const runningAgent = deferred<{
+			text: string;
+			document: AxcutDocument;
+			mutated: boolean;
+		}>();
+		invokeMock.mockReturnValueOnce(runningAgent.promise);
+		const runningProject = "proj_owner_running_teardown";
+		const runningSession = createSession(runningProject);
+		const running = runChat(
+			runningProject,
+			runningSession.id,
+			"running",
+			stubConfig(),
+			projectDocument(runningProject, "Running"),
+			{},
+			{},
+			"owner_running_teardown",
+			owner,
+		);
+		await vi.waitFor(() =>
+			expect(
+				getChatOperationStatus(runningProject, runningSession.id, "owner_running_teardown"),
+			).toMatchObject({ state: "running" }),
+		);
+		await handleChatOperationOwnerTeardown(owner, documents);
+		runningAgent.resolve({
+			text: "late",
+			document: projectDocument(runningProject, "Late"),
+			mutated: false,
+		});
+		await expect(running).resolves.toMatchObject({ success: false });
+
+		const preparedProject = "proj_owner_prepared_teardown";
+		const preparedSession = createSession(preparedProject);
+		await runChat(
+			preparedProject,
+			preparedSession.id,
+			"prepared",
+			stubConfig(),
+			projectDocument(preparedProject, "Prepared"),
+			{},
+			{},
+			"owner_prepared_teardown",
+			owner,
+		);
+		await handleChatOperationOwnerTeardown(owner, documents);
+
+		expect(documents.getProject).not.toHaveBeenCalled();
+		expect(
+			getChatOperationStatus(preparedProject, preparedSession.id, "owner_prepared_teardown"),
+		).toMatchObject({ state: "aborted" });
+	});
+
+	it("waits for an in-flight write and commits once for a replacement editor", async () => {
+		const owner = {};
+		const projectId = "proj_owner_pending_write";
+		const operationId = "owner_pending_write";
+		const { session, intendedDocument } = await stageOwnedPersistence(
+			projectId,
+			operationId,
+			owner,
+		);
+		const authoritative = deferred<AxcutDocument>();
+		const documents: ChatDocumentAuthority = { getProject: vi.fn(() => authoritative.promise) };
+		const updates: unknown[] = [];
+		const unsubscribe = subscribeChatSessionUpdates((update) => updates.push(update));
+
+		const teardown = handleChatOperationOwnerTeardown(owner, documents);
+		await vi.waitFor(() => expect(documents.getProject).toHaveBeenCalledTimes(1));
+		expect(getChatOperationStatus(projectId, session.id, operationId)).toMatchObject({
+			state: "reconciling",
+		});
+		const replacementOpen = reconcileDetachedChatOperationsForProject(projectId, documents);
+		expect(documents.getProject).toHaveBeenCalledTimes(1);
+
+		authoritative.resolve(intendedDocument);
+		await Promise.all([teardown, replacementOpen]);
+		expect(getChatOperationStatus(projectId, session.id, operationId)).toMatchObject({
+			state: "committed",
+		});
+		expect(selectSession(projectId, session.id)?.messages).toHaveLength(2);
+		expect(updates).toHaveLength(1);
+
+		await handleChatOperationOwnerTeardown(owner, documents);
+		await reconcileDetachedChatOperationsForProject(projectId, documents);
+		expect(documents.getProject).toHaveBeenCalledTimes(1);
+		expect(updates).toHaveLength(1);
+		const replacementOwner = {};
+		await expect(
+			runChat(
+				projectId,
+				session.id,
+				"next edit",
+				stubConfig(),
+				intendedDocument,
+				{},
+				{},
+				"owner_reconciled_next_run",
+				replacementOwner,
+			),
+		).resolves.toMatchObject({ success: true });
+		expect(
+			abortChatRun(projectId, session.id, "owner_reconciled_next_run", replacementOwner),
+		).toEqual({ success: true });
+		unsubscribe();
+	});
+
+	it.each([
+		["after a failed write", "proj_owner_failed_write"],
+		["when a later same-id import wins", "proj_owner_later_import"],
+	] as const)("aborts detached history %s", async (_scenario, projectId) => {
+		const owner = {};
+		const operationId = `${projectId}_operation`;
+		const { session } = await stageOwnedPersistence(projectId, operationId, owner);
+		const authoritative = projectDocument(projectId, "Newer authoritative document");
+
+		await handleChatOperationOwnerTeardown(owner, {
+			getProject: vi.fn(async () => authoritative),
+		});
+
+		expect(getChatOperationStatus(projectId, session.id, operationId)).toMatchObject({
+			state: "aborted",
+		});
+		expect(selectSession(projectId, session.id)?.messages).toEqual([]);
+	});
+
+	it("commits after a successful write settles before the renderer continuation", async () => {
+		const owner = {};
+		const projectId = "proj_owner_write_already_settled";
+		const operationId = "owner_write_already_settled";
+		const { session, intendedDocument } = await stageOwnedPersistence(
+			projectId,
+			operationId,
+			owner,
+		);
+
+		await handleChatOperationOwnerTeardown(owner, {
+			getProject: vi.fn(async () => ({
+				...intendedDocument,
+				project: { ...intendedDocument.project, updatedAt: "2099-01-01T00:00:00.000Z" },
+			})),
+		});
+
+		expect(getChatOperationStatus(projectId, session.id, operationId)).toMatchObject({
+			state: "committed",
+		});
+		expect(selectSession(projectId, session.id)?.messages).toHaveLength(2);
+	});
+
+	it("leaves another document owner's operation fenced and rejects foreign mutation", async () => {
+		const firstOwner = {};
+		const secondOwner = {};
+		const firstProject = "proj_owner_isolation_a";
+		const secondProject = "proj_owner_isolation_b";
+		const first = await stageOwnedPersistence(firstProject, "owner_isolation_a", firstOwner);
+		const second = await stageOwnedPersistence(secondProject, "owner_isolation_b", secondOwner);
+
+		expect(
+			commitChatRun(secondProject, second.session.id, "owner_isolation_b", firstOwner),
+		).toMatchObject({ success: false });
+		expect(
+			abortChatRun(secondProject, second.session.id, "owner_isolation_b", firstOwner),
+		).toMatchObject({ success: false });
+		expect(
+			resolveChatOperationPersistence(
+				secondProject,
+				second.session.id,
+				"owner_isolation_b",
+				"failed",
+				firstOwner,
+			),
+		).toMatchObject({ success: false });
+		await handleChatOperationOwnerTeardown(firstOwner, {
+			getProject: vi.fn(async () => first.launchDocument),
+		});
+
+		expect(
+			getChatOperationStatus(firstProject, first.session.id, "owner_isolation_a"),
+		).toMatchObject({
+			state: "aborted",
+		});
+		expect(
+			getChatOperationStatus(secondProject, second.session.id, "owner_isolation_b"),
+		).toMatchObject({ state: "persisting" });
+		expect(
+			resolveChatOperationPersistence(
+				secondProject,
+				second.session.id,
+				"owner_isolation_b",
+				"failed",
+				secondOwner,
+			),
+		).toEqual({ success: true });
+	});
+
+	it("retains a failed authoritative read for bounded replacement-triggered retry", async () => {
+		const owner = {};
+		const projectId = "proj_owner_retry_read";
+		const operationId = "owner_retry_read";
+		const { session, intendedDocument } = await stageOwnedPersistence(
+			projectId,
+			operationId,
+			owner,
+		);
+		const getProject = vi
+			.fn<(projectId: string) => Promise<AxcutDocument>>()
+			.mockRejectedValueOnce(new Error("temporary read failure"))
+			.mockResolvedValue(intendedDocument);
+		vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+		await handleChatOperationOwnerTeardown(owner, { getProject });
+		expect(getChatOperationStatus(projectId, session.id, operationId)).toMatchObject({
+			state: "reconciling",
+		});
+		await expect(
+			runChat(
+				projectId,
+				session.id,
+				"must remain fenced",
+				stubConfig(),
+				intendedDocument,
+				{},
+				{},
+				"replacement_while_read_failed",
+				{},
+			),
+		).resolves.toMatchObject({ success: false });
+
+		await Promise.all([
+			reconcileDetachedChatOperation(projectId, session.id, operationId, { getProject }),
+			reconcileDetachedChatOperationsForProject(projectId, { getProject }),
+		]);
+		expect(getProject).toHaveBeenCalledTimes(2);
+		expect(getChatOperationStatus(projectId, session.id, operationId)).toMatchObject({
+			state: "committed",
+		});
+		expect(selectSession(projectId, session.id)?.messages).toHaveLength(2);
+	});
+
+	it("reconciles an owned rewind through the same authoritative queue", async () => {
+		const projectId = "proj_owned_rewind";
+		const document = projectDocument(projectId, "Before rewind target");
+		const session = createSession(projectId);
+		await runChat(projectId, session.id, "first turn", stubConfig(), document);
+		const targetId = selectSession(projectId, session.id)!.messages[0].id;
+		const owner = {};
+		const prepared = prepareRewindToMessage(projectId, session.id, targetId, owner);
+		expect(prepared.success).toBe(true);
+		if (!prepared.success) return;
+		expect(
+			beginChatOperationPersistence(projectId, session.id, prepared.operationId, owner),
+		).toEqual({
+			success: true,
+		});
+
+		await handleChatOperationOwnerTeardown(owner, {
+			getProject: vi.fn(async () => prepared.document as AxcutDocument),
+		});
+
+		expect(getChatOperationStatus(projectId, session.id, prepared.operationId)).toMatchObject({
+			state: "committed",
+			kind: "rewind",
+		});
+		expect(selectSession(projectId, session.id)?.messages).toEqual(prepared.messages);
 	});
 
 	it("expires abandoned running and prepared operations without renderer renewal", async () => {

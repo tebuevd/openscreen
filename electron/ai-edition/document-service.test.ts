@@ -605,6 +605,34 @@ describe("DocumentService", () => {
 			open.mockRestore();
 		});
 
+		it("loads a later same-id import queued behind an in-flight save", async () => {
+			const doc = await service.createProject("Reconciliation ordering");
+			const enteredWrite = deferred<void>();
+			const releaseWrite = deferred<void>();
+			const realOpen = fs.open.bind(fs);
+			const open = vi.spyOn(fs, "open").mockImplementationOnce(async (...args) => {
+				enteredWrite.resolve(undefined);
+				await releaseWrite.promise;
+				return realOpen(...args);
+			});
+
+			const oldSave = service.saveProject({
+				...doc,
+				project: { ...doc.project, title: "Old agent save" },
+			});
+			await enteredWrite.promise;
+			const laterImport = service.saveProject({
+				...doc,
+				project: { ...doc.project, title: "Later same-id import" },
+			});
+			const authoritativeRead = service.getProject(doc.project.id);
+
+			releaseWrite.resolve(undefined);
+			await Promise.all([oldSave, laterImport]);
+			expect((await authoritativeRead).project.title).toBe("Later same-id import");
+			open.mockRestore();
+		});
+
 		// 20 real temp-file+rename round trips, serialized through the save queue.
 		// That is genuinely more than 5s of disk when the rest of the suite is
 		// running in parallel, so it gets its own timeout rather than flaking.

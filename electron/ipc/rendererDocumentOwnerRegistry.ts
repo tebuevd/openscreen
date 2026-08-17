@@ -1,5 +1,6 @@
 import type { IpcMainInvokeEvent, WebContents, WebFrameMain } from "electron";
-import type { ExportTransactionOwner } from "../native-bridge/services/exportDestinationTransaction";
+
+export type RendererDocumentOwner = object;
 
 type Sender = Pick<
 	WebContents,
@@ -18,7 +19,7 @@ interface FrameIdentity {
 }
 
 interface SenderSession {
-	owner: ExportTransactionOwner | null;
+	owner: RendererDocumentOwner | null;
 	committedFrame: FrameIdentity | null;
 	pendingUrls: Map<string, number> | null;
 	onDestroyed: () => void;
@@ -30,9 +31,9 @@ interface SenderSession {
 	onDidStopLoading: () => void;
 }
 
-export interface ExportTransactionOwnerRegistryOptions {
-	abortOwner: (owner: ExportTransactionOwner) => Promise<void>;
-	onAbortError?: (senderId: number, error: unknown) => void;
+export interface RendererDocumentOwnerRegistryOptions {
+	releaseOwner: (owner: RendererDocumentOwner) => Promise<void>;
+	onReleaseError?: (senderId: number, error: unknown) => void;
 }
 
 function eventDetails(value: unknown): Record<string, unknown> {
@@ -47,35 +48,35 @@ function sameFrame(left: FrameIdentity, right: FrameIdentity): boolean {
 	);
 }
 
-/** Binds opaque transaction ownership to one committed main-frame document lifetime. */
-export class ExportTransactionOwnerRegistry {
+/** Binds opaque resource ownership to one committed main-frame document lifetime. */
+export class RendererDocumentOwnerRegistry {
 	private readonly sessions = new WeakMap<Sender, SenderSession>();
-	private readonly abortOwner: (owner: ExportTransactionOwner) => Promise<void>;
-	private readonly onAbortError: (senderId: number, error: unknown) => void;
+	private readonly releaseOwner: (owner: RendererDocumentOwner) => Promise<void>;
+	private readonly onReleaseError: (senderId: number, error: unknown) => void;
 
-	constructor(options: ExportTransactionOwnerRegistryOptions) {
-		this.abortOwner = options.abortOwner;
-		this.onAbortError =
-			options.onAbortError ??
+	constructor(options: RendererDocumentOwnerRegistryOptions) {
+		this.releaseOwner = options.releaseOwner;
+		this.onReleaseError =
+			options.onReleaseError ??
 			((senderId, error) => {
 				console.error(
-					`[export-destination] failed to abort exports for sender ${senderId}:`,
+					`[renderer-owner] failed to release resources for sender ${senderId}:`,
 					error,
 				);
 			});
 	}
 
-	/** Install navigation listeners before a sender first requests a transaction. */
+	/** Install navigation listeners before a sender first requests an owned resource. */
 	observe(sender: Sender): void {
 		if (!sender.isDestroyed()) this.ensureSession(sender);
 	}
 
-	ownerFor(event: OwnerRequest): ExportTransactionOwner {
+	ownerFor(event: OwnerRequest): RendererDocumentOwner {
 		const sender = event.sender;
-		if (sender.isDestroyed()) throw new Error("Export sender is destroyed.");
+		if (sender.isDestroyed()) throw new Error("Renderer document owner is destroyed.");
 		const session = this.ensureSession(sender);
 		if (session.pendingUrls) {
-			throw new Error("Export transactions are unavailable while navigation is pending.");
+			throw new Error("Document-owned IPC is unavailable while navigation is pending.");
 		}
 
 		const requestFrame = this.frameFromRequest(event);
@@ -84,11 +85,11 @@ export class ExportTransactionOwnerRegistry {
 			!session.committedFrame ||
 			!sameFrame(requestFrame, session.committedFrame)
 		) {
-			throw new Error("Export transaction IPC did not come from the committed main document.");
+			throw new Error("Document-owned IPC did not come from the committed main document.");
 		}
 		const currentFrame = this.currentMainFrame(sender);
 		if (!currentFrame || !sameFrame(currentFrame, session.committedFrame)) {
-			throw new Error("Export transaction document identity is no longer current.");
+			throw new Error("Renderer document identity is no longer current.");
 		}
 
 		session.owner ??= {};
@@ -237,7 +238,7 @@ export class ExportTransactionOwnerRegistry {
 	private revokeOwner(session: SenderSession, senderId: number): void {
 		const owner = session.owner;
 		session.owner = null;
-		if (owner) this.abort(owner, senderId);
+		if (owner) this.release(owner, senderId);
 	}
 
 	private destroy(sender: Sender): void {
@@ -253,7 +254,7 @@ export class ExportTransactionOwnerRegistry {
 		this.revokeOwner(session, sender.id);
 	}
 
-	private abort(owner: ExportTransactionOwner, senderId: number): void {
-		void this.abortOwner(owner).catch((error) => this.onAbortError(senderId, error));
+	private release(owner: RendererDocumentOwner, senderId: number): void {
+		void this.releaseOwner(owner).catch((error) => this.onReleaseError(senderId, error));
 	}
 }

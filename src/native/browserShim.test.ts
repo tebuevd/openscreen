@@ -449,6 +449,46 @@ describe("browser chat operation shim", () => {
 		);
 	});
 
+	it("releases the browser document owner's operations on page teardown", async () => {
+		const session = await nativeBridgeClient.aiEdition.chatCreateSession("pagehide-project");
+		await nativeBridgeClient.aiEdition.chatRun(
+			"pagehide-project",
+			session.id,
+			"pending",
+			undefined,
+			"pagehide-run",
+		);
+		await nativeBridgeClient.aiEdition.chatBeginPersistence(
+			"pagehide-project",
+			session.id,
+			"pagehide-run",
+		);
+
+		window.dispatchEvent(new Event("pagehide"));
+
+		expect(
+			await nativeBridgeClient.aiEdition.chatOperationStatus(
+				"pagehide-project",
+				session.id,
+				"pagehide-run",
+			),
+		).toMatchObject({ state: "aborted" });
+		await expect(
+			nativeBridgeClient.aiEdition.chatRun(
+				"pagehide-project",
+				session.id,
+				"replacement",
+				undefined,
+				"pagehide-replacement",
+			),
+		).resolves.toMatchObject({ success: true });
+		await nativeBridgeClient.aiEdition.chatAbortRun(
+			"pagehide-project",
+			session.id,
+			"pagehide-replacement",
+		);
+	});
+
 	it("bounds browser commit tombstones without evicting the newest replay result", async () => {
 		const session = await nativeBridgeClient.aiEdition.chatCreateSession("bounded-project");
 		for (let index = 0; index <= 256; index++) {

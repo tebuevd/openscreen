@@ -52,8 +52,11 @@ import {
 	deleteSession,
 	getChatOperationStatus,
 	getSessionContextUsage,
+	handleChatOperationOwnerTeardown,
 	listSessions,
 	prepareRewindToMessage,
+	reconcileDetachedChatOperation,
+	reconcileDetachedChatOperationsForProject,
 	renameSession,
 	resolveChatOperationPersistence,
 	runChat,
@@ -4126,7 +4129,7 @@ export function registerIpcHandlers(
 		},
 		getAiEditionDocuments: () => aiEditionDocuments,
 		getAiEditionLlmConfig,
-		runAiEditionChat: (projectId, sessionId, message, document, operationId, sink) =>
+		runAiEditionChat: (projectId, sessionId, message, document, operationId, owner, sink) =>
 			runChat(
 				projectId,
 				sessionId,
@@ -4138,6 +4141,7 @@ export function registerIpcHandlers(
 					cursor: agentCursorTelemetryReader,
 				},
 				operationId,
+				owner,
 			),
 		commitAiEditionChatRun: commitChatRun,
 		abortAiEditionChatRun: abortChatRun,
@@ -4152,6 +4156,9 @@ export function registerIpcHandlers(
 		prepareRewindToMessage,
 		commitRewindToMessage,
 		abortRewindToMessage,
+		handleAiEditionChatOwnerTeardown: handleChatOperationOwnerTeardown,
+		reconcileAiEditionChatProject: reconcileDetachedChatOperationsForProject,
+		reconcileAiEditionChatOperation: reconcileDetachedChatOperation,
 		compactNow: (projectId, sessionId) =>
 			compactSessionNow(projectId, sessionId, getAiEditionLlmConfig()),
 		getContextUsage: getSessionContextUsage,

@@ -16,7 +16,7 @@ import {
 	type ProjectFileResult,
 	type ProjectPathResult,
 } from "../../src/native/contracts";
-import type { ChatEventSink } from "../ai-edition/chat-service";
+import type { ChatEventSink, ChatOperationOwner } from "../ai-edition/chat-service";
 import type { DocumentService } from "../ai-edition/document-service";
 import {
 	type CursorTelemetryLoadResult,
@@ -28,7 +28,7 @@ import { CursorService } from "../native-bridge/services/cursorService";
 import { ProjectService } from "../native-bridge/services/projectService";
 import { SystemService } from "../native-bridge/services/systemService";
 import { createNativeBridgeState } from "../native-bridge/store";
-import { ExportTransactionOwnerRegistry } from "./exportTransactionOwnerRegistry";
+import { RendererDocumentOwnerRegistry } from "./rendererDocumentOwnerRegistry";
 
 export interface NativeBridgeContext {
 	getPlatform: () => NodeJS.Platform;
@@ -65,30 +65,35 @@ export interface NativeBridgeContext {
 		projectId: string,
 		sessionId: string,
 		message: string,
-		document?: unknown,
-		operationId?: string,
-		sink?: ChatEventSink,
+		document: unknown | undefined,
+		operationId: string,
+		owner: ChatOperationOwner,
+		sink: ChatEventSink,
 	) => Promise<import("../../src/native/contracts").AiEditionChatResult>;
 	commitAiEditionChatRun: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	) => AiEditionChatCommitResult;
 	abortAiEditionChatRun: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	) => import("../../src/native/contracts").AiEditionChatOperationResult;
 	beginAiEditionChatPersistence: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	) => import("../../src/native/contracts").AiEditionChatOperationResult;
 	resolveAiEditionChatPersistence: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
 		outcome: AiEditionChatPersistenceResolution,
+		owner: ChatOperationOwner,
 	) => import("../../src/native/contracts").AiEditionChatOperationResult;
 	getAiEditionChatOperationStatus: (
 		projectId: string,
@@ -106,18 +111,32 @@ export interface NativeBridgeContext {
 		projectId: string,
 		sessionId: string,
 		messageId: string,
+		owner: ChatOperationOwner,
 	) => import("../../src/native/contracts").AiEditionChatRewindPrepareResult;
 	commitRewindToMessage: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
 		sessionRevision: number,
+		owner: ChatOperationOwner,
 	) => import("../../src/native/contracts").AiEditionChatRewindCommitResult;
 	abortRewindToMessage: (
 		projectId: string,
 		sessionId: string,
 		operationId: string,
+		owner: ChatOperationOwner,
 	) => import("../../src/native/contracts").AiEditionChatOperationResult;
+	handleAiEditionChatOwnerTeardown: (
+		owner: ChatOperationOwner,
+		documents: DocumentService,
+	) => Promise<void>;
+	reconcileAiEditionChatProject: (projectId: string, documents: DocumentService) => Promise<void>;
+	reconcileAiEditionChatOperation: (
+		projectId: string,
+		sessionId: string,
+		operationId: string,
+		documents: DocumentService,
+	) => Promise<void>;
 	compactNow: (
 		projectId: string,
 		sessionId: string,
@@ -269,15 +288,6 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		getCursorCapabilities: () => cursorService.getCapabilities(),
 	});
 	const compositorViewService = new CompositorViewService();
-	const exportTransactionOwners = new ExportTransactionOwnerRegistry({
-		abortOwner: (owner) => compositorViewService.abortOwnerExports(owner),
-	});
-	for (const contents of webContents.getAllWebContents()) {
-		exportTransactionOwners.observe(contents);
-	}
-	app.on("web-contents-created", (_event, contents) => {
-		exportTransactionOwners.observe(contents);
-	});
 	const aiEditionService = new AiEditionService({
 		documents: context.getAiEditionDocuments(),
 		// Passed uncalled on purpose — invoking it here would build the store (and
@@ -293,6 +303,9 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		prepareRewindToMessage: context.prepareRewindToMessage,
 		commitRewindToMessage: context.commitRewindToMessage,
 		abortRewindToMessage: context.abortRewindToMessage,
+		handleChatOwnerTeardown: context.handleAiEditionChatOwnerTeardown,
+		reconcileChatProject: context.reconcileAiEditionChatProject,
+		reconcileChatOperation: context.reconcileAiEditionChatOperation,
 		compactNow: context.compactNow,
 		getContextUsage: context.getContextUsage,
 		listSessions: context.listAiEditionChatSessions,
@@ -300,6 +313,20 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		selectSession: context.selectAiEditionChatSession,
 		renameSession: context.renameAiEditionChatSession,
 		deleteSession: context.deleteAiEditionChatSession,
+	});
+	const documentOwners = new RendererDocumentOwnerRegistry({
+		releaseOwner: async (owner) => {
+			await Promise.all([
+				compositorViewService.abortOwnerExports(owner),
+				aiEditionService.chatOwnerDestroyed(owner),
+			]);
+		},
+	});
+	for (const contents of webContents.getAllWebContents()) {
+		documentOwners.observe(contents);
+	}
+	app.on("web-contents-created", (_event, contents) => {
+		documentOwners.observe(contents);
 	});
 	unsubscribeChatSessionUpdates?.();
 	unsubscribeChatSessionUpdates = context.subscribeAiEditionChatSessionUpdates((update) => {
@@ -322,7 +349,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 		const domain = request.domain as string;
 
 		try {
-			exportTransactionOwners.observe(event.sender);
+			documentOwners.observe(event.sender);
 			switch (request.domain) {
 				case "system": {
 					const action = request.action as string;
@@ -476,7 +503,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 							return createSuccessResponse(requestId, { ok: true });
 						case "exportMulti": {
 							const sender = event.sender;
-							const owner = exportTransactionOwners.ownerFor(event);
+							const owner = documentOwners.ownerFor(event);
 							const stats = await compositorViewService.exportMulti(
 								request.payload.clips,
 								request.payload.outPath,
@@ -500,7 +527,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 						}
 						case "exportMultiStaged": {
 							const sender = event.sender;
-							const owner = exportTransactionOwners.ownerFor(event);
+							const owner = documentOwners.ownerFor(event);
 							const result = await compositorViewService.exportMultiStaged(
 								request.payload.clips,
 								request.payload.outPath,
@@ -525,20 +552,20 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 						}
 						case "readStagedExport": {
 							const data = await compositorViewService.readStagedExport(
-								exportTransactionOwners.ownerFor(event),
+								documentOwners.ownerFor(event),
 								request.payload.transactionId,
 							);
 							return createSuccessResponse(requestId, { data });
 						}
 						case "renewStagedExportLease":
 							compositorViewService.renewStagedExportLease(
-								exportTransactionOwners.ownerFor(event),
+								documentOwners.ownerFor(event),
 								request.payload.transactionId,
 							);
 							return createSuccessResponse(requestId, { ok: true as const });
 						case "replaceStagedExport":
 							await compositorViewService.replaceStagedExport(
-								exportTransactionOwners.ownerFor(event),
+								documentOwners.ownerFor(event),
 								request.payload.transactionId,
 								request.payload.data,
 							);
@@ -547,19 +574,19 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 							return createSuccessResponse(
 								requestId,
 								await compositorViewService.commitStagedExport(
-									exportTransactionOwners.ownerFor(event),
+									documentOwners.ownerFor(event),
 									request.payload.transactionId,
 								),
 							);
 						case "abortStagedExport":
 							await compositorViewService.abortStagedExport(
-								exportTransactionOwners.ownerFor(event),
+								documentOwners.ownerFor(event),
 								request.payload.transactionId,
 							);
 							return createSuccessResponse(requestId, { ok: true as const });
 						case "exportGif": {
 							const sender = event.sender;
-							const owner = exportTransactionOwners.ownerFor(event);
+							const owner = documentOwners.ownerFor(event);
 							const stats = await compositorViewService.exportGif(
 								request.payload.clips,
 								request.payload.outPath,
@@ -600,22 +627,32 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 								requestId,
 								await aiEditionService.get(request.payload.projectId),
 							);
-						case "document.create":
+						case "document.create": {
+							documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								await aiEditionService.create(request.payload?.title),
 							);
-						case "document.save":
+						}
+						case "document.save": {
+							// Validate the committed document before dispatching the write. If navigation
+							// already revoked this owner, the old renderer cannot enqueue a save behind
+							// teardown reconciliation and land after the authoritative readback.
+							documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								await aiEditionService.save(request.payload.document),
 							);
-						case "document.delete":
+						}
+						case "document.delete": {
+							documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								await aiEditionService.deleteProject(request.payload.projectId),
 							);
-						case "document.addAsset":
+						}
+						case "document.addAsset": {
+							documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								await aiEditionService.addAsset(
@@ -624,7 +661,9 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.label,
 								),
 							);
-						case "document.removeAsset":
+						}
+						case "document.removeAsset": {
+							documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								await aiEditionService.removeAsset(
@@ -632,6 +671,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.assetId,
 								),
 							);
+						}
 						case "llm.getSnapshot":
 							return createSuccessResponse(requestId, await aiEditionService.llmGetSnapshot());
 						case "llm.setConfig":
@@ -664,6 +704,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 							);
 						case "chat.run": {
 							const sessionId = request.payload.sessionId;
+							const owner = documentOwners.ownerFor(event);
 							const sink = buildChatEventSink(event.sender, sessionId, request.payload.operationId);
 							return createSuccessResponse(
 								requestId,
@@ -673,38 +714,49 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.message,
 									request.payload.document,
 									request.payload.operationId,
+									owner,
 									sink,
 								),
 							);
 						}
-						case "chat.run.commit":
+						case "chat.run.commit": {
+							const owner = documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								aiEditionService.chatCommitRun(
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.operationId,
+									owner,
 								),
 							);
-						case "chat.run.abort":
+						}
+						case "chat.run.abort": {
+							const owner = documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								aiEditionService.chatAbortRun(
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.operationId,
+									owner,
 								),
 							);
-						case "chat.operation.beginPersistence":
+						}
+						case "chat.operation.beginPersistence": {
+							const owner = documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								aiEditionService.chatBeginPersistence(
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.operationId,
+									owner,
 								),
 							);
-						case "chat.operation.resolvePersistence":
+						}
+						case "chat.operation.resolvePersistence": {
+							const owner = documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								aiEditionService.chatResolvePersistence(
@@ -712,12 +764,14 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.sessionId,
 									request.payload.operationId,
 									request.payload.outcome,
+									owner,
 								),
 							);
+						}
 						case "chat.operation.status":
 							return createSuccessResponse(
 								requestId,
-								aiEditionService.chatOperationStatus(
+								await aiEditionService.chatOperationStatus(
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.operationId,
@@ -734,7 +788,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 						case "chat.listSessions":
 							return createSuccessResponse(
 								requestId,
-								aiEditionService.chatListSessions(request.payload.projectId),
+								await aiEditionService.chatListSessions(request.payload.projectId),
 							);
 						case "chat.createSession":
 							return createSuccessResponse(
@@ -747,7 +801,7 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 						case "chat.selectSession":
 							return createSuccessResponse(
 								requestId,
-								aiEditionService.chatSelectSession(
+								await aiEditionService.chatSelectSession(
 									request.payload.projectId,
 									request.payload.sessionId,
 								),
@@ -782,16 +836,20 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.sessionId,
 								),
 							);
-						case "chat.rewind.prepare":
+						case "chat.rewind.prepare": {
+							const owner = documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								aiEditionService.chatPrepareRewind(
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.messageId,
+									owner,
 								),
 							);
-						case "chat.rewind.commit":
+						}
+						case "chat.rewind.commit": {
+							const owner = documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								aiEditionService.chatCommitRewind(
@@ -799,17 +857,22 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 									request.payload.sessionId,
 									request.payload.operationId,
 									request.payload.sessionRevision,
+									owner,
 								),
 							);
-						case "chat.rewind.abort":
+						}
+						case "chat.rewind.abort": {
+							const owner = documentOwners.ownerFor(event);
 							return createSuccessResponse(
 								requestId,
 								aiEditionService.chatAbortRewind(
 									request.payload.projectId,
 									request.payload.sessionId,
 									request.payload.operationId,
+									owner,
 								),
 							);
+						}
 						case "chat.contextUsage":
 							return createSuccessResponse(
 								requestId,

@@ -211,10 +211,10 @@ export class DocumentService {
 	}
 
 	async getProject(projectId: string): Promise<AxcutDocument> {
-		// A load must observe every operation invoked before it. The queue tail settles
-		// on failures, leaving the previous atomic file as the authoritative fallback.
-		await this.operationQueues.get(projectId);
-		return this.getProjectNow(projectId);
+		// Queue the read itself, rather than awaiting a snapshot of the current tail and
+		// then reading outside the queue. This observes every operation invoked first and
+		// prevents a later write from starting between settlement and authoritative readback.
+		return this.enqueueProjectOperation(projectId, () => this.getProjectNow(projectId));
 	}
 
 	private async getProjectNow(projectId: string): Promise<AxcutDocument> {

@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { nativeBridgeClient } from "@/native/client";
+import { documentsHaveEquivalentSaveContent } from "../document/equivalence";
 import {
 	type Interval,
 	removeAsset as removeAssetFromDocument,
@@ -109,13 +110,6 @@ export interface ProjectState {
 
 function parseDocument(value: unknown): AxcutDocument {
 	return documentSchema.parse(value);
-}
-
-function serializeSaveContent(document: AxcutDocument): string {
-	return JSON.stringify({
-		...document,
-		project: { ...document.project, updatedAt: "" },
-	});
 }
 
 function mergeAddedAsset(
@@ -652,7 +646,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 					const beforeJson = JSON.stringify(before.document);
 					const authoritativeJson = JSON.stringify(authoritative);
 					const message = error instanceof Error ? error.message : String(error);
-					if (serializeSaveContent(authoritative) === serializeSaveContent(parsed)) {
+					if (documentsHaveEquivalentSaveContent(authoritative, parsed)) {
 						const current = get();
 						if (
 							current.documentGeneration !== expected.documentGeneration ||

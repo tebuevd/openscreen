@@ -662,6 +662,53 @@ describe("LeftPanel async document results", () => {
 		expect(bridgeMocks.chatResolvePersistence).not.toHaveBeenCalled();
 	});
 
+	it.each([
+		"before",
+		"after",
+	] as const)("loads the canonical session when a replacement editor opens %s owner reconciliation", async (timing) => {
+		const committed = canonicalChatCommit();
+		const summaries = [
+			{
+				id: "session_1",
+				projectId: "proj_a",
+				title: "Conversation",
+				createdAt: "2026-08-16T10:00:00.000Z",
+				messageCount: committed.messages.length,
+			},
+		];
+		bridgeMocks.chatListSessions.mockResolvedValue(summaries);
+		bridgeMocks.chatSelectSession.mockResolvedValue({
+			id: "session_1",
+			projectId: "proj_a",
+			title: "Conversation",
+			createdAt: "2026-08-16T10:00:00.000Z",
+			messages: timing === "after" ? committed.messages : [],
+			revision: timing === "after" ? committed.sessionRevision : 0,
+		});
+
+		renderPanel();
+		if (timing === "before") {
+			await waitFor(() =>
+				expect(bridgeMocks.chatSelectSession).toHaveBeenCalledWith("proj_a", "session_1"),
+			);
+			await waitFor(() => expect(chatSessionUpdateListener).not.toBeNull());
+			expect(screen.queryByText("The edit is ready.")).not.toBeInTheDocument();
+			act(() => {
+				chatSessionUpdateListener?.({
+					projectId: "proj_a",
+					sessionId: "session_1",
+					revision: committed.sessionRevision,
+					operationId: "owner-reconciliation",
+					kind: "chat",
+					messages: committed.messages,
+				});
+			});
+		}
+
+		expect(await screen.findByText("The edit is ready.")).toBeInTheDocument();
+		expect(bridgeMocks.chatSelectSession).toHaveBeenCalledWith("proj_a", "session_1");
+	});
+
 	it("resolves a late failed save after the sending panel unmounts", async () => {
 		const saving = deferred<{ success: true; document: AxcutDocument }>();
 		const resultDocument = withTitle(sampleDoc, "Late failed edit");

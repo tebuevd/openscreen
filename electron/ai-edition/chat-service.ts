@@ -7,6 +7,7 @@
 
 import { randomUUID } from "node:crypto";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
+import { documentsHaveEquivalentSaveContent } from "../../src/lib/ai-edition/document/equivalence";
 import {
 	type AxcutTimelineOperation,
 	applyTimelineOperation,
@@ -69,18 +70,30 @@ interface LeasedChatOperation {
 	expiresAt: number;
 }
 
-interface PendingChatRun extends LeasedChatOperation {
+export type ChatOperationOwner = object;
+
+export interface ChatDocumentAuthority {
+	getProject(projectId: string): Promise<AxcutDocument>;
+}
+
+interface OwnedChatOperation {
+	owner: ChatOperationOwner | null;
+	ownerDetached: boolean;
+}
+
+interface PendingChatRun extends LeasedChatOperation, OwnedChatOperation {
 	kind: "chat";
 	state: "running" | "prepared" | "persisting";
 	expectedSessionRevision: number;
 	userMessage: AiEditionChatMessage;
 	assistantMessage: AiEditionChatMessage | null;
 	checkpoint: AxcutDocument | null;
+	intendedDocument: AxcutDocument | null;
 	requiresPersistence: boolean;
 	retainCommitResult: boolean;
 }
 
-interface PendingRewind extends LeasedChatOperation {
+interface PendingRewind extends LeasedChatOperation, OwnedChatOperation {
 	kind: "rewind";
 	state: "prepared" | "persisting";
 	targetMessageId: string;
@@ -118,6 +131,7 @@ const pendingChatRuns = new Map<string, PendingChatRun>();
 const pendingRewinds = new Map<string, PendingRewind>();
 const terminalChatOperations = new Map<string, TerminalChatOperation>();
 const operationExpiryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const operationReconciliations = new Map<string, Promise<void>>();
 const sessionUpdateListeners = new Set<(event: AiEditionChatSessionUpdatedEvent) => void>();
 
 function sessionKey(projectId: string, sessionId: string): string {
@@ -201,6 +215,13 @@ function activeOperationForId(operationId: string): PendingOperation | null {
 
 function operationIsActive(operation: PendingOperation): boolean {
 	return activeOperationForId(operation.operationId) === operation;
+}
+
+function operationIsOwnedBy(
+	operation: PendingOperation,
+	owner: ChatOperationOwner | null,
+): boolean {
+	return operation.owner === owner;
 }
 
 function expireActiveOperation(operation: PendingOperation): void {
@@ -302,6 +323,7 @@ export function beginChatOperationPersistence(
 	projectId: string,
 	sessionId: string,
 	operationId: string,
+	owner: ChatOperationOwner | null = null,
 ): { success: true } | { success: false; error: string } {
 	pruneExpiredOperations();
 	const terminal = terminalChatOperations.get(operationId);
@@ -318,15 +340,17 @@ export function beginChatOperationPersistence(
 	if (!operation) {
 		return { success: false, error: "Chat operation not found, expired, or owned elsewhere." };
 	}
+	if (!operationIsOwnedBy(operation, owner)) {
+		return { success: false, error: "Chat operation belongs to another document owner." };
+	}
 	if (operation.state === "persisting") return { success: true };
 	if (operation.state !== "prepared") {
 		return { success: false, error: "Chat operation is not prepared for persistence." };
 	}
 	operation.state = "persisting";
 	// Persistence is a write fence, not a lease. Once acknowledged it remains until the
-	// renderer reports that the actual document-save promise settled. A hung write therefore
-	// keeps this session unavailable until renderer/main teardown; releasing it on a watchdog
-	// would let an uncancelled write land after a replacement operation.
+	// renderer reports settlement or owner teardown reconciles the authoritative project queue.
+	// Releasing it on a watchdog would let an uncancelled write land after a replacement operation.
 	cancelOperationExpiry(operation.operationId);
 	operation.expiresAt = Number.POSITIVE_INFINITY;
 	return { success: true };
@@ -337,6 +361,7 @@ export function resolveChatOperationPersistence(
 	sessionId: string,
 	operationId: string,
 	_outcome: AiEditionChatPersistenceResolution,
+	owner: ChatOperationOwner | null = null,
 ): { success: true } | { success: false; error: string } {
 	pruneExpiredOperations();
 	const terminal = terminalChatOperations.get(operationId);
@@ -348,6 +373,12 @@ export function resolveChatOperationPersistence(
 	const operation = ownedOperation(projectId, sessionId, operationId);
 	if (!operation || operation.state !== "persisting") {
 		return { success: false, error: "Persisting chat operation not found or owned elsewhere." };
+	}
+	if (!operationIsOwnedBy(operation, owner)) {
+		return {
+			success: false,
+			error: "Persisting chat operation belongs to another document owner.",
+		};
 	}
 	rememberAbortedOperation(operation);
 	return { success: true };
@@ -384,9 +415,132 @@ export function getChatOperationStatus(
 		return { state: "running", kind: operation.kind, operationId };
 	}
 	if (operation.state === "persisting") {
-		return { state: "persisting", kind: operation.kind, operationId };
+		return {
+			state: operation.ownerDetached ? "reconciling" : "persisting",
+			kind: operation.kind,
+			operationId,
+		};
 	}
 	return { state: operation.state, kind: operation.kind, operationId };
+}
+
+function intendedDocumentFor(operation: PendingOperation): AxcutDocument | null {
+	return operation.kind === "chat" ? operation.intendedDocument : operation.document;
+}
+
+async function reconcileDetachedPersistence(
+	operation: PendingOperation,
+	documents: ChatDocumentAuthority,
+): Promise<void> {
+	if (
+		!operationIsActive(operation) ||
+		!operation.ownerDetached ||
+		operation.state !== "persisting"
+	) {
+		return;
+	}
+	const intended = intendedDocumentFor(operation);
+	if (!intended) {
+		abortPendingOperation(operation);
+		return;
+	}
+
+	let authoritative: AxcutDocument;
+	try {
+		authoritative = await documents.getProject(operation.projectId);
+	} catch (error) {
+		console.warn(
+			`[ai-edition] chat persistence reconciliation remains pending for ${operation.projectId}:`,
+			error,
+		);
+		return;
+	}
+	if (
+		!operationIsActive(operation) ||
+		!operation.ownerDetached ||
+		operation.state !== "persisting"
+	) {
+		return;
+	}
+
+	if (!documentsHaveEquivalentSaveContent(authoritative, intended)) {
+		abortPendingOperation(operation);
+		return;
+	}
+	const committed =
+		operation.kind === "chat"
+			? commitChatRun(
+					operation.projectId,
+					operation.sessionId,
+					operation.operationId,
+					operation.owner,
+				)
+			: commitRewindToMessage(
+					operation.projectId,
+					operation.sessionId,
+					operation.operationId,
+					operation.expectedSessionRevision,
+					operation.owner,
+				);
+	if (!committed.success && operationIsActive(operation)) abortPendingOperation(operation);
+}
+
+function requestPersistenceReconciliation(
+	operation: PendingOperation,
+	documents: ChatDocumentAuthority,
+): Promise<void> {
+	const existing = operationReconciliations.get(operation.operationId);
+	if (existing) return existing;
+	const run = reconcileDetachedPersistence(operation, documents).catch((error) => {
+		console.warn(
+			`[ai-edition] unexpected chat persistence reconciliation failure for ${operation.projectId}:`,
+			error,
+		);
+	});
+	operationReconciliations.set(operation.operationId, run);
+	void run.then(() => {
+		if (operationReconciliations.get(operation.operationId) === run) {
+			operationReconciliations.delete(operation.operationId);
+		}
+	});
+	return run;
+}
+
+export async function handleChatOperationOwnerTeardown(
+	owner: ChatOperationOwner,
+	documents: ChatDocumentAuthority,
+): Promise<void> {
+	const reconciliations: Promise<void>[] = [];
+	for (const operation of [...pendingChatRuns.values(), ...pendingRewinds.values()]) {
+		if (operation.owner !== owner) continue;
+		if (operation.state !== "persisting") {
+			abortPendingOperation(operation);
+			continue;
+		}
+		operation.ownerDetached = true;
+		reconciliations.push(requestPersistenceReconciliation(operation, documents));
+	}
+	await Promise.all(reconciliations);
+}
+
+export async function reconcileDetachedChatOperationsForProject(
+	projectId: string,
+	documents: ChatDocumentAuthority,
+): Promise<void> {
+	const reconciliations = [...pendingChatRuns.values(), ...pendingRewinds.values()]
+		.filter((operation) => operation.projectId === projectId && operation.ownerDetached)
+		.map((operation) => requestPersistenceReconciliation(operation, documents));
+	await Promise.all(reconciliations);
+}
+
+export async function reconcileDetachedChatOperation(
+	projectId: string,
+	sessionId: string,
+	operationId: string,
+	documents: ChatDocumentAuthority,
+): Promise<void> {
+	const operation = ownedOperation(projectId, sessionId, operationId);
+	if (operation?.ownerDetached) await requestPersistenceReconciliation(operation, documents);
 }
 
 function addActiveOperation(operation: PendingOperation): boolean {
@@ -668,8 +822,9 @@ export async function runChat(
 	 *  production caller which forgets to pass `cursor` gets an agent that answers
 	 *  "I could not look" every time, which is honest and unhelpful. */
 	env: ChatRunEnv = {},
-	/** Renderer-owned identity. When supplied, history remains staged until commitChatRun. */
+	/** Renderer correlation id. When supplied, history remains staged until commitChatRun. */
 	operationId?: string,
+	owner: ChatOperationOwner | null = null,
 ): Promise<AiEditionChatResult> {
 	const emit: Required<ChatEventSink> = { ...NOOP_SINK, ...sink };
 	const config = llmConfig.getConfig();
@@ -741,9 +896,12 @@ export async function runChat(
 		userMessage,
 		assistantMessage: null,
 		checkpoint: documentForCheckpoint,
+		intendedDocument: null,
 		requiresPersistence: false,
 		retainCommitResult: operationId !== undefined,
 		expiresAt: 0,
+		owner,
+		ownerDetached: false,
 	};
 	if (!addActiveOperation(pendingRun)) {
 		return { success: false, error: "Too many chat operations are active." };
@@ -837,13 +995,16 @@ export async function runChat(
 	};
 	pendingRun.assistantMessage = assistantMessage;
 	pendingRun.requiresPersistence = result.mutated && editsAllowed;
+	pendingRun.intendedDocument = pendingRun.requiresPersistence
+		? structuredClone(result.document)
+		: null;
 	pendingRun.state = "prepared";
 	scheduleActivePhase(pendingRun, PREPARED_OPERATION_TTL_MS);
 
 	// Direct main-process consumers use immediate commit. The renderer supplies an operation id
 	// and commits only after its launch document has been accepted and persisted.
 	if (!operationId) {
-		const committed = commitChatRun(projectId, session.id, runOperationId);
+		const committed = commitChatRun(projectId, session.id, runOperationId, owner);
 		if (!committed.success) return committed;
 	}
 
@@ -865,6 +1026,7 @@ export function commitChatRun(
 	projectId: string,
 	sessionId: string,
 	operationId: string,
+	owner: ChatOperationOwner | null = null,
 ): AiEditionChatCommitResult {
 	pruneExpiredOperations();
 	const terminal = terminalChatOperations.get(operationId);
@@ -885,6 +1047,9 @@ export function commitChatRun(
 	const pending = operation?.kind === "chat" ? operation : null;
 	if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
 		return { success: false, error: "Chat operation not found or expired." };
+	}
+	if (!operationIsOwnedBy(pending, owner)) {
+		return { success: false, error: "Chat operation belongs to another document owner." };
 	}
 	if (pending.state === "running" || !pending.assistantMessage) {
 		return { success: false, error: "Chat operation is still running." };
@@ -937,6 +1102,7 @@ export function abortChatRun(
 	projectId: string,
 	sessionId: string,
 	operationId: string,
+	owner: ChatOperationOwner | null = null,
 ): { success: true } | { success: false; error: string } {
 	pruneExpiredOperations();
 	const terminal = terminalChatOperations.get(operationId);
@@ -957,6 +1123,9 @@ export function abortChatRun(
 	if (!pending || !operationBelongsToSession(pending, projectId, sessionId)) {
 		return { success: false, error: "Chat operation not found or expired." };
 	}
+	if (!operationIsOwnedBy(pending, owner)) {
+		return { success: false, error: "Chat operation belongs to another document owner." };
+	}
 	if (pending.state === "persisting") {
 		return { success: false, error: "Persisting chat operation requires reconciliation." };
 	}
@@ -969,6 +1138,7 @@ export function prepareRewindToMessage(
 	projectId: string,
 	sessionId: string,
 	messageId: string,
+	owner: ChatOperationOwner | null = null,
 ):
 	| {
 			success: true;
@@ -1022,6 +1192,8 @@ export function prepareRewindToMessage(
 		document: structuredClone(cp.document),
 		messages: session.messages.slice(0, messageIndex + 1).map(cloneMessage),
 		expiresAt: 0,
+		owner,
+		ownerDetached: false,
 	};
 	if (!addActiveOperation(prepared)) {
 		return { success: false, error: "Too many chat operations are active." };
@@ -1042,6 +1214,7 @@ export function commitRewindToMessage(
 	sessionId: string,
 	operationId: string,
 	sessionRevision: number,
+	owner: ChatOperationOwner | null = null,
 ): AiEditionChatRewindCommitResult {
 	pruneExpiredOperations();
 	const terminal = terminalChatOperations.get(operationId);
@@ -1060,6 +1233,9 @@ export function commitRewindToMessage(
 	const prepared = operation?.kind === "rewind" ? operation : null;
 	if (!prepared || !operationBelongsToSession(prepared, projectId, sessionId)) {
 		return { success: false, error: "Rewind operation not found or expired." };
+	}
+	if (!operationIsOwnedBy(prepared, owner)) {
+		return { success: false, error: "Rewind operation belongs to another document owner." };
 	}
 	if (prepared.state !== "persisting") {
 		return { success: false, error: "Rewind operation has not begun document persistence." };
@@ -1120,6 +1296,7 @@ export function abortRewindToMessage(
 	projectId: string,
 	sessionId: string,
 	operationId: string,
+	owner: ChatOperationOwner | null = null,
 ): { success: true } | { success: false; error: string } {
 	pruneExpiredOperations();
 	const terminal = terminalChatOperations.get(operationId);
@@ -1139,6 +1316,9 @@ export function abortRewindToMessage(
 	const prepared = operation?.kind === "rewind" ? operation : null;
 	if (!prepared || !operationBelongsToSession(prepared, projectId, sessionId)) {
 		return { success: false, error: "Rewind operation not found or expired." };
+	}
+	if (!operationIsOwnedBy(prepared, owner)) {
+		return { success: false, error: "Rewind operation belongs to another document owner." };
 	}
 	if (prepared.state === "persisting") {
 		return { success: false, error: "Persisting rewind requires reconciliation." };

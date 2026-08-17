@@ -355,7 +355,7 @@ export type AiEditionChatRewindCommitResult =
 
 export type AiEditionChatOperationStatus =
 	| {
-			state: "running" | "prepared" | "persisting";
+			state: "running" | "prepared" | "persisting" | "reconciling";
 			kind: "chat" | "rewind";
 			operationId: string;
 	  }

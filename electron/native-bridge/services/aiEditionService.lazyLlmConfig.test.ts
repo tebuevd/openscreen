@@ -40,6 +40,9 @@ function serviceWithCountingFactory(): { service: AiEditionService; builds: () =
 				? { success: true as const }
 				: { success: false as const, error: "foreign operation" },
 		resolveChatOperationPersistence: () => ({ success: true as const }),
+		handleChatOwnerTeardown: async () => undefined,
+		reconcileChatProject: async () => undefined,
+		reconcileChatOperation: async () => undefined,
 		getChatOperationStatus: () => ({
 			state: "persisting" as const,
 			kind: "chat" as const,
@@ -61,17 +64,20 @@ describe("AiEditionService — LLM store resolution is deferred", () => {
 		expect(builds()).toBe(0);
 	});
 
-	it("routes persistence transitions and status without resolving the LLM store", () => {
+	it("routes persistence transitions and status without resolving the LLM store", async () => {
 		const { service, builds } = serviceWithCountingFactory();
-		expect(service.chatBeginPersistence("project", "session", "operation")).toEqual({
+		const owner = {};
+		expect(service.chatBeginPersistence("project", "session", "operation", owner)).toEqual({
 			success: true,
 		});
-		expect(service.chatOperationStatus("project", "session", "operation")).toMatchObject({
+		await expect(
+			service.chatOperationStatus("project", "session", "operation"),
+		).resolves.toMatchObject({
 			state: "persisting",
 		});
-		expect(service.chatResolvePersistence("project", "session", "operation", "failed")).toEqual({
-			success: true,
-		});
+		expect(
+			service.chatResolvePersistence("project", "session", "operation", "failed", owner),
+		).toEqual({ success: true });
 		expect(builds()).toBe(0);
 	});
 

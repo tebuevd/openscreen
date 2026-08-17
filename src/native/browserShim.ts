@@ -12,6 +12,7 @@ import type {
 } from "./contracts";
 
 const BROWSER_CHAT_SESSION_UPDATED_EVENT = "openscreen:chat-session-updated";
+let removeBrowserChatOwnerTeardownListener: (() => void) | null = null;
 
 function detectBrowserMode(): boolean {
 	if (typeof window === "undefined") return false;
@@ -513,6 +514,16 @@ function createShimBridgeClient() {
 		createdAt: s.createdAt,
 		messageCount: s.messages.length,
 	});
+	const handleDocumentOwnerTeardown = () => {
+		// Browser document writes update the in-memory map and localStorage synchronously
+		// before their resolved Promise is returned, so no write can still land after
+		// pagehide. Releasing every staged operation here is therefore deterministic.
+		for (const operation of [...pendingChatRuns.values()]) rememberAbortedRun(operation);
+	};
+	removeBrowserChatOwnerTeardownListener?.();
+	window.addEventListener("pagehide", handleDocumentOwnerTeardown);
+	removeBrowserChatOwnerTeardownListener = () =>
+		window.removeEventListener("pagehide", handleDocumentOwnerTeardown);
 
 	return {
 		aiEdition: {
