@@ -264,15 +264,6 @@ interface Window {
 			canceled?: boolean;
 			error?: string;
 		}>;
-		writeExportToPath: (
-			videoData: ArrayBuffer,
-			filePath: string,
-		) => Promise<{
-			success: boolean;
-			path?: string;
-			message?: string;
-			error?: string;
-		}>;
 		openVideoFilePicker: () => Promise<{
 			success: boolean;
 			path?: string;

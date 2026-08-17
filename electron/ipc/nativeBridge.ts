@@ -420,6 +420,44 @@ export function registerNativeBridgeHandlers(context: NativeBridgeContext) {
 							}
 							return createSuccessResponse(requestId, stats);
 						}
+						case "exportMultiStaged": {
+							const sender = event.sender;
+							const result = await compositorViewService.exportMultiStaged(
+								request.payload.clips,
+								request.payload.outPath,
+								request.payload.sceneJson,
+								request.payload.params,
+								request.payload.additionalInputPaths,
+								(frames) => {
+									if (!sender.isDestroyed()) {
+										sender.send("export:native-progress", frames);
+									}
+								},
+							);
+							if (!result) {
+								return createErrorResponse(
+									requestId,
+									"UNAVAILABLE",
+									"Native compositor addon not present.",
+								);
+							}
+							return createSuccessResponse(requestId, result);
+						}
+						case "replaceStagedExport":
+							await compositorViewService.replaceStagedExport(
+								request.payload.transactionId,
+								request.payload.data,
+							);
+							return createSuccessResponse(requestId, { ok: true as const });
+						case "commitStagedExport":
+							return createSuccessResponse(requestId, {
+								outputPath: await compositorViewService.commitStagedExport(
+									request.payload.transactionId,
+								),
+							});
+						case "abortStagedExport":
+							await compositorViewService.abortStagedExport(request.payload.transactionId);
+							return createSuccessResponse(requestId, { ok: true as const });
 						case "exportGif": {
 							const sender = event.sender;
 							const stats = await compositorViewService.exportGif(

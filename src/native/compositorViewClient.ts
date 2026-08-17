@@ -18,12 +18,14 @@ import type {
 	CompositorBackend,
 	CompositorBackendResult,
 	CompositorClipInput,
+	CompositorExportCommitResult,
 	CompositorExportGifParams,
 	CompositorExportGifResult,
 	CompositorExportParams,
 	CompositorExportResult,
 	CompositorFramePacket,
 	CompositorParamValue,
+	CompositorStagedExportResult,
 	CompositorViewRect,
 	CompositorViewResult,
 } from "./contracts";
@@ -156,6 +158,55 @@ export function exportMultiNative(
 		domain: "compositor",
 		action: "exportMulti",
 		payload: { clips, outPath, sceneJson, params },
+	});
+}
+
+export function exportMultiNativeStaged(
+	clips: CompositorClipInput[],
+	outPath: string,
+	sceneJson: string | undefined,
+	params: CompositorExportParams,
+	additionalInputPaths: string[],
+): Promise<CompositorStagedExportResult> {
+	if (!validateMp4ExportDimensions(params).ok) {
+		return Promise.reject(new Error(MP4_EXPORT_DIMENSIONS_ERROR));
+	}
+	if (!validateMp4ExportBitrate((params as { bitrate?: unknown }).bitrate)) {
+		return Promise.reject(new Error(MP4_EXPORT_BITRATE_ERROR));
+	}
+	return requireNativeBridgeData<CompositorStagedExportResult>({
+		domain: "compositor",
+		action: "exportMultiStaged",
+		payload: { clips, outPath, sceneJson, params, additionalInputPaths },
+	});
+}
+
+export function replaceStagedNativeExport(
+	transactionId: string,
+	data: ArrayBuffer,
+): Promise<{ ok: true }> {
+	return requireNativeBridgeData<{ ok: true }>({
+		domain: "compositor",
+		action: "replaceStagedExport",
+		payload: { transactionId, data },
+	});
+}
+
+export function commitStagedNativeExport(
+	transactionId: string,
+): Promise<CompositorExportCommitResult> {
+	return requireNativeBridgeData<CompositorExportCommitResult>({
+		domain: "compositor",
+		action: "commitStagedExport",
+		payload: { transactionId },
+	});
+}
+
+export function abortStagedNativeExport(transactionId: string): Promise<{ ok: true }> {
+	return requireNativeBridgeData<{ ok: true }>({
+		domain: "compositor",
+		action: "abortStagedExport",
+		payload: { transactionId },
 	});
 }
 

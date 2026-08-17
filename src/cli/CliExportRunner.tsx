@@ -32,7 +32,15 @@ import {
 	resolveMp4ExportSettings,
 } from "@/lib/exporter/mp4ExportSettings";
 import { mixVoiceoverIntoVideo } from "@/lib/exporter/voiceoverMix";
-import { exportGifNative, exportMultiNative, nativeBridgeClient } from "@/native";
+import {
+	abortStagedNativeExport,
+	commitStagedNativeExport,
+	exportGifNative,
+	exportMultiNative,
+	exportMultiNativeStaged,
+	nativeBridgeClient,
+	replaceStagedNativeExport,
+} from "@/native";
 import { buildSceneDescription } from "@/native/sceneDescription";
 import { CLI_EXPORT_DIMENSIONS_ERROR, prepareCliExportDocument } from "./prepareExportDocument";
 import { clampZoomFocus } from "./vendor/zoomHelpers";
@@ -287,43 +295,51 @@ export async function runExport(request: CliExportRequest): Promise<CliDoneResul
 			};
 		}
 
-		// MP4: native writes outPath directly. When a voiceover is requested, mix
-		// it afterwards (the native pipeline has no extra-audio-track concept) and
-		// overwrite the same file.
 		if (!mp4Resolution?.ok) {
 			throw new Error(CLI_EXPORT_DIMENSIONS_ERROR);
 		}
-		await exportMultiNative(clips, outPath, sceneJson, {
+		const mp4Params = {
 			width: mp4Resolution.settings.width,
 			height: mp4Resolution.settings.height,
 			fps: MP4_EXPORT_FPS,
 			bitrate: mp4Resolution.settings.bitrate,
 			codec: "h264",
-		});
+		};
 
-		if (request.audioPath) {
-			window.electronAPI.cliProgress({ percentage: 100, phase: "mixing-voiceover" });
-			const [videoResponse, audioResponse] = await Promise.all([
-				fetch(toFileUrl(outPath)),
-				fetch(toFileUrl(request.audioPath)),
-			]);
-			if (!videoResponse.ok) {
-				throw new Error(`Failed to read the exported video back for mixing: ${outPath}`);
-			}
-			if (!audioResponse.ok) {
-				throw new Error(`Failed to read voiceover file: ${request.audioPath}`);
-			}
-			const mixed = await mixVoiceoverIntoVideo(await videoResponse.blob(), {
-				voiceoverData: await audioResponse.arrayBuffer(),
-				mode: request.audioMode,
-				offsetSec: request.audioOffsetSec,
-			});
-			const saveResult = await window.electronAPI.writeExportToPath(
-				await mixed.arrayBuffer(),
-				outPath,
-			);
-			if (!saveResult.success) {
-				throw new Error(saveResult.message ?? `Failed to write mixed output to ${outPath}`);
+		if (!request.audioPath) {
+			await exportMultiNative(clips, outPath, sceneJson, mp4Params);
+		} else {
+			let transactionId: string | null = null;
+			try {
+				const staged = await exportMultiNativeStaged(clips, outPath, sceneJson, mp4Params, [
+					request.audioPath,
+				]);
+				transactionId = staged.transactionId;
+				window.electronAPI.cliProgress({ percentage: 100, phase: "mixing-voiceover" });
+				const [videoResponse, audioResponse] = await Promise.all([
+					fetch(toFileUrl(staged.temporaryPath)),
+					fetch(toFileUrl(request.audioPath)),
+				]);
+				if (!videoResponse.ok) {
+					throw new Error("Failed to read the staged video back for voiceover mixing");
+				}
+				if (!audioResponse.ok) {
+					throw new Error(`Failed to read voiceover file: ${request.audioPath}`);
+				}
+				const mixed = await mixVoiceoverIntoVideo(await videoResponse.blob(), {
+					voiceoverData: await audioResponse.arrayBuffer(),
+					mode: request.audioMode,
+					offsetSec: request.audioOffsetSec,
+				});
+				await replaceStagedNativeExport(transactionId, await mixed.arrayBuffer());
+				await commitStagedNativeExport(transactionId);
+				transactionId = null;
+			} finally {
+				if (transactionId) {
+					await abortStagedNativeExport(transactionId).catch((error) => {
+						console.warn("[cli-export] failed to abort staged export:", error);
+					});
+				}
 			}
 		}
 

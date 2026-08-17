@@ -1,7 +1,6 @@
 // Export dialog for the new editor. Wires together:
 // 1. pickExportSavePath (native save dialog)
 // 2. the native D3D exporter (exportMultiNative / exportGifNative)
-// 3. writeExportToPath (writes the resulting buffer to disk)
 //
 // Format/quality/GIF options live in the dialog's local state. The
 // legacy `ExportDialog` (in components/video-editor) is the rich version

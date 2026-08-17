@@ -7,7 +7,13 @@ vi.mock("./client", () => ({
 	requireNativeBridgeData: requireNativeBridgeDataMock,
 }));
 
-import { exportMultiNative } from "./compositorViewClient";
+import {
+	abortStagedNativeExport,
+	commitStagedNativeExport,
+	exportMultiNative,
+	exportMultiNativeStaged,
+	replaceStagedNativeExport,
+} from "./compositorViewClient";
 
 describe("exportMultiNative params", () => {
 	beforeEach(() => {
@@ -62,5 +68,42 @@ describe("exportMultiNative params", () => {
 			}),
 		).rejects.toThrow(/bitrate.*positive safe integer/);
 		expect(requireNativeBridgeDataMock).not.toHaveBeenCalled();
+	});
+
+	it("wires staged render, replacement, commit, and abort through typed bridge actions", async () => {
+		const params = { width: 1920, height: 1080, bitrate: 20_000_000 };
+		const data = new ArrayBuffer(4);
+
+		await exportMultiNativeStaged([], "/tmp/selected.mp4", "{}", params, ["/tmp/voiceover.wav"]);
+		await replaceStagedNativeExport("transaction-1", data);
+		await commitStagedNativeExport("transaction-1");
+		await abortStagedNativeExport("transaction-2");
+
+		expect(requireNativeBridgeDataMock).toHaveBeenNthCalledWith(1, {
+			domain: "compositor",
+			action: "exportMultiStaged",
+			payload: {
+				clips: [],
+				outPath: "/tmp/selected.mp4",
+				sceneJson: "{}",
+				params,
+				additionalInputPaths: ["/tmp/voiceover.wav"],
+			},
+		});
+		expect(requireNativeBridgeDataMock).toHaveBeenNthCalledWith(2, {
+			domain: "compositor",
+			action: "replaceStagedExport",
+			payload: { transactionId: "transaction-1", data },
+		});
+		expect(requireNativeBridgeDataMock).toHaveBeenNthCalledWith(3, {
+			domain: "compositor",
+			action: "commitStagedExport",
+			payload: { transactionId: "transaction-1" },
+		});
+		expect(requireNativeBridgeDataMock).toHaveBeenNthCalledWith(4, {
+			domain: "compositor",
+			action: "abortStagedExport",
+			payload: { transactionId: "transaction-2" },
+		});
 	});
 });

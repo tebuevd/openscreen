@@ -97,6 +97,8 @@ export interface ClipInput {
 	sourceEndSec: number;
 	/** webcam source time = screen source time − this. */
 	webcamOffsetSec: number;
+	/** Whether native should decode and mix the screen file's audio track. */
+	hasAudio: boolean;
 }
 
 /** Which backend the compositor will run on. `"cpu"` = WARP rasterisation + software

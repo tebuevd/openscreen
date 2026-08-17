@@ -3428,37 +3428,6 @@ export function registerIpcHandlers(
 		}
 	});
 
-	ipcMain.handle("write-export-to-path", async (_, videoData: ArrayBuffer, filePath: string) => {
-		try {
-			// Sanity-check the path: the renderer is trusted (contextIsolation on), but a
-			// stale-state bug shouldn't be able to clobber arbitrary files.
-			if (typeof filePath !== "string" || !path.isAbsolute(filePath)) {
-				return { success: false, message: "Invalid path" };
-			}
-			const lower = filePath.toLowerCase();
-			if (!lower.endsWith(".mp4") && !lower.endsWith(".gif")) {
-				return { success: false, message: "Invalid file type" };
-			}
-
-			const normalizedPath = path.normalize(filePath);
-			await fs.mkdir(path.dirname(normalizedPath), { recursive: true });
-			await fs.writeFile(normalizedPath, Buffer.from(videoData));
-
-			return {
-				success: true,
-				path: normalizedPath,
-				message: "Video exported successfully",
-			};
-		} catch (error) {
-			console.error("Failed to write exported video:", error);
-			return {
-				success: false,
-				message: "Failed to save exported video",
-				error: String(error),
-			};
-		}
-	});
-
 	ipcMain.handle("open-video-file-picker", async () => {
 		try {
 			const dialogOptions = buildDialogOptions(

@@ -164,6 +164,17 @@ export interface CompositorExportResult {
 	videoDurationS: number;
 }
 
+/** Native render kept in a main-process transaction for a later post-processing commit. */
+export interface CompositorStagedExportResult {
+	transactionId: string;
+	temporaryPath: string;
+	stats: CompositorExportResult;
+}
+
+export interface CompositorExportCommitResult {
+	outputPath: string;
+}
+
 /** Taille/cadence/codec de sortie voulus. La taille est toujours une paire explicite. */
 export interface CompositorExportParams {
 	width: number;
@@ -723,6 +734,36 @@ export type NativeBridgeRequest =
 				sceneJson?: string;
 				params: CompositorExportParams;
 			};
+			requestId?: string;
+	  }
+	| {
+			domain: "compositor";
+			action: "exportMultiStaged";
+			payload: {
+				clips: CompositorClipInput[];
+				outPath: string;
+				sceneJson?: string;
+				params: CompositorExportParams;
+				additionalInputPaths: string[];
+			};
+			requestId?: string;
+	  }
+	| {
+			domain: "compositor";
+			action: "replaceStagedExport";
+			payload: { transactionId: string; data: ArrayBuffer };
+			requestId?: string;
+	  }
+	| {
+			domain: "compositor";
+			action: "commitStagedExport";
+			payload: { transactionId: string };
+			requestId?: string;
+	  }
+	| {
+			domain: "compositor";
+			action: "abortStagedExport";
+			payload: { transactionId: string };
 			requestId?: string;
 	  }
 	| {
