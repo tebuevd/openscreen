@@ -53,7 +53,24 @@ vi.mock("./ProviderSettings", () => ({
 }));
 
 vi.mock("./Modals", () => ({
-	ChatHistoryModal: () => null,
+	ChatHistoryModal: ({
+		open,
+		sessions,
+		onSelect,
+	}: {
+		open: boolean;
+		sessions: Array<{ id: string; title: string }>;
+		onSelect: (id: string) => void;
+	}) =>
+		open ? (
+			<div aria-label="Conversation picker">
+				{sessions.map((session) => (
+					<button key={session.id} type="button" onClick={() => onSelect(session.id)}>
+						{session.title}
+					</button>
+				))}
+			</div>
+		) : null,
 	SourceTranscriptModal: () => null,
 }));
 
@@ -460,6 +477,7 @@ describe("LeftPanel async document results", () => {
 		const run = deferred<ReturnType<typeof chatResult>>();
 		await startPendingChat(run.promise);
 		const agentResult = withTitle(sampleDoc, "Superseded agent result");
+		bridgeMocks.get.mockResolvedValue({ success: true, document: agentResult });
 
 		await act(async () => {
 			run.resolve(chatResult(agentResult));
@@ -513,6 +531,7 @@ describe("LeftPanel async document results", () => {
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(agentResult));
 
 		const imported = withTitle(sampleDoc, "Imported replacement after save started");
+		bridgeMocks.get.mockResolvedValue({ success: true, document: imported });
 		let importing!: Promise<boolean>;
 		act(() => {
 			importing = useProjectStore.getState().importProject(imported);
@@ -595,6 +614,107 @@ describe("LeftPanel async document results", () => {
 		});
 		expect(screen.getByText("The edit is ready.")).toBeInTheDocument();
 		expect(toastMocks.error).not.toHaveBeenCalled();
+	});
+
+	it.each([
+		"successful",
+		"ambiguous",
+	] as const)("commits one canonical checkpoint after a same-project reopen and %s save response", async (saveResponse) => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const reloading = deferred<{ success: true; document: AxcutDocument }>();
+		const readback = deferred<{ success: true; document: AxcutDocument }>();
+		const resultDocument = withTitle(sampleDoc, "Persisted before same-project reopen");
+		const reopened = {
+			...resultDocument,
+			project: {
+				...resultDocument.project,
+				updatedAt: "2026-08-16T10:05:00.000Z",
+			},
+		};
+		const committed = canonicalChatCommit();
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockReturnValueOnce(reloading.promise).mockReturnValueOnce(readback.promise);
+		bridgeMocks.chatCommitRun.mockResolvedValue({
+			success: false,
+			error: "Owner teardown already committed this operation.",
+		});
+		bridgeMocks.chatOperationStatus.mockImplementation(
+			async (_projectId: string, _sessionId: string, operationId: string) =>
+				bridgeMocks.chatCommitRun.mock.calls.length > 0
+					? {
+							state: "committed" as const,
+							kind: "chat" as const,
+							operationId,
+							result: committed,
+						}
+					: { state: "persisting" as const, kind: "chat" as const, operationId },
+		);
+		const run = deferred<ReturnType<typeof chatResult>>();
+		await startPendingChat(run.promise);
+		await act(async () => {
+			run.resolve(chatResult(resultDocument));
+			await run.promise;
+		});
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(resultDocument));
+
+		let reopen!: Promise<void>;
+		act(() => {
+			reopen = useProjectStore.getState().loadProject("proj_a");
+		});
+		await act(async () => {
+			if (saveResponse === "successful") {
+				saving.resolve({ success: true, document: resultDocument });
+			} else {
+				saving.reject(new Error("save response lost"));
+			}
+			await saving.promise.catch(() => undefined);
+		});
+		await waitFor(() => expect(bridgeMocks.get).toHaveBeenCalledTimes(2));
+		await act(async () => {
+			reloading.resolve({ success: true, document: reopened });
+			await reopen;
+		});
+		await act(async () => {
+			readback.resolve({ success: true, document: resultDocument });
+			await readback.promise;
+		});
+
+		await waitFor(() => expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(1));
+		expect(bridgeMocks.chatResolvePersistence).not.toHaveBeenCalled();
+		expect(screen.queryByText("The edit is ready.")).not.toBeInTheDocument();
+		expect(toastMocks.error).not.toHaveBeenCalled();
+		const operationId = bridgeMocks.chatRun.mock.calls[0][4] as string;
+		act(() => {
+			chatSessionUpdateListener?.({
+				projectId: "proj_a",
+				sessionId: "session_1",
+				revision: committed.sessionRevision,
+				operationId,
+				kind: "chat",
+				messages: committed.messages,
+			});
+			chatSessionUpdateListener?.({
+				projectId: "proj_a",
+				sessionId: "session_1",
+				revision: committed.sessionRevision,
+				operationId,
+				kind: "chat",
+				messages: committed.messages,
+			});
+		});
+
+		expect(await screen.findAllByText("The edit is ready.")).toHaveLength(1);
+		bridgeMocks.chatPrepareRewind.mockResolvedValue({ success: false, error: "stop" });
+		fireEvent.click(screen.getByRole("button", { name: "Rewind to this message" }));
+		fireEvent.click(screen.getByRole("button", { name: "Rewind" }));
+		await waitFor(() =>
+			expect(bridgeMocks.chatPrepareRewind).toHaveBeenCalledWith(
+				"proj_a",
+				"session_1",
+				"canonical_user_1",
+			),
+		);
+		expect(bridgeMocks.chatCommitRun).toHaveBeenCalledTimes(1);
 	});
 
 	it("recovers two lost chat commit replies from canonical status without duplication", async () => {
@@ -785,6 +905,192 @@ describe("LeftPanel async document results", () => {
 		);
 		expect(input).toHaveValue("Keep this draft");
 		expect(bridgeMocks.chatConfirmRewindComposerClaim).not.toHaveBeenCalled();
+	});
+
+	it("retries a lost claim when the first renderer releases its lease", async () => {
+		bridgeMocks.chatSelectSession.mockResolvedValue({
+			id: "session_1",
+			projectId: "proj_a",
+			title: "Conversation",
+			createdAt: "2026-08-16T10:00:00.000Z",
+			messages: [rewindMessages[0]],
+			revision: 8,
+			pendingComposerRestoration: { revision: 8 },
+		});
+		bridgeMocks.chatClaimRewindComposer
+			.mockResolvedValueOnce({ claimed: false, leaseExpiresAt: Date.now() + 15_000 })
+			.mockResolvedValueOnce(rewindComposerClaim("Recovered after release", "released-claim"));
+		renderPanel();
+		await waitFor(() => expect(bridgeMocks.chatClaimRewindComposer).toHaveBeenCalledTimes(1));
+
+		act(() => {
+			chatSessionUpdateListener?.({
+				projectId: "proj_a",
+				sessionId: "session_1",
+				revision: 8,
+				operationId: "first-owner-lease-released",
+				kind: "rewind-composer-available",
+				messages: [rewindMessages[0]],
+				pendingComposerRestoration: { revision: 8 },
+			});
+		});
+
+		const input = screen.getByPlaceholderText("Describe the edit you want.");
+		await waitFor(() => expect(input).toHaveValue("Recovered after release"));
+		expect(bridgeMocks.chatClaimRewindComposer).toHaveBeenCalledTimes(2);
+		fireEvent.change(input, { target: { value: "Keep one applied draft" } });
+		act(() => {
+			chatSessionUpdateListener?.({
+				projectId: "proj_a",
+				sessionId: "session_1",
+				revision: 8,
+				operationId: "duplicate-availability",
+				kind: "rewind-composer-available",
+				messages: [rewindMessages[0]],
+				pendingComposerRestoration: { revision: 8 },
+			});
+		});
+		expect(bridgeMocks.chatClaimRewindComposer).toHaveBeenCalledTimes(2);
+		expect(input).toHaveValue("Keep one applied draft");
+	});
+
+	it("retries a false claim after switching away and reselecting the conversation", async () => {
+		bridgeMocks.chatListSessions.mockResolvedValue([
+			{
+				id: "session_1",
+				title: "Conversation 1",
+				messageCount: 1,
+				createdAt: "2026-08-16T10:00:00.000Z",
+			},
+			{
+				id: "session_2",
+				title: "Conversation 2",
+				messageCount: 0,
+				createdAt: "2026-08-16T10:01:00.000Z",
+			},
+		]);
+		bridgeMocks.chatSelectSession.mockImplementation(async (_projectId, sessionId) =>
+			sessionId === "session_1"
+				? {
+						id: "session_1",
+						projectId: "proj_a",
+						title: "Conversation 1",
+						createdAt: "2026-08-16T10:00:00.000Z",
+						messages: [rewindMessages[0]],
+						revision: 9,
+						pendingComposerRestoration: { revision: 9 },
+					}
+				: {
+						id: "session_2",
+						projectId: "proj_a",
+						title: "Conversation 2",
+						createdAt: "2026-08-16T10:01:00.000Z",
+						messages: [],
+						revision: 0,
+					},
+		);
+		bridgeMocks.chatClaimRewindComposer
+			.mockResolvedValueOnce({ claimed: false })
+			.mockResolvedValueOnce(rewindComposerClaim("Recovered on reselect", "reselected-claim"));
+		renderPanel();
+		await waitFor(() => expect(bridgeMocks.chatClaimRewindComposer).toHaveBeenCalledTimes(1));
+
+		fireEvent.click(screen.getByRole("button", { name: "History" }));
+		fireEvent.click(screen.getByRole("button", { name: "Conversation 2" }));
+		await waitFor(() =>
+			expect(bridgeMocks.chatSelectSession).toHaveBeenCalledWith("proj_a", "session_2"),
+		);
+		fireEvent.click(screen.getByRole("button", { name: "Conversation 1" }));
+
+		await waitFor(() =>
+			expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue(
+				"Recovered on reselect",
+			),
+		);
+		expect(bridgeMocks.chatClaimRewindComposer).toHaveBeenCalledTimes(2);
+	});
+
+	it("retries once when another owner's composer lease expires", async () => {
+		bridgeMocks.chatSelectSession.mockResolvedValue({
+			id: "session_1",
+			projectId: "proj_a",
+			title: "Conversation",
+			createdAt: "2026-08-16T10:00:00.000Z",
+			messages: [rewindMessages[0]],
+			revision: 10,
+			pendingComposerRestoration: { revision: 10 },
+		});
+		bridgeMocks.chatClaimRewindComposer
+			.mockResolvedValueOnce({ claimed: false, leaseExpiresAt: Date.now() + 20 })
+			.mockResolvedValueOnce(rewindComposerClaim("Recovered after expiry", "expiry-claim"));
+		renderPanel();
+
+		await waitFor(() =>
+			expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue(
+				"Recovered after expiry",
+			),
+		);
+		expect(bridgeMocks.chatClaimRewindComposer).toHaveBeenCalledTimes(2);
+		expect(bridgeMocks.chatConfirmRewindComposerClaim).toHaveBeenCalledWith("expiry-claim");
+	});
+
+	it("cancels an older revision retry when a newer rewind supersedes it", async () => {
+		bridgeMocks.chatSelectSession.mockResolvedValue({
+			id: "session_1",
+			projectId: "proj_a",
+			title: "Conversation",
+			createdAt: "2026-08-16T10:00:00.000Z",
+			messages: [rewindMessages[0]],
+			revision: 11,
+			pendingComposerRestoration: { revision: 11 },
+		});
+		bridgeMocks.chatClaimRewindComposer
+			.mockResolvedValueOnce({ claimed: false, leaseExpiresAt: Date.now() + 40 })
+			.mockResolvedValueOnce(rewindComposerClaim("Newest rewind prompt", "newest-claim"));
+		renderPanel();
+		await waitFor(() => expect(bridgeMocks.chatClaimRewindComposer).toHaveBeenCalledTimes(1));
+
+		act(() => {
+			chatSessionUpdateListener?.({
+				projectId: "proj_a",
+				sessionId: "session_1",
+				revision: 12,
+				operationId: "newer-rewind",
+				kind: "rewind",
+				messages: [rewindMessages[0]],
+				pendingComposerRestoration: { revision: 12 },
+			});
+		});
+		const input = screen.getByPlaceholderText("Describe the edit you want.");
+		await waitFor(() => expect(input).toHaveValue("Newest rewind prompt"));
+		await new Promise((resolve) => setTimeout(resolve, 60));
+
+		expect(bridgeMocks.chatClaimRewindComposer).toHaveBeenCalledTimes(2);
+		expect(bridgeMocks.chatClaimRewindComposer).toHaveBeenLastCalledWith("proj_a", "session_1", 12);
+		expect(input).toHaveValue("Newest rewind prompt");
+	});
+
+	it("clears a scheduled composer retry when the panel unmounts", async () => {
+		bridgeMocks.chatSelectSession.mockResolvedValue({
+			id: "session_1",
+			projectId: "proj_a",
+			title: "Conversation",
+			createdAt: "2026-08-16T10:00:00.000Z",
+			messages: [rewindMessages[0]],
+			revision: 13,
+			pendingComposerRestoration: { revision: 13 },
+		});
+		bridgeMocks.chatClaimRewindComposer.mockResolvedValue({
+			claimed: false,
+			leaseExpiresAt: Date.now() + 30,
+		});
+		const view = renderPanel();
+		await waitFor(() => expect(bridgeMocks.chatClaimRewindComposer).toHaveBeenCalledTimes(1));
+
+		view.unmount();
+		await new Promise((resolve) => setTimeout(resolve, 50));
+
+		expect(bridgeMocks.chatClaimRewindComposer).toHaveBeenCalledTimes(1);
 	});
 
 	it("replays a missed rewind prompt when its conversation is selected later", async () => {
@@ -1178,6 +1484,7 @@ describe("LeftPanel async document results", () => {
 				? rewindSave.promise
 				: Promise.resolve({ success: true as const, document });
 		});
+		bridgeMocks.get.mockResolvedValue({ success: true, document: prepared.document });
 		await startPendingRewind(Promise.resolve(prepared));
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(prepared.document));
 
@@ -1233,6 +1540,61 @@ describe("LeftPanel async document results", () => {
 				"Try this edit",
 			),
 		);
+	});
+
+	it("commits rewind history after a same-project reopen reads the persisted document", async () => {
+		const prepared = preparedRewind("rewind_same_project_reopen");
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const reloading = deferred<{ success: true; document: AxcutDocument }>();
+		const readback = deferred<{ success: true; document: AxcutDocument }>();
+		const committed = {
+			success: true as const,
+			messages: prepared.messages,
+			sessionRevision: prepared.sessionRevision + 1,
+			pendingComposerRestoration: { revision: prepared.sessionRevision + 1 },
+		};
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockReturnValueOnce(reloading.promise).mockReturnValueOnce(readback.promise);
+		bridgeMocks.chatCommitRewind.mockResolvedValue(committed);
+		await startPendingRewind(Promise.resolve(prepared));
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(prepared.document));
+
+		let reopen!: Promise<void>;
+		act(() => {
+			reopen = useProjectStore.getState().loadProject("proj_a");
+		});
+		saving.resolve({ success: true, document: prepared.document });
+		await waitFor(() => expect(bridgeMocks.get).toHaveBeenCalledTimes(2));
+		await act(async () => {
+			reloading.resolve({ success: true, document: prepared.document });
+			await reopen;
+		});
+		await act(async () => {
+			readback.resolve({ success: true, document: prepared.document });
+			await readback.promise;
+		});
+
+		await waitFor(() => expect(bridgeMocks.chatCommitRewind).toHaveBeenCalledTimes(1));
+		expect(bridgeMocks.chatResolvePersistence).not.toHaveBeenCalled();
+		expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue("");
+		act(() => {
+			chatSessionUpdateListener?.({
+				projectId: "proj_a",
+				sessionId: "session_1",
+				revision: committed.sessionRevision,
+				operationId: prepared.operationId,
+				kind: "rewind",
+				messages: committed.messages,
+				pendingComposerRestoration: committed.pendingComposerRestoration,
+			});
+		});
+
+		await waitFor(() =>
+			expect(screen.getByPlaceholderText("Describe the edit you want.")).toHaveValue(
+				"Try this edit",
+			),
+		);
+		expect(bridgeMocks.chatCommitRewind).toHaveBeenCalledTimes(1);
 	});
 
 	it("adopts a differing authoritative save and resolves rewind history", async () => {

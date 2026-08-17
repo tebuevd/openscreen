@@ -10,7 +10,10 @@ import {
 	createEmptyDocument,
 	documentSchema,
 } from "../../src/lib/ai-edition/schema";
-import { MAX_ACTIVE_REWIND_COMPOSER_CLAIMS } from "../../src/native/contracts";
+import {
+	type AiEditionChatSessionUpdatedEvent,
+	MAX_ACTIVE_REWIND_COMPOSER_CLAIMS,
+} from "../../src/native/contracts";
 
 vi.mock("./deep-agent/service", () => ({
 	invokeOpenScreenAgent: vi.fn(),
@@ -381,7 +384,7 @@ describe("runChat tool loop", () => {
 		).toEqual(firstClaim);
 		expect(
 			claimRewindComposer("proj_rewind", session.id, committed.sessionRevision, replacementOwner),
-		).toEqual({ claimed: false });
+		).toEqual({ claimed: false, leaseExpiresAt: firstClaim.leaseExpiresAt });
 		expect(confirmRewindComposerClaim(firstClaim.claimId, replacementOwner)).toEqual({
 			confirmed: false,
 		});
@@ -561,6 +564,66 @@ describe("runChat tool loop", () => {
 		});
 	});
 
+	it("notifies another renderer when owner teardown or expiry makes a prompt available", async () => {
+		vi.useFakeTimers();
+		const projectId = "proj_rewind_claim_available";
+		const document = projectDocument(projectId, "Rewind claim availability");
+		const restoration = await createComposerRestoration(projectId, document, 0);
+		const firstOwner = {};
+		const waitingOwner = {};
+		const firstClaim = claimRewindComposer(
+			projectId,
+			restoration.sessionId,
+			restoration.revision,
+			firstOwner,
+		);
+		expect(firstClaim.claimed).toBe(true);
+		if (!firstClaim.claimed) return;
+		expect(
+			claimRewindComposer(projectId, restoration.sessionId, restoration.revision, waitingOwner),
+		).toEqual({ claimed: false, leaseExpiresAt: firstClaim.leaseExpiresAt });
+		const updates: AiEditionChatSessionUpdatedEvent[] = [];
+		const unsubscribe = subscribeChatSessionUpdates((update) => updates.push(update));
+
+		await handleChatOperationOwnerTeardown(firstOwner, { getProject: vi.fn() });
+
+		expect(updates).toEqual([
+			expect.objectContaining({
+				projectId,
+				sessionId: restoration.sessionId,
+				revision: restoration.revision,
+				kind: "rewind-composer-available",
+				pendingComposerRestoration: { revision: restoration.revision },
+			}),
+		]);
+		const waitingClaim = claimRewindComposer(
+			projectId,
+			restoration.sessionId,
+			restoration.revision,
+			waitingOwner,
+		);
+		expect(waitingClaim).toMatchObject({ claimed: true, prompt: restoration.prompt });
+		if (!waitingClaim.claimed) return;
+
+		vi.advanceTimersByTime(waitingClaim.leaseExpiresAt - Date.now());
+
+		expect(updates).toHaveLength(2);
+		expect(updates[1]).toMatchObject({
+			kind: "rewind-composer-available",
+			pendingComposerRestoration: { revision: restoration.revision },
+		});
+		const finalOwner = {};
+		const finalClaim = claimRewindComposer(
+			projectId,
+			restoration.sessionId,
+			restoration.revision,
+			finalOwner,
+		);
+		expect(finalClaim).toMatchObject({ claimed: true, prompt: restoration.prompt });
+		if (finalClaim.claimed) confirmRewindComposerClaim(finalClaim.claimId, finalOwner);
+		unsubscribe();
+	});
+
 	it("caps active composer leases without evicting or allocating for rejected claims", async () => {
 		vi.useFakeTimers();
 		const projectId = "proj_rewind_claim_capacity";
@@ -588,6 +651,7 @@ describe("runChat tool loop", () => {
 
 		expect(claimRewindComposer(projectId, overflow.sessionId, overflow.revision, {})).toEqual({
 			claimed: false,
+			leaseExpiresAt: leases[0].leaseExpiresAt,
 		});
 		expect(vi.getTimerCount()).toBe(timersAtCapacity);
 		expect(selectSession(projectId, overflow.sessionId)?.pendingComposerRestoration).toEqual({
@@ -630,7 +694,7 @@ describe("runChat tool loop", () => {
 		const timersBeforeExpiryRejection = vi.getTimerCount();
 		expect(
 			claimRewindComposer(projectId, expiryOverflow.sessionId, expiryOverflow.revision, {}),
-		).toEqual({ claimed: false });
+		).toEqual({ claimed: false, leaseExpiresAt: leases[2].leaseExpiresAt });
 		expect(vi.getTimerCount()).toBe(timersBeforeExpiryRejection);
 		vi.advanceTimersByTime(leases[2].leaseExpiresAt - Date.now());
 		const expiryOwner = {};
@@ -1012,13 +1076,29 @@ describe("runChat tool loop", () => {
 		expect(getChatOperationStatus(projectId, session.id, operationId)).toMatchObject({
 			state: "committed",
 		});
-		expect(selectSession(projectId, session.id)?.messages).toHaveLength(2);
+		const committedSession = selectSession(projectId, session.id);
+		expect(committedSession?.messages).toHaveLength(2);
+		const committedUser = committedSession?.messages[0];
+		expect(committedUser?.checkpointId).toBe(committedUser?.id);
 		expect(updates).toHaveLength(1);
 
 		await handleChatOperationOwnerTeardown(owner, documents);
 		await reconcileDetachedChatOperationsForProject(projectId, documents);
 		expect(documents.getProject).toHaveBeenCalledTimes(1);
 		expect(updates).toHaveLength(1);
+		const checkpointOwner = {};
+		const checkpoint = prepareRewindToMessage(
+			projectId,
+			session.id,
+			committedUser!.id,
+			checkpointOwner,
+		);
+		expect(checkpoint.success).toBe(true);
+		if (checkpoint.success) {
+			expect(
+				abortRewindToMessage(projectId, session.id, checkpoint.operationId, checkpointOwner),
+			).toEqual({ success: true });
+		}
 		const replacementOwner = {};
 		await expect(
 			runChat(

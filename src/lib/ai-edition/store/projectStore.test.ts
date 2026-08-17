@@ -99,6 +99,10 @@ const assetDoc: AxcutDocument = {
 	},
 };
 
+function withUpdatedAt(document: AxcutDocument, updatedAt: string): AxcutDocument {
+	return { ...document, project: { ...document.project, updatedAt } };
+}
+
 function deferred<T>() {
 	let resolve!: (value: T) => void;
 	let reject!: (reason?: unknown) => void;
@@ -519,7 +523,7 @@ describe("useProjectStore", () => {
 		});
 	});
 
-	it("reports a successful save as detached when the current document changes in flight", async () => {
+	it("reports a successful save as superseded when the current document changes in flight", async () => {
 		const { clearHistory, undo } = await import("./undo");
 		clearHistory();
 		const pending = deferred<{ success: true; document: AxcutDocument }>();
@@ -530,6 +534,7 @@ describe("useProjectStore", () => {
 			...sampleDoc,
 			project: { ...sampleDoc.project, title: "Persisted agent result" },
 		};
+		bridgeMocks.get.mockResolvedValue({ success: true, document: resultDocument });
 		const applying = useProjectStore.getState().applyDocumentResult(expected, resultDocument);
 		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(resultDocument));
 		useProjectStore.getState().setDocument({
@@ -539,11 +544,7 @@ describe("useProjectStore", () => {
 		await Promise.resolve();
 
 		pending.resolve({ success: true, document: resultDocument });
-		await expect(applying).resolves.toEqual({
-			success: true,
-			status: "persisted-detached",
-			appliedToCurrent: false,
-		});
+		await expect(applying).resolves.toEqual({ success: false, status: "superseded" });
 		expect(useProjectStore.getState()).toMatchObject({
 			document: { project: { title: "Newer local edit" } },
 			dirty: true,
@@ -682,7 +683,7 @@ describe("useProjectStore", () => {
 		expect(useProjectStore.getState().document?.project.title).toBe("Test");
 	});
 
-	it("reports reconciled persistence without replacing a newer current document", async () => {
+	it("reports ambiguous persistence as superseded by a newer current document", async () => {
 		const pending = deferred<{ success: true; document: AxcutDocument }>();
 		const resultDocument: AxcutDocument = {
 			...sampleDoc,
@@ -701,14 +702,85 @@ describe("useProjectStore", () => {
 		});
 
 		pending.reject(new Error("response lost"));
-		await expect(applying).resolves.toEqual({
-			success: true,
-			status: "reconciled-detached",
-			appliedToCurrent: false,
-		});
+		await expect(applying).resolves.toEqual({ success: false, status: "superseded" });
 		expect(useProjectStore.getState()).toMatchObject({
 			document: { project: { title: "Newer local edit" } },
 			dirty: true,
+		});
+	});
+
+	it("recognizes a persisted result after the same project reloads it authoritatively", async () => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const reloading = deferred<{ success: true; document: AxcutDocument }>();
+		const readback = deferred<{ success: true; document: AxcutDocument }>();
+		const intended = withUpdatedAt(
+			{
+				...sampleDoc,
+				project: { ...sampleDoc.project, title: "Persisted before reopen" },
+			},
+			"2026-08-16T10:01:00.000Z",
+		);
+		const reopened = withUpdatedAt(intended, "2026-08-16T10:02:00.000Z");
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockReturnValueOnce(reloading.promise).mockReturnValueOnce(readback.promise);
+		loadDocument();
+		const expected = operationToken();
+		const applying = useProjectStore.getState().applyDocumentResult(expected, intended);
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(intended));
+
+		const reloadPromise = useProjectStore.getState().loadProject(sampleDoc.project.id);
+		saving.resolve({ success: true, document: intended });
+		await waitFor(() => expect(bridgeMocks.get).toHaveBeenCalledTimes(2));
+		reloading.resolve({ success: true, document: reopened });
+		await reloadPromise;
+		readback.resolve({ success: true, document: intended });
+
+		await expect(applying).resolves.toEqual({
+			success: true,
+			status: "authoritative-detached",
+			appliedToCurrent: false,
+		});
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Persisted before reopen" } },
+			status: "ready",
+			dirty: false,
+		});
+		expect(useProjectStore.getState().documentGeneration).toBeGreaterThan(
+			expected.documentGeneration,
+		);
+	});
+
+	it("reconciles a lost save response after the same project reloads the intended document", async () => {
+		const saving = deferred<{ success: true; document: AxcutDocument }>();
+		const reloading = deferred<{ success: true; document: AxcutDocument }>();
+		const readback = deferred<{ success: true; document: AxcutDocument }>();
+		const intended = {
+			...sampleDoc,
+			project: { ...sampleDoc.project, title: "Reconciled before reopen" },
+		};
+		const reopened = withUpdatedAt(intended, "2026-08-16T10:03:00.000Z");
+		bridgeMocks.save.mockReturnValue(saving.promise);
+		bridgeMocks.get.mockReturnValueOnce(reloading.promise).mockReturnValueOnce(readback.promise);
+		loadDocument();
+		const applying = useProjectStore.getState().applyDocumentResult(operationToken(), intended);
+		await waitFor(() => expect(bridgeMocks.save).toHaveBeenCalledWith(intended));
+
+		const reloadPromise = useProjectStore.getState().loadProject(sampleDoc.project.id);
+		saving.reject(new Error("response lost"));
+		await waitFor(() => expect(bridgeMocks.get).toHaveBeenCalledTimes(2));
+		reloading.resolve({ success: true, document: reopened });
+		await reloadPromise;
+		readback.resolve({ success: true, document: intended });
+
+		await expect(applying).resolves.toEqual({
+			success: true,
+			status: "authoritative-detached",
+			appliedToCurrent: false,
+		});
+		expect(useProjectStore.getState()).toMatchObject({
+			document: { project: { title: "Reconciled before reopen" } },
+			status: "ready",
+			dirty: false,
 		});
 	});
 

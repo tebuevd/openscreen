@@ -358,7 +358,7 @@ export interface AiEditionChatComposerRestoration {
 
 export type AiEditionChatRewindComposerClaimResult =
 	| { claimed: true; prompt: string; claimId: string; leaseExpiresAt: number }
-	| { claimed: false };
+	| { claimed: false; leaseExpiresAt?: number };
 
 export type AiEditionChatRewindComposerConfirmResult =
 	| { confirmed: true; alreadyConfirmed: boolean }
@@ -398,7 +398,7 @@ export interface AiEditionChatSessionUpdatedEvent {
 	sessionId: string;
 	revision: number;
 	operationId: string;
-	kind: "chat" | "rewind";
+	kind: "chat" | "rewind" | "rewind-composer-available";
 	messages: AiEditionChatMessage[];
 	pendingComposerRestoration?: AiEditionChatComposerRestoration;
 }

@@ -680,22 +680,46 @@ export interface ChatSession {
 	compaction?: SessionCompaction;
 }
 
-function removeRewindComposerClaim(claim: RewindComposerClaim): void {
+function emitRewindComposerAvailability(claim: RewindComposerClaim): void {
+	const session = sessionsByProject.get(claim.projectId)?.get(claim.sessionId);
+	if (
+		!session?.pendingComposerRestoration ||
+		session.pendingComposerRestoration.revision !== claim.revision
+	) {
+		return;
+	}
+	emitChatSessionUpdate({
+		projectId: claim.projectId,
+		sessionId: claim.sessionId,
+		revision: session.revision,
+		operationId: `${claim.claimId}:available`,
+		kind: "rewind-composer-available",
+		messages: session.messages.map(cloneMessage),
+		pendingComposerRestoration: { revision: claim.revision },
+	});
+}
+
+function removeRewindComposerClaim(claim: RewindComposerClaim, notifyAvailability = false): void {
+	let removed = false;
 	if (rewindComposerClaims.get(claim.claimId) === claim) {
 		rewindComposerClaims.delete(claim.claimId);
+		removed = true;
 	}
 	const key = sessionKey(claim.projectId, claim.sessionId);
 	if (rewindComposerClaimBySession.get(key) === claim.claimId) {
 		rewindComposerClaimBySession.delete(key);
+		removed = true;
 	}
 	const timeout = rewindComposerClaimExpiryTimers.get(claim.claimId);
 	if (timeout) clearTimeout(timeout);
 	rewindComposerClaimExpiryTimers.delete(claim.claimId);
+	if (removed && notifyAvailability) emitRewindComposerAvailability(claim);
 }
 
 function activeRewindComposerClaim(
 	projectId: string,
 	sessionId: string,
+	notifyExpired = true,
 ): RewindComposerClaim | null {
 	const key = sessionKey(projectId, sessionId);
 	const claimId = rewindComposerClaimBySession.get(key);
@@ -706,7 +730,7 @@ function activeRewindComposerClaim(
 		return null;
 	}
 	if (claim.leaseExpiresAt <= Date.now()) {
-		removeRewindComposerClaim(claim);
+		removeRewindComposerClaim(claim, notifyExpired);
 		return null;
 	}
 	return claim;
@@ -715,8 +739,16 @@ function activeRewindComposerClaim(
 function pruneExpiredRewindComposerClaims(): void {
 	const now = Date.now();
 	for (const claim of [...rewindComposerClaims.values()]) {
-		if (claim.leaseExpiresAt <= now) removeRewindComposerClaim(claim);
+		if (claim.leaseExpiresAt <= now) removeRewindComposerClaim(claim, true);
 	}
+}
+
+function nextRewindComposerClaimExpiry(): number | undefined {
+	let earliest = Number.POSITIVE_INFINITY;
+	for (const claim of rewindComposerClaims.values()) {
+		earliest = Math.min(earliest, claim.leaseExpiresAt);
+	}
+	return Number.isFinite(earliest) ? earliest : undefined;
 }
 
 function scheduleRewindComposerClaimExpiry(claim: RewindComposerClaim): void {
@@ -729,7 +761,7 @@ function scheduleRewindComposerClaimExpiry(claim: RewindComposerClaim): void {
 			rewindComposerClaimExpiryTimers.set(claim.claimId, timeout);
 			return;
 		}
-		removeRewindComposerClaim(claim);
+		removeRewindComposerClaim(claim, true);
 	};
 	const timeout = setTimeout(expire, Math.max(0, claim.leaseExpiresAt - Date.now()));
 	timeout.unref?.();
@@ -737,7 +769,7 @@ function scheduleRewindComposerClaimExpiry(claim: RewindComposerClaim): void {
 }
 
 function clearPendingComposerRestoration(session: ChatSession): void {
-	const claim = activeRewindComposerClaim(session.projectId, session.id);
+	const claim = activeRewindComposerClaim(session.projectId, session.id, false);
 	if (claim) removeRewindComposerClaim(claim);
 	delete session.pendingComposerRestoration;
 }
@@ -764,7 +796,7 @@ function rememberConfirmedRewindComposerClaim(claim: RewindComposerClaim): void 
 
 function releaseRewindComposerClaimsForOwner(owner: ChatOperationOwner): void {
 	for (const claim of [...rewindComposerClaims.values()]) {
-		if (claim.owner === owner) removeRewindComposerClaim(claim);
+		if (claim.owner === owner) removeRewindComposerClaim(claim, true);
 	}
 }
 
@@ -886,7 +918,9 @@ export function claimRewindComposer(
 	pruneExpiredRewindComposerClaims();
 	const existing = activeRewindComposerClaim(projectId, sessionId);
 	if (existing) {
-		if (existing.revision !== revision || existing.owner !== owner) return { claimed: false };
+		if (existing.revision !== revision || existing.owner !== owner) {
+			return { claimed: false, leaseExpiresAt: existing.leaseExpiresAt };
+		}
 		return {
 			claimed: true,
 			prompt: pending.prompt,
@@ -895,7 +929,7 @@ export function claimRewindComposer(
 		};
 	}
 	if (rewindComposerClaims.size >= MAX_ACTIVE_REWIND_COMPOSER_CLAIMS) {
-		return { claimed: false };
+		return { claimed: false, leaseExpiresAt: nextRewindComposerClaimExpiry() };
 	}
 
 	let claimId = `chat_rewind_composer_${randomUUID()}`;
@@ -936,7 +970,7 @@ export function confirmRewindComposerClaim(
 	const claim = rewindComposerClaims.get(claimId);
 	if (!claim || claim.owner !== owner) return { confirmed: false };
 	if (claim.leaseExpiresAt <= Date.now()) {
-		removeRewindComposerClaim(claim);
+		removeRewindComposerClaim(claim, true);
 		return { confirmed: false };
 	}
 	const session = sessionsByProject.get(claim.projectId)?.get(claim.sessionId);
@@ -961,7 +995,7 @@ export function releaseRewindComposerClaim(
 	const claim = rewindComposerClaims.get(claimId);
 	if (!claim || claim.owner !== owner) return { released: false };
 	if (claim.leaseExpiresAt <= Date.now()) {
-		removeRewindComposerClaim(claim);
+		removeRewindComposerClaim(claim, true);
 		return { released: false };
 	}
 	const session = sessionsByProject.get(claim.projectId)?.get(claim.sessionId);
@@ -972,7 +1006,7 @@ export function releaseRewindComposerClaim(
 	) {
 		return { released: false };
 	}
-	removeRewindComposerClaim(claim);
+	removeRewindComposerClaim(claim, true);
 	return { released: true };
 }
 

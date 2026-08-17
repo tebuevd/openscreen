@@ -24,10 +24,11 @@ export interface DocumentOperationToken {
 export type DocumentResultApplyOutcome =
 	| {
 			success: true;
-			status: "applied" | "reconciled" | "persisted-detached" | "reconciled-detached";
+			status: "applied" | "reconciled" | "authoritative-detached";
 			appliedToCurrent: boolean;
 	  }
 	| { success: false; status: "stale" }
+	| { success: false; status: "superseded" }
 	| { success: false; status: "diverged"; error: string };
 
 // Every resolved outcome represents a validated disk write. A detached write is
@@ -754,6 +755,47 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 					`Document result belongs to ${parsed.project.id}, expected ${expected.projectId}`,
 				);
 			}
+			const operationIsCurrent = () => {
+				const current = get();
+				return (
+					current.documentGeneration === expected.documentGeneration &&
+					current.projectId === expected.projectId &&
+					current.revision === expected.revision &&
+					current.status === "ready" &&
+					current.document?.project.id === expected.projectId
+				);
+			};
+			const detachedOutcome = (authoritative: AxcutDocument): DocumentResultApplyOutcome => {
+				const current = get();
+				if (
+					authoritative.project.id === expected.projectId &&
+					documentsHaveEquivalentSaveContent(authoritative, parsed) &&
+					current.projectId === expected.projectId &&
+					current.status === "ready" &&
+					current.document?.project.id === expected.projectId &&
+					documentsHaveEquivalentSaveContent(current.document, parsed)
+				) {
+					return {
+						success: true,
+						status: "authoritative-detached",
+						appliedToCurrent: false,
+					};
+				}
+				return { success: false, status: "superseded" };
+			};
+			const readAuthoritative = async (): Promise<AxcutDocument> => {
+				const result = await nativeBridgeClient.aiEdition.get(expected.projectId);
+				if (!result.success || !result.document) {
+					throw new Error(result.error ?? "Authoritative project document is unavailable");
+				}
+				const authoritative = parseDocument(result.document);
+				if (authoritative.project.id !== expected.projectId) {
+					throw new Error(
+						`Authoritative project ${authoritative.project.id} does not match ${expected.projectId}`,
+					);
+				}
+				return authoritative;
+			};
 
 			let persisted: AxcutDocument;
 			try {
@@ -763,41 +805,14 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 				// acknowledgement was lost. Re-read disk and adopt it only while this operation's
 				// exact launch version is still current; never restore over an intervening edit.
 				try {
-					const result = await nativeBridgeClient.aiEdition.get(expected.projectId);
-					const authoritative =
-						result.success && result.document ? parseDocument(result.document) : null;
-					if (!authoritative || authoritative.project.id !== expected.projectId) {
-						throw new Error("Authoritative project document is unavailable");
-					}
+					const authoritative = await readAuthoritative();
 					const beforeJson = JSON.stringify(before.document);
 					const authoritativeJson = JSON.stringify(authoritative);
 					const message = error instanceof Error ? error.message : String(error);
 					if (documentsHaveEquivalentSaveContent(authoritative, parsed)) {
-						const current = get();
-						if (
-							current.documentGeneration !== expected.documentGeneration ||
-							current.projectId !== expected.projectId ||
-							current.revision !== expected.revision
-						) {
-							return {
-								success: true,
-								status: "reconciled-detached",
-								appliedToCurrent: false,
-							};
-						}
+						if (!operationIsCurrent()) return detachedOutcome(authoritative);
 						const { pushHistory } = await import("./undo");
-						const latest = get();
-						if (
-							latest.documentGeneration !== expected.documentGeneration ||
-							latest.projectId !== expected.projectId ||
-							latest.revision !== expected.revision
-						) {
-							return {
-								success: true,
-								status: "reconciled-detached",
-								appliedToCurrent: false,
-							};
-						}
+						if (!operationIsCurrent()) return detachedOutcome(authoritative);
 						pushHistory({
 							projectId: expected.projectId,
 							doc: structuredClone(before.document),
@@ -811,24 +826,10 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 						return { success: true, status: "reconciled", appliedToCurrent: true };
 					}
 
-					const current = get();
-					if (
-						current.documentGeneration !== expected.documentGeneration ||
-						current.projectId !== expected.projectId ||
-						current.revision !== expected.revision
-					) {
-						return { success: false, status: "diverged", error: message };
-					}
+					if (!operationIsCurrent()) return { success: false, status: "superseded" };
 					if (authoritativeJson !== beforeJson) {
 						const { clearHistory } = await import("./undo");
-						const latest = get();
-						if (
-							latest.documentGeneration !== expected.documentGeneration ||
-							latest.projectId !== expected.projectId ||
-							latest.revision !== expected.revision
-						) {
-							return { success: false, status: "diverged", error: message };
-						}
+						if (!operationIsCurrent()) return { success: false, status: "superseded" };
 						clearHistory();
 						set({
 							document: authoritative,
@@ -848,18 +849,7 @@ export const useProjectStore = create<ProjectState>((set, get) => ({
 			}
 
 			const { pushHistory } = await import("./undo");
-			const current = get();
-			if (
-				current.documentGeneration !== expected.documentGeneration ||
-				current.projectId !== expected.projectId ||
-				current.revision !== expected.revision
-			) {
-				return {
-					success: true,
-					status: "persisted-detached",
-					appliedToCurrent: false,
-				};
-			}
+			if (!operationIsCurrent()) return detachedOutcome(await readAuthoritative());
 			pushHistory({ projectId: expected.projectId, doc: structuredClone(before.document) });
 			set({
 				document: persisted,

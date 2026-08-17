@@ -90,12 +90,36 @@ type SuccessfulRewindCommit = Extract<AiEditionChatRewindCommitResult, { success
 interface RewindComposerDelivery {
 	revision: number;
 	applied: boolean;
+	claimInFlight: boolean;
 	claimAttempts: number;
 	confirmAttempts: number;
+	retryTimer: ReturnType<typeof setTimeout> | null;
 }
 
 const REWIND_COMPOSER_RETRY_LIMIT = 4;
 const REWIND_COMPOSER_RETRY_DELAY_MS = 100;
+const REWIND_COMPOSER_MAX_RETRY_DELAY_MS = 15_100;
+
+function clearRewindComposerRetry(delivery: RewindComposerDelivery): void {
+	if (delivery.retryTimer !== null) clearTimeout(delivery.retryTimer);
+	delivery.retryTimer = null;
+}
+
+function discardRewindComposerDelivery(
+	deliveries: Map<string, RewindComposerDelivery>,
+	key: string,
+	delivery?: RewindComposerDelivery,
+): void {
+	const current = deliveries.get(key);
+	if (!current || (delivery && current !== delivery)) return;
+	clearRewindComposerRetry(current);
+	deliveries.delete(key);
+}
+
+function clearRewindComposerDeliveries(deliveries: Map<string, RewindComposerDelivery>): void {
+	for (const delivery of deliveries.values()) clearRewindComposerRetry(delivery);
+	deliveries.clear();
+}
 
 type CommitResolution<T> =
 	| { state: "committed"; result: T }
@@ -984,15 +1008,26 @@ function ChatStripPanel() {
 			) {
 				return;
 			}
-			if (rewindComposerDeliveriesRef.current.get(key)?.revision === revision) return;
-
-			const delivery: RewindComposerDelivery = {
-				revision,
-				applied: false,
-				claimAttempts: 0,
-				confirmAttempts: 0,
-			};
-			rewindComposerDeliveriesRef.current.set(key, delivery);
+			const deliveries = rewindComposerDeliveriesRef.current;
+			let delivery = deliveries.get(key);
+			if (delivery && delivery.revision !== revision) {
+				discardRewindComposerDelivery(deliveries, key, delivery);
+				delivery = undefined;
+			}
+			if (!delivery) {
+				delivery = {
+					revision,
+					applied: false,
+					claimInFlight: false,
+					claimAttempts: 0,
+					confirmAttempts: 0,
+					retryTimer: null,
+				};
+				deliveries.set(key, delivery);
+			}
+			if (delivery.applied || delivery.claimInFlight) return;
+			if (delivery.claimAttempts >= REWIND_COMPOSER_RETRY_LIMIT) return;
+			clearRewindComposerRetry(delivery);
 			const ownsUi = () => {
 				const latest = useProjectStore.getState();
 				return (
@@ -1000,23 +1035,37 @@ function ChatStripPanel() {
 					latest.projectId === projectId &&
 					activeSessionIdRef.current === sessionId &&
 					sessionRevisionRef.current.get(sessionId) === revision &&
-					rewindComposerDeliveriesRef.current.get(key) === delivery
+					deliveries.get(key) === delivery
 				);
 			};
 			const retryDelay = (attempt: number) =>
 				REWIND_COMPOSER_RETRY_DELAY_MS * 2 ** Math.max(0, attempt - 1);
+			const scheduleRetry = (retry: () => void, delayMs: number): void => {
+				if (!ownsUi()) return;
+				clearRewindComposerRetry(delivery);
+				delivery.retryTimer = setTimeout(
+					() => {
+						delivery.retryTimer = null;
+						if (ownsUi()) retry();
+					},
+					Math.max(0, Math.min(delayMs, REWIND_COMPOSER_MAX_RETRY_DELAY_MS)),
+				);
+			};
 			const confirm = async (claimId: string): Promise<void> => {
 				delivery.confirmAttempts++;
 				try {
 					const result = await nativeBridgeClient.aiEdition.chatConfirmRewindComposerClaim(claimId);
-					if (result.confirmed) return;
+					if (result.confirmed) clearRewindComposerRetry(delivery);
 				} catch {
-					if (delivery.confirmAttempts < REWIND_COMPOSER_RETRY_LIMIT) {
-						setTimeout(() => void confirm(claimId), retryDelay(delivery.confirmAttempts));
+					if (delivery.confirmAttempts < REWIND_COMPOSER_RETRY_LIMIT && ownsUi()) {
+						scheduleRetry(() => void confirm(claimId), retryDelay(delivery.confirmAttempts));
 					}
 				}
 			};
 			const claim = async (): Promise<void> => {
+				if (!ownsUi() || delivery.claimInFlight) return;
+				if (delivery.claimAttempts >= REWIND_COMPOSER_RETRY_LIMIT) return;
+				delivery.claimInFlight = true;
 				delivery.claimAttempts++;
 				let result: Awaited<
 					ReturnType<typeof nativeBridgeClient.aiEdition.chatClaimRewindComposer>
@@ -1028,25 +1077,41 @@ function ChatStripPanel() {
 						revision,
 					);
 				} catch {
+					delivery.claimInFlight = false;
 					if (ownsUi() && delivery.claimAttempts < REWIND_COMPOSER_RETRY_LIMIT) {
-						setTimeout(() => void claim(), retryDelay(delivery.claimAttempts));
-					} else if (rewindComposerDeliveriesRef.current.get(key) === delivery) {
-						rewindComposerDeliveriesRef.current.delete(key);
+						scheduleRetry(() => void claim(), retryDelay(delivery.claimAttempts));
+					} else if (!ownsUi()) {
+						discardRewindComposerDelivery(deliveries, key, delivery);
 					}
 					return;
 				}
-				if (!result.claimed) return;
+				delivery.claimInFlight = false;
+				if (!result.claimed) {
+					if (!ownsUi()) {
+						discardRewindComposerDelivery(deliveries, key, delivery);
+						return;
+					}
+					if (
+						result.leaseExpiresAt !== undefined &&
+						delivery.claimAttempts < REWIND_COMPOSER_RETRY_LIMIT
+					) {
+						scheduleRetry(
+							() => void claim(),
+							Math.max(REWIND_COMPOSER_RETRY_DELAY_MS, result.leaseExpiresAt - Date.now() + 1),
+						);
+					}
+					return;
+				}
 				if (!ownsUi()) {
 					void nativeBridgeClient.aiEdition
 						.chatReleaseRewindComposerClaim(result.claimId)
 						.catch(() => undefined);
-					if (rewindComposerDeliveriesRef.current.get(key) === delivery) {
-						rewindComposerDeliveriesRef.current.delete(key);
-					}
+					discardRewindComposerDelivery(deliveries, key, delivery);
 					return;
 				}
 				if (!delivery.applied) {
 					delivery.applied = true;
+					clearRewindComposerRetry(delivery);
 					setInput(result.prompt);
 				}
 				await confirm(result.claimId);
@@ -1094,6 +1159,15 @@ function ChatStripPanel() {
 				) {
 					return;
 				}
+				const deliveryKey = `${event.projectId}::${event.sessionId}`;
+				const existingDelivery = rewindComposerDeliveriesRef.current.get(deliveryKey);
+				if (existingDelivery && existingDelivery.revision !== event.revision) {
+					discardRewindComposerDelivery(
+						rewindComposerDeliveriesRef.current,
+						deliveryKey,
+						existingDelivery,
+					);
+				}
 				sessionRevisionRef.current.set(event.sessionId, event.revision);
 				rememberAppliedSessionUpdate(appliedSessionUpdatesRef.current, event.operationId);
 				setMessages(toDisplayMessages(event.messages));
@@ -1105,7 +1179,10 @@ function ChatStripPanel() {
 					),
 				);
 				const restoration = event.pendingComposerRestoration;
-				if (event.kind === "rewind" && restoration) {
+				if (
+					(event.kind === "rewind" || event.kind === "rewind-composer-available") &&
+					restoration
+				) {
 					claimRewindComposer(event.projectId, event.sessionId, restoration.revision);
 				}
 			},
@@ -1116,6 +1193,7 @@ function ChatStripPanel() {
 		mountedRef.current = true;
 		return () => {
 			mountedRef.current = false;
+			clearRewindComposerDeliveries(rewindComposerDeliveriesRef.current);
 			sessionActionRef.current = null;
 			thinkingRunSessionRef.current = null;
 			const operation = activeOperationRef.current;
@@ -1134,13 +1212,14 @@ function ChatStripPanel() {
 		if (operation) {
 			activeOperationRef.current = null;
 			operation.uiAttached = false;
-			if (!operationMustFinish(operation)) {
+			const mustFinish = operationMustFinish(operation);
+			if (!mustFinish) {
 				operation.cancelled = true;
 				requestOperationAbort(operation);
+				toast.error(t("chat.applyEditsFailed"), {
+					description: t("chat.documentChangedDuringOperation"),
+				});
 			}
-			toast.error(t("chat.applyEditsFailed"), {
-				description: t("chat.documentChangedDuringOperation"),
-			});
 		}
 		sessionActionRef.current = null;
 		setBusy(false);
@@ -1150,7 +1229,7 @@ function ChatStripPanel() {
 		thinkingRunSessionRef.current = null;
 		sessionRevisionRef.current.clear();
 		appliedSessionUpdatesRef.current.clear();
-		rewindComposerDeliveriesRef.current.clear();
+		clearRewindComposerDeliveries(rewindComposerDeliveriesRef.current);
 		thinkingTextRef.current = "";
 		setThinkingText("");
 		if (!projectId) {
@@ -1161,6 +1240,15 @@ function ChatStripPanel() {
 		}
 		void refreshSessions(projectId, documentGeneration, true);
 	}, [projectId, documentGeneration, refreshSessions, t]);
+
+	useEffect(() => {
+		const activeKey = projectId && activeSessionId ? `${projectId}::${activeSessionId}` : null;
+		for (const [key, delivery] of rewindComposerDeliveriesRef.current) {
+			if (key !== activeKey) {
+				discardRewindComposerDelivery(rewindComposerDeliveriesRef.current, key, delivery);
+			}
+		}
+	}, [projectId, activeSessionId]);
 
 	useEffect(() => {
 		if (!projectId || !activeSessionId) {
@@ -1187,6 +1275,15 @@ function ChatStripPanel() {
 				if (session) {
 					const knownRevision = sessionRevisionRef.current.get(activeSessionId) ?? -1;
 					if (session.revision < knownRevision) return;
+					const deliveryKey = `${projectId}::${activeSessionId}`;
+					const existingDelivery = rewindComposerDeliveriesRef.current.get(deliveryKey);
+					if (existingDelivery && existingDelivery.revision !== session.revision) {
+						discardRewindComposerDelivery(
+							rewindComposerDeliveriesRef.current,
+							deliveryKey,
+							existingDelivery,
+						);
+					}
 					sessionRevisionRef.current.set(activeSessionId, session.revision);
 					setMessages(toDisplayMessages(session.messages));
 					const restoration = session.pendingComposerRestoration;
@@ -1443,16 +1540,16 @@ function ChatStripPanel() {
 							const outcome = await applyAgentDocument(result.document, documentOperation);
 							if (!outcome.success) {
 								await resolvePersistence(
-									outcome.status === "stale" ? "not-persisted" : "failed",
-									outcome.status === "stale",
+									outcome.status === "stale"
+										? "not-persisted"
+										: outcome.status === "superseded"
+											? "superseded"
+											: "failed",
+									outcome.status === "stale" || outcome.status === "superseded",
 								);
 								if (outcome.status === "diverged" && ownsUi()) {
 									toast.error(t("chat.applyEditsFailed"), { description: outcome.error });
 								}
-								return;
-							}
-							if (!outcome.appliedToCurrent) {
-								await resolvePersistence("superseded", true);
 								return;
 							}
 						}
@@ -1691,16 +1788,18 @@ function ChatStripPanel() {
 					try {
 						const outcome = await applyAgentDocument(prepared.document, documentOperation);
 						if (!outcome.success) {
-							await resolvePersistence(outcome.status === "stale" ? "not-persisted" : "failed");
+							await resolvePersistence(
+								outcome.status === "stale"
+									? "not-persisted"
+									: outcome.status === "superseded"
+										? "superseded"
+										: "failed",
+							);
 							if (ownsUi()) {
-								if (outcome.status === "stale") showStaleDocumentResult();
-								else toast.error(t("chat.rewindFailed"), { description: outcome.error });
+								if (outcome.status === "stale" || outcome.status === "superseded") {
+									showStaleDocumentResult();
+								} else toast.error(t("chat.rewindFailed"), { description: outcome.error });
 							}
-							return;
-						}
-						if (!outcome.appliedToCurrent) {
-							await resolvePersistence("superseded");
-							if (ownsUi()) showStaleDocumentResult();
 							return;
 						}
 					} catch (error) {

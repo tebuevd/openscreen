@@ -205,6 +205,47 @@ describe("browser chat operation shim", () => {
 		await nativeBridgeClient.aiEdition.chatReleaseRewindComposerClaim(replacementClaim.claimId);
 	});
 
+	it("emits browser availability events when a claim releases or expires", async () => {
+		vi.useFakeTimers();
+		installPersistedRestoration("available prompt");
+		const updates: Array<{ kind: string; pendingComposerRestoration?: { revision: number } }> = [];
+		const unsubscribe = window.electronAPI.onAiEditionChatSessionUpdated((event) =>
+			updates.push(event),
+		);
+		const firstClaim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+			"project",
+			"session",
+			7,
+		);
+		expect(firstClaim.claimed).toBe(true);
+		if (!firstClaim.claimed) return;
+
+		await nativeBridgeClient.aiEdition.chatReleaseRewindComposerClaim(firstClaim.claimId);
+
+		expect(updates).toEqual([
+			expect.objectContaining({
+				kind: "rewind-composer-available",
+				pendingComposerRestoration: { revision: 7 },
+			}),
+		]);
+		const secondClaim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
+			"project",
+			"session",
+			7,
+		);
+		expect(secondClaim.claimed).toBe(true);
+		if (!secondClaim.claimed) return;
+
+		vi.advanceTimersByTime(secondClaim.leaseExpiresAt - Date.now());
+
+		expect(updates).toHaveLength(2);
+		expect(updates[1]).toMatchObject({
+			kind: "rewind-composer-available",
+			pendingComposerRestoration: { revision: 7 },
+		});
+		unsubscribe();
+	});
+
 	it("caps active browser composer leases without evicting existing claims", async () => {
 		vi.useFakeTimers();
 		installPersistedRestorations(MAX_ACTIVE_REWIND_COMPOSER_CLAIMS + 3);
@@ -232,7 +273,7 @@ describe("browser chat operation shim", () => {
 				`session-${MAX_ACTIVE_REWIND_COMPOSER_CLAIMS}`,
 				1,
 			),
-		).toEqual({ claimed: false });
+		).toEqual({ claimed: false, leaseExpiresAt: claims[0].leaseExpiresAt });
 		expect(vi.getTimerCount()).toBe(timersAtCapacity);
 		expect(
 			(
@@ -279,7 +320,7 @@ describe("browser chat operation shim", () => {
 				`session-${MAX_ACTIVE_REWIND_COMPOSER_CLAIMS + 2}`,
 				1,
 			),
-		).toEqual({ claimed: false });
+		).toEqual({ claimed: false, leaseExpiresAt: claims[2].leaseExpiresAt });
 		expect(vi.getTimerCount()).toBe(timersBeforeExpiryRejection);
 		vi.advanceTimersByTime(claims[2].leaseExpiresAt - Date.now());
 		const expirySlotClaim = await nativeBridgeClient.aiEdition.chatClaimRewindComposer(
