@@ -143,6 +143,11 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v7
+      - name: swift test (ScreenCaptureKit helper)
+        timeout-minutes: 10
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "13.0"
+        run: swift test --package-path electron/native/screencapturekit
       - name: Install Rust toolchain
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --target aarch64-apple-darwin
@@ -165,6 +170,15 @@ jobs:
         run: |
           cd crates
           cargo test -p openscreen-compositor --lib --tests
+      - name: cargo test (napi addon)
+        timeout-minutes: 10
+        env:
+          MAC_FFMPEG_DIR: /opt/homebrew/opt/ffmpeg
+          # The test binary links ffmpeg dynamically; compiling it is not enough.
+          DYLD_LIBRARY_PATH: /opt/homebrew/opt/ffmpeg/lib
+        run: |
+          cd crates
+          cargo test -p compositor-view-napi --lib
       - name: cargo build (napi addon)
         env:
           MAC_FFMPEG_DIR: /opt/homebrew/opt/ffmpeg
