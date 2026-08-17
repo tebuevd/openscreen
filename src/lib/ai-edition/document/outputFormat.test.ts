@@ -107,7 +107,7 @@ describe("resolveVisibleClips", () => {
 
 	it("does not let an excluded portrait clip dictate legacy Original aspect", () => {
 		const landscape = asset("landscape", 1920, 1080);
-		const portrait = asset("portrait", 1080, 1920);
+		const portrait = asset("portrait", 2160, 3840);
 		const portraitClip = {
 			...clip("portrait-clip", "portrait"),
 			timelineStartSec: 10,

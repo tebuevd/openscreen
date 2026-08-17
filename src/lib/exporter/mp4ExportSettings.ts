@@ -1,4 +1,5 @@
 import { type AspectRatio, parseAspectRatio } from "../../utils/aspectRatioUtils";
+import { calculateEffectiveOrientedDimensions } from "../ai-edition/document/exportClipResolver";
 import type { ExportQuality } from "./types";
 
 export interface Mp4ExportSettings {
@@ -127,10 +128,6 @@ function even(value: number) {
 	return Math.floor(value / 2) * 2;
 }
 
-function atLeastEven(value: number) {
-	return Math.max(2, even(value));
-}
-
 export function calculateEffectiveSourceDimensions(
 	sourceWidth: number,
 	sourceHeight: number,
@@ -138,13 +135,12 @@ export function calculateEffectiveSourceDimensions(
 ) {
 	// Callers supply display-oriented media dimensions (`videoWidth`/`videoHeight`), so container
 	// rotation is already reflected before crop geometry is applied.
-	const cropWidth = cropRegion?.width ?? 1;
-	const cropHeight = cropRegion?.height ?? 1;
-
-	return {
-		width: atLeastEven(Math.round(sourceWidth * cropWidth)),
-		height: atLeastEven(Math.round(sourceHeight * cropHeight)),
-	};
+	return (
+		calculateEffectiveOrientedDimensions(sourceWidth, sourceHeight, cropRegion) ?? {
+			width: 2,
+			height: 2,
+		}
+	);
 }
 
 function calculateDimensionsForShortSide(targetShortSide: number, aspectRatioValue: number) {

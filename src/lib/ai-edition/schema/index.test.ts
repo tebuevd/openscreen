@@ -623,6 +623,211 @@ describe("v5 -> v6 native AspectRatio migration", () => {
 		expect((doc.legacyEditor as Record<string, unknown>).aspectRatio).toBe("9:16");
 	});
 
+	it("ignores a fully trimmed larger portrait clip when baking Original aspect", () => {
+		const doc = documentSchema.parse(
+			migrateRawDocumentToCurrent({
+				schemaVersion: 5,
+				project: {
+					id: "p1",
+					title: "trimmed portrait",
+					createdAt: "2024-01-01T00:00:00.000Z",
+					updatedAt: "2024-01-01T00:00:00.000Z",
+				},
+				assets: [
+					{
+						id: "landscape",
+						kind: "video",
+						label: "Landscape",
+						originalPath: "/landscape.mp4",
+						cameraTrack: null,
+						video: { width: 1920, height: 1080 },
+					},
+					{
+						id: "portrait",
+						kind: "video",
+						label: "Portrait",
+						originalPath: "/portrait.mp4",
+						cameraTrack: null,
+						video: { width: 2160, height: 3840 },
+					},
+				],
+				timeline: {
+					clips: [
+						{
+							id: "landscape-clip",
+							assetId: "landscape",
+							sourceStartSec: 0,
+							sourceEndSec: 10,
+							timelineStartSec: 0,
+							timelineEndSec: 10,
+							origin: "user",
+						},
+						{
+							id: "portrait-clip",
+							assetId: "portrait",
+							sourceStartSec: 0,
+							sourceEndSec: 10,
+							timelineStartSec: 10,
+							timelineEndSec: 20,
+							origin: "user",
+						},
+					],
+					trimRanges: [
+						{
+							id: "trim-portrait",
+							assetId: "portrait",
+							startSec: 0,
+							endSec: 10,
+							origin: "user",
+							reason: "",
+						},
+					],
+				},
+				legacyEditor: { aspectRatio: "native" },
+			}),
+		);
+
+		expect((doc.legacyEditor as Record<string, unknown>).aspectRatio).toBe("16:9");
+	});
+
+	it("ignores missing, pathless, and zero-duration larger portrait clips", () => {
+		const migrated = migrateRawDocumentToCurrent({
+			schemaVersion: 5,
+			project: {
+				id: "p1",
+				title: "invalid portrait clips",
+				createdAt: "2024-01-01T00:00:00.000Z",
+				updatedAt: "2024-01-01T00:00:00.000Z",
+			},
+			assets: [
+				{
+					id: "landscape",
+					kind: "video",
+					label: "Landscape",
+					originalPath: "/landscape.mp4",
+					cameraTrack: null,
+					video: { width: 1920, height: 1080 },
+				},
+				{
+					id: "pathless",
+					kind: "video",
+					label: "Pathless",
+					originalPath: "",
+					cameraTrack: null,
+					video: { width: 2160, height: 3840 },
+				},
+				{
+					id: "zero",
+					kind: "video",
+					label: "Zero",
+					originalPath: "/zero.mp4",
+					cameraTrack: null,
+					video: { width: 2160, height: 3840 },
+				},
+			],
+			timeline: {
+				clips: [
+					{
+						id: "landscape-clip",
+						assetId: "landscape",
+						sourceStartSec: 0,
+						sourceEndSec: 10,
+						timelineStartSec: 0,
+						timelineEndSec: 10,
+						origin: "user",
+					},
+					{
+						id: "missing-clip",
+						assetId: "missing",
+						sourceStartSec: 0,
+						sourceEndSec: 10,
+						timelineStartSec: 10,
+						timelineEndSec: 20,
+						origin: "user",
+					},
+					{
+						id: "pathless-clip",
+						assetId: "pathless",
+						sourceStartSec: 0,
+						sourceEndSec: 10,
+						timelineStartSec: 20,
+						timelineEndSec: 30,
+						origin: "user",
+					},
+					{
+						id: "zero-source",
+						assetId: "zero",
+						sourceStartSec: 0,
+						sourceEndSec: 0,
+						timelineStartSec: 30,
+						timelineEndSec: 40,
+						origin: "user",
+					},
+					{
+						id: "zero-timeline",
+						assetId: "zero",
+						sourceStartSec: 0,
+						sourceEndSec: 10,
+						timelineStartSec: 40,
+						timelineEndSec: 40,
+						origin: "user",
+					},
+				],
+			},
+			legacyEditor: { aspectRatio: "native" },
+		}) as Record<string, unknown>;
+
+		expect((migrated.legacyEditor as Record<string, unknown>).aspectRatio).toBe("16:9");
+	});
+
+	it("breaks equal-area ties by resolved timeline order", () => {
+		const migrated = migrateRawDocumentToCurrent({
+			...makeV5Doc({ legacyEditor: { aspectRatio: "native" } }),
+			assets: [
+				{
+					id: "landscape",
+					kind: "video",
+					label: "Landscape",
+					originalPath: "/landscape.mp4",
+					cameraTrack: null,
+					video: { width: 1920, height: 1080 },
+				},
+				{
+					id: "portrait",
+					kind: "video",
+					label: "Portrait",
+					originalPath: "/portrait.mp4",
+					cameraTrack: null,
+					video: { width: 1080, height: 1920 },
+				},
+			],
+			timeline: {
+				clips: [
+					{
+						id: "portrait-later",
+						assetId: "portrait",
+						sourceStartSec: 0,
+						sourceEndSec: 10,
+						timelineStartSec: 10,
+						timelineEndSec: 20,
+						origin: "user",
+					},
+					{
+						id: "landscape-first",
+						assetId: "landscape",
+						sourceStartSec: 0,
+						sourceEndSec: 10,
+						timelineStartSec: 0,
+						timelineEndSec: 10,
+						origin: "user",
+					},
+				],
+			},
+		}) as Record<string, unknown>;
+
+		expect((migrated.legacyEditor as Record<string, unknown>).aspectRatio).toBe("16:9");
+	});
+
 	it("leaves 'native' alone when the timeline has no clips with known dimensions", () => {
 		// Deliberately NOT a 16:9 fallback: an empty/unprobed timeline gives no basis
 		// for a concrete token, and guessing one persists a wrong frame. See the v1.7

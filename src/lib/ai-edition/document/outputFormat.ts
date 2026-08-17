@@ -22,15 +22,14 @@ import {
 	toAspectRatioToken,
 } from "@/utils/aspectRatioUtils";
 import type { AxcutAsset, AxcutClip, AxcutDocument } from "../schema";
-import { resolveClipSourceEndSec } from "../timeline/clipDuration";
-import { resolvePlaybackSegments } from "./timeline";
+import { type ResolvedExportClipWindow, resolveExportClipWindows } from "./exportClipResolver";
 
 export interface Dims {
 	width: number;
 	height: number;
 }
 
-export type ResolvedVisibleClip = AxcutClip & { sourceEndSec: number };
+export type ResolvedVisibleClip = ResolvedExportClipWindow<AxcutClip>;
 
 /** Output frame used when a document has no usable asset dimensions at all. */
 const FALLBACK_OUTPUT_DIMS: Dims = { width: 1920, height: 1080 };
@@ -83,19 +82,11 @@ export function pickExtremeDims(items: Dims[], direction: "largest" | "smallest"
 
 /** The authoritative clip stream for preview, scene serialization, and export. */
 export function resolveVisibleClips(document: AxcutDocument): ResolvedVisibleClip[] {
-	const assetById = new Map(document.assets.map((asset) => [asset.id, asset]));
-	const exportableClips: ResolvedVisibleClip[] = [];
-	for (const clip of document.timeline.clips) {
-		const asset = assetById.get(clip.assetId);
-		if (!asset?.originalPath || clip.timelineEndSec <= clip.timelineStartSec) continue;
-		const sourceEndSec = resolveClipSourceEndSec(clip, asset);
-		if (!Number.isFinite(sourceEndSec) || sourceEndSec <= clip.sourceStartSec) continue;
-		exportableClips.push({ ...clip, sourceEndSec });
-	}
-	return resolvePlaybackSegments(exportableClips, document.timeline.trimRanges).flatMap((clip) => {
-		if (clip.sourceEndSec === undefined || clip.sourceEndSec <= clip.sourceStartSec) return [];
-		return [{ ...clip, sourceEndSec: clip.sourceEndSec }];
-	});
+	return resolveExportClipWindows(
+		document.timeline.clips,
+		document.timeline.trimRanges,
+		document.assets,
+	);
 }
 
 /**

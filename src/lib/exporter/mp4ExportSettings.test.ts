@@ -295,6 +295,24 @@ describe("resolveMp4ExportSettings", () => {
 		}
 	});
 
+	it("uses the portrait-output capacity branch without upscaling any visible clip", () => {
+		const sources = [
+			{ width: 100, height: 1600 },
+			{ width: 600, height: 800 },
+		];
+		const result = resolveMp4ExportSettings({
+			quality: "source",
+			aspectRatio: "3:4",
+			sourceDimensions: sources[0],
+			sourceClipDimensions: sources,
+		});
+		expect(result).toMatchObject({ ok: true, settings: { width: 600, height: 800 } });
+		if (!result.ok) throw new Error(result.reason);
+		for (const source of sources) {
+			expect(wouldUpscale(result.settings, source)).toBe(false);
+		}
+	});
+
 	it("keeps mixed landscape, portrait, and display-rotated source geometry even", () => {
 		const sources = [
 			{ width: 1920, height: 1080 },
@@ -310,6 +328,20 @@ describe("resolveMp4ExportSettings", () => {
 		for (const source of sources) {
 			expect(wouldUpscale(output, source)).toBe(false);
 		}
+	});
+
+	it.each([
+		["landscape", { width: 8192, height: 4320 }],
+		["portrait", { width: 4320, height: 8192 }],
+	])("keeps Source at the max-axis and max-area boundary in %s", (_label, source) => {
+		const output = calculateSourceExportDimensions([source], source.width / source.height);
+		expect(output).toEqual(source);
+		if (!output) throw new Error("Expected Source dimensions");
+		expect(output.width % 2).toBe(0);
+		expect(output.height % 2).toBe(0);
+		expect(Math.max(output.width, output.height)).toBe(MAX_MP4_EXPORT_DIMENSION);
+		expect(output.width * output.height).toBe(MAX_MP4_EXPORT_PIXEL_AREA);
+		expect(wouldUpscale(output, source)).toBe(false);
 	});
 
 	it("allows DCI 8K landscape and portrait at the allocation boundary", () => {

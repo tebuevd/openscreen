@@ -262,7 +262,7 @@ describe("ExportDialog submission", () => {
 				label: "Trimmed portrait",
 				originalPath: "/tmp/trimmed.mp4",
 				cameraTrack: null,
-				video: video(320, 640),
+				video: video(2160, 3840),
 			},
 			{
 				id: "pathless",

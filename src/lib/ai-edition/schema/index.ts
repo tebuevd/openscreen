@@ -17,6 +17,15 @@ import { z } from "zod";
 // Relative, not `@/`: the Electron main bundle imports this module and
 // vite-plugin-electron builds it without the root resolve.alias.
 import { toAspectRatioToken } from "../../../utils/aspectRatioUtils";
+// Structural leaf with no schema/runtime imports, shared with outputFormat so migration and
+// current documents cannot drift on clip eligibility or effective crop dimensions.
+import {
+	calculateEffectiveOrientedDimensions,
+	type ExportClipAsset,
+	type ExportClipTrim,
+	type ExportClipWindow,
+	resolveExportClipWindows,
+} from "../document/exportClipResolver";
 // Cycle-safe: `document/ids` only pulls `uuid`, and `timeline/timelineMap`'s
 // transitive value-imports (region-ventilation, virtual-preview) import from this
 // module TYPE-ONLY, so requiring them here never re-enters schema at runtime.
@@ -585,57 +594,96 @@ export function upgradeV4DocumentToV5(raw: unknown): unknown {
 	};
 }
 
-/**
- * Largest raw asset footprint among the timeline's clips. A local copy of the
- * `referenceClipDims` pick from `document/outputFormat` — duplicated here so the schema
- * package doesn't import from a module that itself imports from this one (cycle), and so
- * the upgrader doesn't need the runtime `probedAssetDims` map (it runs at load time, before
- * any asset is probed). Crop IS applied: `"native"` resolved to the *cropped* clip
- * dimensions at runtime (`clipEffectiveDims` → `calculateEffectiveSourceDimensions`),
- * so ignoring it here would silently reframe every cropped project.
- */
-/** Mirrors `atLeastEven` in mp4ExportSettings — H.264 4:2:0 rejects odd dims. */
-function atLeastEven(value: number): number {
-	return Math.max(2, Math.floor(value / 2) * 2);
-}
+type LegacyAspectClip = ExportClipWindow & {
+	cropRegion?: { width: number; height: number };
+};
 
 function largestClipDims(doc: Record<string, unknown>): { width: number; height: number } | null {
 	const timeline = (doc.timeline ?? {}) as Record<string, unknown>;
-	const clips = Array.isArray(timeline.clips) ? timeline.clips : [];
-	const assets = Array.isArray(doc.assets) ? doc.assets : [];
+	const rawClips = Array.isArray(timeline.clips) ? timeline.clips : [];
+	const rawAssets = Array.isArray(doc.assets) ? doc.assets : [];
+	const rawTrims = Array.isArray(timeline.trimRanges) ? timeline.trimRanges : [];
 	const assetById = new Map<string, Record<string, unknown>>();
-	for (const a of assets) {
-		if (a && typeof a === "object" && typeof (a as { id?: unknown }).id === "string") {
-			assetById.set((a as { id: string }).id, a as Record<string, unknown>);
-		}
+	const assets: ExportClipAsset[] = [];
+	for (const entry of rawAssets) {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+		const asset = entry as Record<string, unknown>;
+		if (typeof asset.id !== "string") continue;
+		assetById.set(asset.id, asset);
+		assets.push({
+			id: asset.id,
+			...(typeof asset.originalPath === "string" ? { originalPath: asset.originalPath } : {}),
+			...(typeof asset.durationSec === "number" ? { durationSec: asset.durationSec } : {}),
+		});
 	}
+	const clips: LegacyAspectClip[] = rawClips.flatMap((entry) => {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+		const clip = entry as Record<string, unknown>;
+		if (
+			typeof clip.id !== "string" ||
+			typeof clip.assetId !== "string" ||
+			typeof clip.sourceStartSec !== "number" ||
+			typeof clip.timelineStartSec !== "number" ||
+			typeof clip.timelineEndSec !== "number" ||
+			(clip.sourceEndSec !== undefined && typeof clip.sourceEndSec !== "number")
+		) {
+			return [];
+		}
+		const crop =
+			clip.cropRegion && typeof clip.cropRegion === "object" && !Array.isArray(clip.cropRegion)
+				? (clip.cropRegion as Record<string, unknown>)
+				: null;
+		return [
+			{
+				id: clip.id,
+				assetId: clip.assetId,
+				sourceStartSec: clip.sourceStartSec,
+				...(typeof clip.sourceEndSec === "number" ? { sourceEndSec: clip.sourceEndSec } : {}),
+				timelineStartSec: clip.timelineStartSec,
+				timelineEndSec: clip.timelineEndSec,
+				...(crop && typeof crop.width === "number" && typeof crop.height === "number"
+					? { cropRegion: { width: crop.width, height: crop.height } }
+					: {}),
+			},
+		];
+	});
+	const trims: ExportClipTrim[] = rawTrims.flatMap((entry) => {
+		if (!entry || typeof entry !== "object" || Array.isArray(entry)) return [];
+		const trim = entry as Record<string, unknown>;
+		if (
+			typeof trim.assetId !== "string" ||
+			typeof trim.startSec !== "number" ||
+			typeof trim.endSec !== "number"
+		) {
+			return [];
+		}
+		return [
+			{
+				assetId: trim.assetId,
+				...(typeof trim.clipId === "string" ? { clipId: trim.clipId } : {}),
+				startSec: trim.startSec,
+				endSec: trim.endSec,
+			},
+		];
+	});
+
+	const visibleClips = resolveExportClipWindows(clips, trims, assets);
 	let best: { width: number; height: number } | null = null;
 	let bestArea = 0;
-	for (const clip of clips) {
-		if (!clip || typeof clip !== "object") continue;
-		const c = clip as Record<string, unknown>;
-		const assetId = c.assetId;
-		if (typeof assetId !== "string") continue;
-		const asset = assetById.get(assetId);
+	for (const clip of visibleClips) {
+		const asset = assetById.get(clip.assetId);
 		if (!asset) continue;
 		const video = (asset.video ?? {}) as Record<string, unknown>;
-		const rawW = typeof video.width === "number" ? video.width : 0;
-		const rawH = typeof video.height === "number" ? video.height : 0;
-		if (rawW <= 0 || rawH <= 0) continue;
-		// Apply the clip's crop, exactly as `calculateEffectiveSourceDimensions`
-		// (mp4ExportSettings) does at runtime — including the snap to even pixels,
-		// so the reduced token matches the size the encoder is actually handed.
-		// "native" meant "the cropped source's shape"; ignoring crop here would
-		// bake the wrong ratio into every cropped project.
-		const crop = (c.cropRegion ?? {}) as Record<string, unknown>;
-		const cropW = typeof crop.width === "number" && crop.width > 0 ? crop.width : 1;
-		const cropH = typeof crop.height === "number" && crop.height > 0 ? crop.height : 1;
-		const w = atLeastEven(Math.round(rawW * cropW));
-		const h = atLeastEven(Math.round(rawH * cropH));
-		const area = w * h;
+		const dimensions = calculateEffectiveOrientedDimensions(
+			typeof video.width === "number" ? video.width : 0,
+			typeof video.height === "number" ? video.height : 0,
+			clip.cropRegion,
+		);
+		if (!dimensions) continue;
+		const area = dimensions.width * dimensions.height;
 		if (area > bestArea) {
 			bestArea = area;
-			best = { width: w, height: h };
+			best = dimensions;
 		}
 	}
 	return best;
