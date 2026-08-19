@@ -399,12 +399,30 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 			guard let display = content.displays.first(where: { $0.displayID == displayId }) else {
 				throw HelperError.sourceNotFound("No ScreenCaptureKit display found for id \(displayId).")
 			}
-			let width = Int(CGDisplayPixelsWide(display.displayID))
-			let height = Int(CGDisplayPixelsHigh(display.displayID))
+			let filter = SCContentFilter(display: display, excludingWindows: [])
+			let sourceSize: CGSize
+			if #available(macOS 14.0, *) {
+				sourceSize = CaptureGeometry.pixelSize(
+					for: filter.contentRect.size,
+					pointPixelScale: CGFloat(filter.pointPixelScale)
+				)
+			} else {
+				sourceSize = Self.displayPixelSize(
+					for: display.displayID,
+					fallback: display.frame.size
+				)
+			}
+			let dimensions = CaptureGeometry.fittedDimensions(
+				for: sourceSize,
+				maximum: CaptureDimensions(
+					width: request.video.width,
+					height: request.video.height
+				)
+			)
 			return CaptureTarget(
-				filter: SCContentFilter(display: display, excludingWindows: []),
-				width: clampCaptureDimension(width, fallback: request.video.width),
-				height: clampCaptureDimension(height, fallback: request.video.height),
+				filter: filter,
+				width: dimensions.width,
+				height: dimensions.height,
 				captureFrame: display.frame
 			)
 		case "window":
@@ -670,6 +688,17 @@ final class ScreenCaptureRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
 		}
 
 		return status == .complete
+	}
+
+	private static func displayPixelSize(for displayId: CGDirectDisplayID, fallback: CGSize) -> CGSize {
+		guard let mode = CGDisplayCopyDisplayMode(displayId) else {
+			return fallback
+		}
+
+		return CaptureGeometry.orientedPixelSize(
+			CGSize(width: mode.pixelWidth, height: mode.pixelHeight),
+			rotationDegrees: CGDisplayRotation(displayId)
+		)
 	}
 
 	private func clampCaptureDimension(_ value: Int, fallback: Int) -> Int {
